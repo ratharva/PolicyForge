@@ -1,0 +1,90 @@
+"""Dispatch table between policy families (ACT, MolmoAct2, pi0.5) for
+train_loop.py, so the shared per-worker training loop doesn't hardcode
+which policy it's running.
+
+Factories, not eager module-level instances -- POLICY_ADAPTER_FACTORIES'
+values are called lazily inside get_adapter(), so importing this module
+never imports a policy's module unless it's actually selected at runtime.
+This lets a policy with extra/conflicting dependencies fail fast with a
+clear ModuleNotFoundError rather than breaking import for scripts that
+never asked for it.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import torch
+
+
+@dataclass
+class PolicyAdapter:
+    # (data_cfg, overrides, train_cfg, dataset_stats, device) -> (policy, preprocessor)
+    build: Callable[..., tuple[Any, Any]]
+    # (policy, inputs) -> (loss, metrics)
+    forward_loss: Callable[[Any, dict], tuple[torch.Tensor, dict[str, float]]]
+    needs_task: bool
+    # Called once right after build(), before any distributed wrapping.
+    post_build_hook: Callable[[Any, Any], None] | None = None
+    # None -> train_loop.py falls back to ray.train.torch.prepare_model(policy)
+    # + the pickle-state_dict save/load path. Set (MolmoAct2 fsdp2 only) to
+    # swap in accelerate-based FSDP2 wrapping and sharded checkpointing.
+    wrap_for_training: Callable[..., Any] | None = None
+    save_checkpoint: Callable[..., None] | None = None
+    load_checkpoint: Callable[..., dict] | None = None
+    # Extra kwargs for ray.train.torch.prepare_model's parallel_strategy_kwargs
+    # -- only meaningful when wrap_for_training is None (the DDP path).
+    prepare_model_kwargs: dict | None = None
+    # True when a Ray Data preprocessing stage already ran the policy's
+    # preprocessor upstream (training/data/ray_dataset.py) -- train_loop.py
+    # then skips calling preprocessor(batch) itself for this policy.
+    preprocessing_offloaded: bool = False
+
+
+def _act_adapter() -> PolicyAdapter:
+    from training.model import act
+    return PolicyAdapter(build=act.build_policy_and_processor, forward_loss=act.forward_loss, needs_task=False)
+
+
+def _molmoact2_adapter(distributed_strategy: str, offload_tokenization: bool) -> PolicyAdapter:
+    from training.model import molmoact2
+    is_fsdp2 = distributed_strategy == "fsdp2"
+    return PolicyAdapter(
+        build=molmoact2.build_policy_and_processor,
+        forward_loss=molmoact2.forward_loss,
+        needs_task=True,
+        post_build_hook=molmoact2.enable_training_optimizations,
+        wrap_for_training=molmoact2.wrap_for_training if is_fsdp2 else None,
+        save_checkpoint=molmoact2.save_checkpoint if is_fsdp2 else None,
+        load_checkpoint=molmoact2.load_checkpoint if is_fsdp2 else None,
+        # LoRA + gradient checkpointing under plain DDP can fail with "did
+        # not receive grad for all parameters" when not every
+        # requires_grad=True parameter participates in every forward pass.
+        prepare_model_kwargs=None if is_fsdp2 else {"find_unused_parameters": True},
+        preprocessing_offloaded=offload_tokenization,
+    )
+
+
+def _pi05_adapter() -> PolicyAdapter:
+    from training.model import pi05
+    return PolicyAdapter(
+        build=pi05.build_policy_and_processor,
+        forward_loss=pi05.forward_loss,
+        needs_task=True,
+        # No post_build_hook -- gradient checkpointing auto-wires from
+        # PI05Config's own flag at construction time.
+        # No wrap_for_training/save_checkpoint/load_checkpoint -- DDP only
+        # for pi05 in this pipeline. Extending to FSDP2 later is a
+        # mechanical repeat of model/molmoact2.py's pattern.
+        prepare_model_kwargs={"find_unused_parameters": True},
+    )
+
+
+def get_adapter(policy_type: str, distributed_strategy: str = "ddp", offload_tokenization: bool = False) -> PolicyAdapter:
+    if policy_type == "act":
+        return _act_adapter()
+    if policy_type == "molmoact2":
+        return _molmoact2_adapter(distributed_strategy, offload_tokenization)
+    if policy_type == "pi05":
+        return _pi05_adapter()
+    raise ValueError(f"unknown policy_type {policy_type!r}, expected one of ('act', 'molmoact2', 'pi05')")

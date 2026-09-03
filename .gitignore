@@ -1,0 +1,27 @@
+# secrets
+hf_tok.txt
+*.env
+
+# generated data / runs (large, regeneratable from source)
+training/lerobot_v3/
+training/runs/
+training/.cache/
+verify_out/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# editors / local machine settings
+.claude/
+.DS_Store
+
+# agent-facing notes, not part of the repo
+CLAUDE.md
+
+# course reference material -- not part of the shipped pipeline;
+# the two files it actually needs are vendored into training/vendor/
+ray_context/

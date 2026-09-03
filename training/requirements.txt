@@ -1,0 +1,29 @@
+# Works for both --policy-type act and --policy-type molmoact2 -- MolmoAct2
+# is bundled in this pinned lerobot version (verified directly against the
+# real public PyPI wheel: lerobot/policies/molmoact2/ is really in there),
+# no fork or separate environment needed. (An earlier version of this file
+# said otherwise, based on research against a fork branch that was never
+# cross-checked against what's actually pinned below -- see README's
+# "MolmoAct2 environment" section for the correction.)
+ray[data,train]>=2.51
+huggingface_hub
+mcap
+mcap-protobuf-support
+av
+numpy
+torch
+Pillow
+lerobot==0.6.1
+tensorboard
+
+# Optional: only needed if DataConfig.source_uri or --v3-root uses s3:// or
+# gs:// instead of hf:// / a local path (see README's "Data source" and
+# "Where the converted LeRobot v3 dataset lives" sections).
+# s3fs
+# gcsfs
+
+# Optional: only needed for --molmoact2-distributed-strategy fsdp2 (full
+# fine-tuning at scale) -- see README's "MolmoAct2 full fine-tuning (FSDP2)"
+# section. Not needed for --molmoact2-train-mode lora (the default), which
+# uses plain DDP like ACT.
+# accelerate>=1.13.0
