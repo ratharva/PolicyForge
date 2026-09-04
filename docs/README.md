@@ -7,28 +7,12 @@ downloads/converts a raw dataset into LeRobot v3; **training**
 an already-prepared v3 root and trains a policy. `train.py` never
 discovers/downloads/converts anything itself.
 
-## Start here -- one file per step, in order
+See the root [`README.md`](../README.md) for install/quick-start commands.
 
-1. [Setup](01-setup.md) -- install, `HF_TOKEN`, repo layout
-2. [Verify decode](02-verify-data.md) -- sanity-check one episode before converting anything
-3. [Prepare data](03-prepare-data.md) -- discover, download, convert to LeRobot v3
-4. [Train](04-train.md) -- run `train.py`, full CLI reference
-5. [View results](05-view-results.md) -- history, TensorBoard, what a run produces
+## Extending the pipeline
 
-## Deep dives -- for the parts you're expected to customize
-
-- [Customizing datasets](customizing-datasets.md) -- the three built-in
-  datasets (abc130k, droid, agibot_alpha), the schema YAML format, and how
-  to add a new one
-- [Customizing policies](customizing-policies.md) -- ACT, MolmoAct2, π0.5:
-  every policy-specific flag, LoRA vs. full fine-tune, FSDP2, normalization
 - [Extending: new dataset / robot / policy](extending.md) -- condensed,
-  procedural checklist for all three (the deep dives above have the *why*)
-
-## Also worth reading before a real run
-
-- [Verification status](verification-status.md) -- what's been run against
-  real data and what's still open, across the whole pipeline
+  procedural checklist for adding any of the three
 
 ## Repo layout
 
@@ -48,4 +32,5 @@ training/
   train_loop.py, train.py, prepare_data.py, history.py, requirements.txt
 ```
 
-Full detail on each piece lives in the step/deep-dive docs above, not here.
+Full detail on each piece lives in the code itself -- every module here has
+a docstring explaining its role and how it fits together.

@@ -1,10 +1,8 @@
 # Adding a new dataset, robot, or policy
 
-A condensed, procedural companion to [Customizing datasets](customizing-datasets.md)
-and [Customizing policies](customizing-policies.md) -- those two have the
-full narrative/verification history; this one is just "what do I actually
-touch." Read the relevant deep-dive too before writing real code -- this
-page skips the *why*.
+A condensed, procedural checklist for the three most common ways this
+pipeline gets extended -- "what do I actually touch," not the full
+narrative/verification history behind each design choice.
 
 ## 1. Add a new dataset
 
@@ -16,9 +14,10 @@ page skips the *why*.
    `training/data_prep/schemas/<your_dataset>.yaml`.
 2. Set the top-level fields for real, from the real raw data -- **download
    and inspect it yourself first**, don't trust a dataset card or a fetched
-   summary (see the droid correction in
-   [Customizing datasets](customizing-datasets.md#droid----droid-franka-panda-18-institution-consortium)
-   for why that's burned this project before):
+   summary (see `training/data_prep/schemas/droid.yaml`'s comment -- a
+   fetched dataset-card summary for DROID didn't match what downloading the
+   real `meta/info.json` showed, and this project has been burned by that
+   more than once):
    ```yaml
    dataset_source: your_dataset        # must match the filename
    ingestion_strategy: mcap            # or hf_lerobot_mirror / agibot_hdf5
@@ -32,9 +31,9 @@ page skips the *why*.
      - ["component_name", 6]
    ```
 3. Fill in the strategy-named block (`mcap:` / `hf_lerobot_mirror:` /
-   `agibot_hdf5:`) -- field meanings are strategy-specific, see
-   [Customizing datasets](customizing-datasets.md#the-schema-yaml-format)
-   for each block's real shape.
+   `agibot_hdf5:`) -- field meanings are strategy-specific; the closest
+   existing schema file for that strategy (`abc130k.yaml`, `droid.yaml`,
+   `agibot_alpha.yaml`) is the reference for each block's real shape.
 4. Nothing else to register -- `--dataset-source` choices are *discovered*
    from `training/data_prep/schemas/*.yaml`
    (`schema_loader.available_dataset_sources()`), not a hardcoded list.
@@ -120,10 +119,11 @@ confirmation, the droid `meta/info.json` correction).
 
 ## 3. Add a new policy
 
-Full detail: [Customizing policies](customizing-policies.md#adding-a-new-policy)
-and CLAUDE.md's "How to add a new policy" section (verified gotchas, the
-`get_optim_params()` LR-wiring trap, the fake-policy test pattern). Short
-version:
+The real gotchas worth knowing before you start: a policy's
+`get_optim_params()` can return grouped or flat LR params depending on the
+policy (check the installed source, don't assume), and a fake-policy
+integration test (see step 8) catches most real bugs before you ever need
+real weights.
 
 1. **`training/model/<policy>.py`** implementing the adapter contract
    (mirror `act.py` first):
@@ -171,8 +171,8 @@ version:
    Train worker function -- not patched driver-side, workers get a fresh
    import). Catches dtype mismatches, wrap-order bugs, checkpoint dispatch
    bugs without needing real weights or a big GPU.
-9. **Update `training/README.md`** (command reference table) and
-   `CLAUDE.md` if the addition changes any pattern above.
+9. **Update `training/README.md`** (command reference table) if the
+   addition changes any pattern above.
 
 `train_loop.py` (data iteration, DDP/FSDP wrap, checkpoint/resume, early
 stopping, TensorBoard) needs **no changes** -- it's ~90% identical across
