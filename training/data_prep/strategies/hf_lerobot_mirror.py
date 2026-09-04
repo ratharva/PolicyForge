@@ -32,6 +32,7 @@ class HfLerobotMirrorIngestionConfig:
     source_format_version: str
     camera_key_map: dict[str, str]
     read_path_smoke_test_repo_id: str | None = None
+    revision: str | None = None
 
 
 def build_ingestion_config(spec: dict) -> HfLerobotMirrorIngestionConfig:
@@ -41,6 +42,7 @@ def build_ingestion_config(spec: dict) -> HfLerobotMirrorIngestionConfig:
         source_format_version=m["source_format_version"],
         camera_key_map=dict(m["camera_key_map"]),
         read_path_smoke_test_repo_id=m.get("read_path_smoke_test_repo_id"),
+        revision=spec.get("revision"),
     )
 
 
@@ -64,8 +66,10 @@ def prepare(
     from lerobot.scripts.convert_dataset_v21_to_v30 import convert_dataset
 
     target_repo_id = repo_id or ingestion_cfg.full_repo_id
-    convert_dataset(repo_id=target_repo_id, root=v3_root, push_to_hub=False)
+    convert_dataset(repo_id=target_repo_id, branch=ingestion_cfg.revision, root=v3_root, push_to_hub=False)
 
-    params = compute_conversion_params(tasks, max_episodes_per_task, robot, image_size, dataset_source)
+    params = compute_conversion_params(
+        tasks, max_episodes_per_task, robot, image_size, dataset_source, revision=ingestion_cfg.revision,
+    )
     write_conversion_params(v3_root, params)
     return v3_root

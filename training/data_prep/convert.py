@@ -140,6 +140,7 @@ def convert_to_lerobot_v3(
 
     expected_params = compute_conversion_params(
         requested_tasks, max_episodes_per_task, robot, image_size, dataset_source,
+        revision=getattr(ingestion_cfg, "revision", None),
     )
     exists = dataset_exists(out_root)
 

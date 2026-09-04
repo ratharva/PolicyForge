@@ -37,7 +37,7 @@ class DatasetSource:
     ingestion_strategy: str
     robot: RobotSchema
     default_source_uri: str
-    ingestion_config: Any  # McapIngestionConfig | HfLerobotMirrorIngestionConfig | AgiBotHdf5IngestionConfig
+    ingestion_config: Any  # McapIngestionConfig | HfLerobotMirrorIngestionConfig | AgiBotHdf5IngestionConfig -- carries .revision
     # None for strategies that don't go through convert_to_lerobot_v3 (hf_lerobot_mirror) --
     # present for strategies that do their own Ray-parallel per-episode conversion.
     decode_and_align: Callable[..., dict] | None

@@ -39,6 +39,7 @@ class McapIngestionConfig:
     # Episode-relative path -> (split, task): "<path_prefix>/{split}/{task}/.../<episode_filename>"
     path_prefix: str
     episode_filename: str
+    revision: str | None = None
 
 
 def build_ingestion_config(spec: dict) -> McapIngestionConfig:
@@ -51,6 +52,7 @@ def build_ingestion_config(spec: dict) -> McapIngestionConfig:
         wrist_camera_topics=dict(m["wrist_camera_topics"]),
         path_prefix=m["path_prefix"],
         episode_filename=m["episode_filename"],
+        revision=spec.get("revision"),
     )
 
 
@@ -140,7 +142,7 @@ def read_raw_episode_streaming(
 
     from training.data_prep.source import open_fs
 
-    fs, fs_root = open_fs(source_uri, hf_token=token)
+    fs, fs_root = open_fs(source_uri, hf_token=token, revision=mcap_cfg.revision)
     full_path = f"{fs_root}/{rel_path}"
     with fs.open(full_path, mode="rb", block_size=0, cache_type="none") as f:
         reader = NonSeekingReader(f, decoder_factories=[DecoderFactory()])
@@ -205,7 +207,7 @@ def decode_and_align(
     if convert_cfg.mode == "download":
         from training.data_prep.source import download_one
 
-        local_path = download_one(source_uri, rel_path, token)
+        local_path = download_one(source_uri, rel_path, token, revision=mcap_cfg.revision)
         raw = read_raw_episode(local_path, robot, mcap_cfg)
     else:
         raw = read_raw_episode_streaming(source_uri, rel_path, robot, mcap_cfg, token)

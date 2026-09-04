@@ -66,6 +66,7 @@ def main() -> None:
 
         if not args.reconvert and is_prepared(
             v3_root, args.tasks, args.max_episodes_per_task, source.robot, DEFAULT_IMAGE_SIZE, args.dataset_source,
+            revision=source.ingestion_config.revision,
         ):
             print(f"Already prepared at {v3_root} -- pass --reconvert to rebuild it.")
             return
@@ -82,6 +83,7 @@ def main() -> None:
 
         if not args.reconvert and is_prepared(
             v3_root, args.tasks, args.max_episodes_per_task, source.robot, DEFAULT_IMAGE_SIZE, args.dataset_source,
+            revision=source.ingestion_config.revision,
         ):
             print(f"Already prepared at {v3_root} -- pass --reconvert to rebuild it.")
             return
@@ -113,6 +115,7 @@ def main() -> None:
 
     if is_prepared(
         v3_root, args.tasks, args.max_episodes_per_task, source.robot, image_size, args.dataset_source,
+        revision=source.ingestion_config.revision,
     ) and not args.reconvert:
         print(f"Already prepared at {v3_root} -- pass --reconvert to rebuild it.")
         return

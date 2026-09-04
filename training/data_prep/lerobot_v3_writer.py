@@ -62,14 +62,16 @@ CONVERSION_PARAMS_FILENAME = "conversion_params.json"
 
 def compute_conversion_params(
     tasks: list[str], max_episodes_per_task: int, robot: RobotSchema,
-    image_size: tuple[int, int], dataset_source: str,
+    image_size: tuple[int, int], dataset_source: str, revision: str | None = None,
 ) -> dict:
     """`tasks` are raw CLI substrings, not resolved task directory names --
     comparable both before discovery (train.py's is_prepared() gate) and
     after (convert.py's inner check) without re-resolving names either time.
     `dataset_source` lets train.py resolve the right RobotSchema back out of
     conversion_params.json without a --dataset-source flag in the common
-    case -- see training/data_prep/strategies/registry.py."""
+    case -- see training/data_prep/strategies/registry.py. `revision`
+    records the pinned source-repo commit this conversion actually used, so
+    a later pin change correctly reads as "stale, reconvert"."""
     return {
         "dataset_source": dataset_source,
         "tasks": sorted(tasks),
@@ -77,6 +79,7 @@ def compute_conversion_params(
         "tick_fps": robot.tick_fps,
         "image_size": list(image_size),
         "camera_keys": list(robot.camera_keys),
+        "revision": revision,
     }
 
 
@@ -329,16 +332,19 @@ def wipe_dataset(root: str) -> None:
     would require renumbering and renaming every subsequent episode's
     files -- not implemented. A full wipe + rebuild is simpler and correct.
 
-    Refuses to wipe root/home-shaped paths or anything missing meta/info.json."""
+    Refuses to wipe root/home-shaped paths or anything missing
+    meta/conversion_params.json -- that file (not meta/info.json, which any
+    LeRobot v3 dataset has regardless of who wrote it) is PolicyForge's own
+    marker."""
     fs, fs_root = open_fs(root)
     if "://" not in root:
         resolved = os.path.realpath(root)
         if resolved in ("/", os.path.expanduser("~")) or resolved == os.path.dirname(resolved):
             raise ValueError(f"refusing to wipe {root!r} -- resolves to {resolved!r}, looks like a real root/home directory")
-    if fs.exists(fs_root) and not fs.exists(f"{fs_root}/meta/info.json"):
+    if fs.exists(fs_root) and not fs.exists(f"{fs_root}/meta/{CONVERSION_PARAMS_FILENAME}"):
         raise ValueError(
-            f"refusing to wipe {root!r} -- no meta/info.json found there, so this doesn't "
-            f"look like a dataset this tool created"
+            f"refusing to wipe {root!r} -- no meta/{CONVERSION_PARAMS_FILENAME} found there, "
+            f"so this doesn't look like a dataset this tool created"
         )
     if fs.exists(fs_root):
         fs.rm(fs_root, recursive=True)

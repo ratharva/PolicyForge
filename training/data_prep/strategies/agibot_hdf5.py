@@ -104,6 +104,7 @@ class AgiBotHdf5IngestionConfig:
     state_hdf5_paths: dict[str, str]
     action_hdf5_paths: dict[str, str]
     video_filename_template: str
+    revision: str | None = None
 
 
 def build_ingestion_config(spec: dict) -> AgiBotHdf5IngestionConfig:
@@ -115,6 +116,7 @@ def build_ingestion_config(spec: dict) -> AgiBotHdf5IngestionConfig:
         state_hdf5_paths=dict(a["state_hdf5_paths"]),
         action_hdf5_paths=dict(a["action_hdf5_paths"]),
         video_filename_template=a["video_filename_template"],
+        revision=spec.get("revision"),
     )
 
 
@@ -123,10 +125,10 @@ def build_ingestion_config(spec: dict) -> AgiBotHdf5IngestionConfig:
 # ---------------------------------------------------------------------------
 
 
-def _load_task_info(repo_id: str, rel_path: str, token: str | None) -> list[dict]:
+def _load_task_info(repo_id: str, rel_path: str, token: str | None, revision: str | None = None) -> list[dict]:
     from huggingface_hub import hf_hub_download
 
-    local_path = hf_hub_download(repo_id, rel_path, repo_type="dataset", token=token)
+    local_path = hf_hub_download(repo_id, rel_path, repo_type="dataset", token=token, revision=revision)
     with open(local_path) as f:
         return json.load(f)
 
@@ -138,14 +140,14 @@ def list_tasks(source_uri: str, agibot_cfg: AgiBotHdf5IngestionConfig, token: st
 
     _, repo_id = parse_hf_uri(source_uri)
     api = HfApi(token=token)
-    files = api.list_repo_files(repo_id, repo_type="dataset", token=token)
+    files = api.list_repo_files(repo_id, repo_type="dataset", revision=agibot_cfg.revision)
     prefix = f"{agibot_cfg.task_info_dir}/task_"
     task_files = [f for f in files if f.startswith(prefix) and f.endswith(".json")]
 
     names_to_ids: dict[str, str] = {}
     for rel_path in task_files:
         task_id = rel_path[len(prefix):-len(".json")]
-        episodes = _load_task_info(repo_id, rel_path, token)
+        episodes = _load_task_info(repo_id, rel_path, token, revision=agibot_cfg.revision)
         if episodes:
             names_to_ids[episodes[0]["task_name"]] = task_id
     return names_to_ids
@@ -171,21 +173,25 @@ def select_task_episodes(
             print(f"  WARNING: {requested!r} matches {len(matches)} tasks {matches}; using {matches[0]!r}")
         task_name = matches[0]
         task_id = names_to_ids[task_name]
-        episodes = _load_task_info(repo_id, f"{agibot_cfg.task_info_dir}/task_{task_id}.json", token)
+        episodes = _load_task_info(
+            repo_id, f"{agibot_cfg.task_info_dir}/task_{task_id}.json", token, revision=agibot_cfg.revision,
+        )
         eids = sorted({str(e["episode_id"]) for e in episodes}, key=int)[:max_episodes_per_task]
         print(f"  {task_name}: using {len(eids)} episodes")
         selected[task_name] = (task_id, eids)
     return selected
 
 
-def _list_tar_shards(source_uri: str, prefix: str, token: str | None) -> list[tuple[int, int, str]]:
+def _list_tar_shards(
+    source_uri: str, prefix: str, token: str | None, revision: str | None = None,
+) -> list[tuple[int, int, str]]:
     """[(lo, hi, rel_path), ...] for every real "<prefix>/<lo>-<hi>.tar" in
     the repo. rel_path (not a resolved URL) is what download_one needs."""
     from huggingface_hub import HfApi
 
     _, repo_id = parse_hf_uri(source_uri)
     api = HfApi(token=token)
-    files = api.list_repo_files(repo_id, repo_type="dataset", token=token)
+    files = api.list_repo_files(repo_id, repo_type="dataset", revision=revision)
     shards = []
     for f in files:
         if not (f.startswith(prefix + "/") and f.endswith(".tar")):
@@ -204,7 +210,9 @@ def list_observation_shards(
 ) -> list[tuple[int, int, str]]:
     """[(lo, hi, rel_path), ...] for every real observations shard belonging
     to task_id -- task-scoped, unlike proprio_stats (see list_proprio_shards)."""
-    return _list_tar_shards(source_uri, f"{agibot_cfg.observations_tar_prefix}/{task_id}", token)
+    return _list_tar_shards(
+        source_uri, f"{agibot_cfg.observations_tar_prefix}/{task_id}", token, revision=agibot_cfg.revision,
+    )
 
 
 def list_proprio_shards(
@@ -212,7 +220,7 @@ def list_proprio_shards(
 ) -> list[tuple[int, int, str]]:
     """[(lo, hi, rel_path), ...] for every real proprio_stats shard --
     dataset-wide (today, one ~48GB tar covering every task), not per-task."""
-    return _list_tar_shards(source_uri, agibot_cfg.proprio_stats_tar_prefix, token)
+    return _list_tar_shards(source_uri, agibot_cfg.proprio_stats_tar_prefix, token, revision=agibot_cfg.revision)
 
 
 def download_task_observation_shards(
@@ -227,7 +235,10 @@ def download_task_observation_shards(
     different episode subset from the same task later needs no re-download
     (download_one's cache makes a repeat call for the same file a no-op)."""
     shards = list_observation_shards(source_uri, task_id, agibot_cfg, token)
-    return [(lo, hi, download_one(source_uri, rel_path, token, cache_dir)) for lo, hi, rel_path in shards]
+    return [
+        (lo, hi, download_one(source_uri, rel_path, token, cache_dir, revision=agibot_cfg.revision))
+        for lo, hi, rel_path in shards
+    ]
 
 
 def download_proprio_shards(
@@ -242,7 +253,10 @@ def download_proprio_shards(
     second task in the same run (or a later run) pays nothing extra for an
     already-downloaded shard."""
     shards = list_proprio_shards(source_uri, agibot_cfg, token)
-    return [(lo, hi, download_one(source_uri, rel_path, token, cache_dir)) for lo, hi, rel_path in shards]
+    return [
+        (lo, hi, download_one(source_uri, rel_path, token, cache_dir, revision=agibot_cfg.revision))
+        for lo, hi, rel_path in shards
+    ]
 
 
 def resolve_local_shards(
@@ -282,6 +296,10 @@ def resolve_local_shards(
 # ---------------------------------------------------------------------------
 
 
+MAX_TAR_MEMBER_BYTES = 2_000_000_000  # 2GB -- real proprio/video members are MBs, not GBs
+_COPY_CHUNK_BYTES = 8_000_000
+
+
 def _extract_from_local_tar(tar_path: str, wanted_names: set[str], out_dir: str) -> dict[str, str]:
     """Single-pass scan of an already-local tar, extracting every member
     whose name is in wanted_names as it's encountered and stopping once all
@@ -298,9 +316,13 @@ def _extract_from_local_tar(tar_path: str, wanted_names: set[str], out_dir: str)
             if not remaining:
                 break
             if member.isfile() and member.name in remaining:
+                if member.size > MAX_TAR_MEMBER_BYTES:
+                    raise ValueError(f"{member.name} in {tar_path} is {member.size} bytes, exceeds cap")
                 local_path = os.path.join(out_dir, member.name.replace("/", "__"))
+                src = tar.extractfile(member)
                 with open(local_path, "wb") as f:
-                    f.write(tar.extractfile(member).read())
+                    while chunk := src.read(_COPY_CHUNK_BYTES):
+                        f.write(chunk)
                 found[member.name] = local_path
                 remaining.discard(member.name)
     if remaining:
@@ -376,7 +398,9 @@ def prepare(
     force: bool = False,
 ) -> str:
     exists = dataset_exists(v3_root)
-    expected_params = compute_conversion_params(tasks, max_episodes_per_task, robot, image_size, dataset_source)
+    expected_params = compute_conversion_params(
+        tasks, max_episodes_per_task, robot, image_size, dataset_source, revision=agibot_cfg.revision,
+    )
     if exists and not force:
         stored = read_conversion_params(v3_root)
         if stored == expected_params:

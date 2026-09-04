@@ -23,6 +23,7 @@
 dataset_source: agibot_alpha
 ingestion_strategy: agibot_hdf5
 default_source_uri: "hf://datasets/agibot-world/AgiBotWorld-Alpha"
+revision: "128665c9e0244c45d1cbe5c13f5a4706afd24f27"
 tick_fps: 30.0   # confirmed twice, independently: real timestamp[] spacing
                  # (median diff 33.339ms) AND the real mp4's own encoded
                  # average_rate (both = 30)

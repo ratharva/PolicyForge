@@ -2,6 +2,7 @@
 dataset_source: abc130k
 ingestion_strategy: mcap
 default_source_uri: "hf://datasets/XDOF/ABC-130k"
+revision: "75ca0b88bda489f2bd935d72454593ecb90efb52"
 tick_fps: 30.0
 
 # Fixed-arity camera set this robot's episodes decode into. "top" is

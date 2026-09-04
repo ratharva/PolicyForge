@@ -14,6 +14,7 @@
 dataset_source: droid
 ingestion_strategy: hf_lerobot_mirror
 default_source_uri: "hf://datasets/cadene/droid_1.0.1"
+revision: "56b622ac23335c2bb5909e1e3c72416033c65acf"
 tick_fps: 15.0
 
 camera_keys: [exterior_1_left, exterior_2_left, wrist_left]

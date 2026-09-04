@@ -67,7 +67,7 @@ def resolve_v3_root(v3_root: str | None, dataset_source: str, tasks: list[str]) 
 
 def is_prepared(
     v3_root: str, tasks: list[str], max_episodes_per_task: int,
-    robot: RobotSchema, image_size: tuple[int, int], dataset_source: str,
+    robot: RobotSchema, image_size: tuple[int, int], dataset_source: str, revision: str | None = None,
 ) -> bool:
     """True only if v3_root exists AND was converted for this exact
     tasks/max_episodes_per_task/schema request -- not just "some dataset
@@ -76,7 +76,7 @@ def is_prepared(
     if not dataset_exists(v3_root):
         return False
     stored = read_conversion_params(v3_root)
-    expected = compute_conversion_params(tasks, max_episodes_per_task, robot, image_size, dataset_source)
+    expected = compute_conversion_params(tasks, max_episodes_per_task, robot, image_size, dataset_source, revision)
     return stored == expected
 
 
@@ -105,7 +105,7 @@ def prepare_dataset(
     by_task = list_episodes_by_task(
         token, source_uri, dataset_source,
         path_to_split_and_task=path_to_split_and_task, episode_filename=episode_filename,
-        refresh=refresh_listing,
+        refresh=refresh_listing, revision=getattr(ingestion_cfg, "revision", None),
     )
     selected = select_episodes(by_task, tasks, max_episodes_per_task)
 

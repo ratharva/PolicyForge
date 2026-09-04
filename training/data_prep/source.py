@@ -36,11 +36,14 @@ def requires_hf_token(source_uri: str) -> bool:
     return is_hf_uri(source_uri)
 
 
-def open_fs(source_uri: str, hf_token: str | None = None):
+def open_fs(source_uri: str, hf_token: str | None = None, revision: str | None = None):
     """Returns (fs, fs_root) via fsspec. hf_token is forwarded only for
     hf:// URIs; s3://gs:// sources rely on ambient credentials (the standard
-    boto3/gcloud credential chain)."""
+    boto3/gcloud credential chain). revision pins an hf:// URI to a specific
+    commit/branch/tag via the "hf://datasets/org/repo@revision" syntax."""
     import fsspec
+    if is_hf_uri(source_uri) and revision:
+        source_uri = f"{source_uri}@{revision}"
     if is_hf_uri(source_uri) and hf_token:
         return fsspec.core.url_to_fs(source_uri, token=hf_token)
     return fsspec.core.url_to_fs(source_uri)
@@ -61,6 +64,7 @@ def _reject_unsafe_rel_path(rel_path: str) -> None:
 
 def download_one(
     source_uri: str, rel_path: str, token: str | None = None, cache_dir: str | None = None,
+    revision: str | None = None,
 ) -> str:
     """Download rel_path from source_uri's backend to local disk, returning
     the local path. hf:// uses hf_hub_download (proven local caching, reused
@@ -73,6 +77,7 @@ def download_one(
         repo_type, repo_id = parse_hf_uri(source_uri)
         return hf_hub_download(
             repo_id=repo_id, repo_type=repo_type, filename=rel_path, token=token, cache_dir=cache_dir,
+            revision=revision,
         )
 
     fs, fs_root = open_fs(source_uri)

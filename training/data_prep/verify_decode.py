@@ -51,10 +51,10 @@ def main() -> None:
     by_task = list_episodes_by_task(
         token, source.default_source_uri, args.dataset_source,
         path_to_split_and_task=lambda p: path_to_split_and_task(p, mcap_cfg),
-        episode_filename=mcap_cfg.episode_filename,
+        episode_filename=mcap_cfg.episode_filename, revision=mcap_cfg.revision,
     )
     selected = select_episodes(by_task, [args.task], 1)
-    local = download_episodes(token, source.default_source_uri, selected)
+    local = download_episodes(token, source.default_source_uri, selected, revision=mcap_cfg.revision)
     task, paths = next(iter(local.items()))
     mcap_path = paths[0]
     print(f"\ndecoding {mcap_path}")

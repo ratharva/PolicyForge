@@ -25,7 +25,7 @@ def list_episodes_by_task(
     token: str | None, source_uri: str, dataset_source: str,
     path_to_split_and_task: Callable[[str], tuple[str, str]],
     episode_filename: str,
-    cache_path: str | None = None, refresh: bool = False,
+    cache_path: str | None = None, refresh: bool = False, revision: str | None = None,
 ) -> dict[str, list[str]]:
     """Full source listing, grouped by task. Walks the entire tree, so this
     is the slowest step -- cached to `cache_path` (default:
@@ -50,9 +50,9 @@ def list_episodes_by_task(
         from huggingface_hub import HfApi
         repo_type, repo_id = parse_hf_uri(source_uri)
         api = HfApi(token=token)
-        all_files = list(api.list_repo_files(repo_id, repo_type=repo_type))
+        all_files = list(api.list_repo_files(repo_id, repo_type=repo_type, revision=revision))
     else:
-        fs, fs_root = open_fs(source_uri)
+        fs, fs_root = open_fs(source_uri, revision=revision)
         all_files = [p[len(fs_root):].lstrip("/") for p in fs.find(fs_root)]
     print(f"  {len(all_files):,} files listed in {time.perf_counter() - t0:.1f}s")
 
@@ -99,7 +99,7 @@ def select_episodes(
 
 def download_episodes(
     token: str | None, source_uri: str,
-    selected: dict[str, list[str]], cache_dir: str | None = None,
+    selected: dict[str, list[str]], cache_dir: str | None = None, revision: str | None = None,
 ) -> dict[str, list[str]]:
     """Download every selected episode file. Returns {task: [local_path, ...]}."""
     local: dict[str, list[str]] = {}
@@ -110,7 +110,7 @@ def download_episodes(
         for rel_path in rel_paths:
             done += 1
             print(f"[{done}/{total}] downloading {rel_path}")
-            local_path = download_one(source_uri, rel_path, token, cache_dir)
+            local_path = download_one(source_uri, rel_path, token, cache_dir, revision=revision)
             local[task].append(local_path)
     return local
 
@@ -144,6 +144,7 @@ if __name__ == "__main__":
         tok, source.default_source_uri, args.dataset_source,
         path_to_split_and_task=lambda p: path_to_split_and_task(p, source.ingestion_config),
         episode_filename=source.ingestion_config.episode_filename,
+        revision=source.ingestion_config.revision,
     )
     for task, files in sorted(by_task.items(), key=lambda kv: -len(kv[1])):
         print(f"{len(files):6d}  {task}")

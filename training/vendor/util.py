@@ -18,8 +18,6 @@ import contextlib
 import logging
 import os
 import sys
-import tempfile
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -434,53 +432,6 @@ def resume_would_skip_training(start_epoch, num_epochs):
 
 
 # ============================================================================
-# Checkpoint I/O
-# ============================================================================
-def make_checkpoint(policy, optimizer, scaler, epoch, step, stats,
-                    base_model_repo, camera_rename):
-    """Pickle trainable-only state + dataset stats into a Ray Train Checkpoint.
-
-    Stats are included so tools/policy_server.py can rebuild the same preprocessor
-    at inference time without re-reading the dataset. base_model_repo and
-    camera_rename are saved as breadcrumbs for downstream consumers.
-    """
-    import ray.cloudpickle as pickle
-    import ray.train
-
-    trainable_keys = {k for k, p in policy.module.named_parameters() if p.requires_grad}
-    full_sd = policy.module.state_dict()
-    trainable_sd = {k: v for k, v in full_sd.items() if k in trainable_keys}
-
-    ckpt_dir = tempfile.mkdtemp(prefix="pi05_ckpt_")
-    with open(os.path.join(ckpt_dir, "state.pkl"), "wb") as f:
-        pickle.dump(
-            {"model":            trainable_sd,
-             "optim":            optimizer.state_dict(),
-             "scaler":           scaler.state_dict(),
-             "epoch":            epoch,
-             "step":             step,
-             "stats":            stats,
-             "base_model_repo":  base_model_repo,
-             "camera_rename":    camera_rename},
-            f,
-        )
-    return ray.train.Checkpoint.from_directory(ckpt_dir)
-
-
-def load_checkpoint(checkpoint, policy, optimizer, scaler):
-    """Restore from a Ray Train checkpoint. Returns (start_epoch, start_step)."""
-    import ray.cloudpickle as pickle
-    with checkpoint.as_directory() as d:
-        with open(os.path.join(d, "state.pkl"), "rb") as f:
-            state = pickle.load(f)
-    policy.module.load_state_dict(state["model"], strict=False)
-    optimizer.load_state_dict(state["optim"])
-    if "scaler" in state:
-        scaler.load_state_dict(state["scaler"])
-    return state["epoch"] + 1, state.get("step", 0)
-
-
-# ============================================================================
 # Phase transitions: host-RAM headroom gating
 # ============================================================================
 def node_host_memory(ray_module):
@@ -604,59 +555,3 @@ def release_phase(ray_module, log_fn=print):
         for n in nodes
     ])
     log_fn(f"released phase state on {len(nodes)} GPU node(s)")
-
-
-# ============================================================================
-# Per-node HF snapshot staging (model only -- datasets are streamed via hf://)
-# ============================================================================
-def stage_model_to_local(source_uri, local_dir):
-    """Sync a model/config dir from a public S3 mirror to `local_dir` if not present.
-
-    `source_uri` is an ``s3://`` prefix. We use the AWS CLI with
-    ``--no-sign-request`` so any cluster reads the public bucket without
-    needing credentials for it. Idempotent: skips the sync when config.json
-    is already present (e.g. already staged on this node, or baked into the
-    image).
-    """
-    local_dir = Path(local_dir)
-    if (local_dir / "config.json").exists():
-        return f"cached: {local_dir}"
-    local_dir.mkdir(parents=True, exist_ok=True)
-    import subprocess
-    subprocess.run(
-        ["aws", "s3", "sync", str(source_uri), str(local_dir),
-         "--no-sign-request", "--only-show-errors"],
-        check=True,
-    )
-    return f"downloaded: {local_dir}"
-
-
-def stage_on_all_nodes(ray_module, stage_fn, label, dest, log_fn=print):
-    """Run stage_fn on the head node and every live GPU worker node.
-
-    Each GPU node has its own /mnt/local_storage (per-node disk), so we
-    pin a tiny num_cpus=0 task to each node and have it run the same
-    snapshot_download call. log_fn defaults to print but can be log.info.
-    """
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-    log_fn(f"Staging {label} -> {dest} ...")
-    log_fn(f"  on head: {stage_fn()}")
-
-    nodes = [n for n in ray_module.nodes()
-             if n.get("Alive") and n.get("Resources", {}).get("GPU")]
-
-    @ray_module.remote(num_cpus=0)
-    def _stage():
-        return stage_fn()
-
-    futures = [
-        _stage.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=n["NodeID"], soft=False,
-            )
-        ).remote()
-        for n in nodes
-    ]
-    for n, status in zip(nodes, ray_module.get(futures)):
-        log_fn(f"  {n['NodeManagerHostname']}: {status}")
