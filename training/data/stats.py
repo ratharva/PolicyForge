@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from training.config import DataConfig
+from training.common.config import DataConfig
 
 
 def compute_dataset_stats(ds, cfg: DataConfig, n_samples: int = 500) -> dict:

@@ -8,7 +8,7 @@ Two ways to get a training-ready Ray Dataset:
                                   uses by default anymore.
 
   build_lerobot_v3_dataset()  -- reads an already-converted LeRobot v3 root
-                                  (see training/data/convert.py) via
+                                  (see training/data_prep/convert.py) via
                                   training/vendor/lerobot_datasource.py's
                                   LeRobotDatasource. This is train.py's
                                   default path.
@@ -24,10 +24,10 @@ from typing import Any
 import numpy as np
 import ray
 
-from training.config import DataConfig
-from training.data.decode import read_raw_episode
-from training.data.episode import align_episode, chunk_actions
-from training.data.video_decode import decode_camera_stream
+from training.common.robots import RobotSchema
+from training.data.action_chunk import chunk_actions
+from training.data_prep.strategies.mcap import McapIngestionConfig, align_episode, read_raw_episode
+from training.data_prep.video_decode import decode_camera_stream
 
 
 def _set_name(ds: "ray.data.Dataset", name: str | None) -> "ray.data.Dataset":
@@ -44,14 +44,17 @@ def _set_name(ds: "ray.data.Dataset", name: str | None) -> "ray.data.Dataset":
 # ---------------------------------------------------------------------------
 
 
-def _decode_episode_row(row: dict[str, Any], cfg: DataConfig, chunk_size: int) -> list[dict[str, Any]]:
+def _decode_episode_row(
+    row: dict[str, Any], robot: RobotSchema, mcap_cfg: McapIngestionConfig,
+    image_size: tuple[int, int], chunk_size: int,
+) -> list[dict[str, Any]]:
     mcap_path = row["path"]
     task = row["task"]
     try:
-        raw = read_raw_episode(mcap_path, cfg)
+        raw = read_raw_episode(mcap_path, robot, mcap_cfg)
         for cam_key in list(raw.cameras):
-            raw.cameras[cam_key] = decode_camera_stream(raw.cameras[cam_key], cfg.image_size)
-        aligned = align_episode(raw, cfg)
+            raw.cameras[cam_key] = decode_camera_stream(raw.cameras[cam_key], image_size)
+        aligned = align_episode(raw, robot)
     except ValueError as e:
         print(f"WARNING: skipping {mcap_path} ({task}): {e}")
         return []
@@ -66,26 +69,28 @@ def _decode_episode_row(row: dict[str, Any], cfg: DataConfig, chunk_size: int) -
             "action": action_chunks[i].astype(np.float32),
             "action_is_pad": is_pad[i],
         }
-        for cam_key in cfg.robot.camera_keys:
+        for cam_key in robot.camera_keys:
             item[f"observation.images.{cam_key}"] = aligned[f"image.{cam_key}"][i]  # uint8 HWC
         out.append(item)
     return out
 
 
 def build_dataset_direct(
-    local_by_task: dict[str, list[str]], cfg: DataConfig, chunk_size: int, name: str | None = None,
+    local_by_task: dict[str, list[str]], robot: RobotSchema, mcap_cfg: McapIngestionConfig,
+    image_size: tuple[int, int], chunk_size: int, name: str | None = None,
 ) -> "ray.data.Dataset":
-    """Decodes MCAP directly, no LeRobot v3 conversion. Rows come out HWC
-    uint8 (NOT transposed) -- if wiring this into train_loop.py, either add a
-    transpose stage (see transpose_for_training below) or use a collate that
-    permutes on the way to the GPU, not vendor/util.py's NumpyToTorchCollate as-is."""
+    """Decodes MCAP directly, no LeRobot v3 conversion -- mcap ingestion
+    strategy only. Rows come out HWC uint8 (NOT transposed) -- if wiring
+    this into train_loop.py, either add a transpose stage (see
+    transpose_for_training below) or use a collate that permutes on the way
+    to the GPU, not vendor/util.py's NumpyToTorchCollate as-is."""
     rows = [
         {"path": p, "task": task}
         for task, paths in local_by_task.items()
         for p in paths
     ]
     ds = ray.data.from_items(rows)
-    ds = ds.flat_map(_decode_episode_row, fn_args=(cfg, chunk_size))
+    ds = ds.flat_map(_decode_episode_row, fn_args=(robot, mcap_cfg, image_size, chunk_size))
     return _set_name(ds, name)
 
 
@@ -104,15 +109,26 @@ def build_lerobot_v3_dataset(v3_root: str, chunk_size: int) -> "ray.data.Dataset
     (action_chunk_size=chunk_size). Sample THIS (pre-transpose) for
     normalization stats -- see training/data/stats.py and train.py's call order.
 
-    lerobot_v3_writer.py names video features with the short camera key (e.g.
-    "top") to match meta/episodes' `videos/{key}/...` columns, which
-    LeRobotDatasource requires -- renamed here to what the rest of the
-    training pipeline (NumpyToTorchCollate, ACTConfig) expects.
+    training/data_prep/lerobot_v3_writer.py names video features with the
+    short camera key (e.g. "top") to match meta/episodes' `videos/{key}/...`
+    columns, which LeRobotDatasource requires -- renamed here to what the
+    rest of the training pipeline (NumpyToTorchCollate, ACTConfig) expects.
+
+    A dataset NOT built by our own writer (e.g. the droid ingestion
+    strategy's output, produced by lerobot's own official
+    convert_dataset_v21_to_v30.py) already stores video_keys fully
+    qualified as "observation.images.<name>" -- confirmed by a real
+    conversion + read-back, which without this guard double-prefixed every
+    image column into "observation.images.observation.images.<name>". Only
+    keys that aren't already prefixed get renamed.
     """
     from training.vendor.lerobot_datasource import LeRobotDatasource
 
     source = LeRobotDatasource(v3_root, action_chunk_size=chunk_size)
-    rename = {k: f"observation.images.{k}" for k in source.meta.video_keys}
+    rename = {
+        k: f"observation.images.{k}" for k in source.meta.video_keys
+        if not k.startswith("observation.images.")
+    }
     return ray.data.read_datasource(source).map(_rename_columns, fn_args=(rename,))
 
 

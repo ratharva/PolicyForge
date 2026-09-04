@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import torch
 
-from training.config import DataConfig, Pi05ConfigOverrides, TrainConfig
+from training.common.config import DataConfig
+from training.config import Pi05ConfigOverrides, TrainConfig
 
 
 def build_pi05_config(

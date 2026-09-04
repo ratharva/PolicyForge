@@ -1,47 +1,49 @@
-"""Convert MCAP episodes into one combined LeRobot v3 dataset root (all
-requested tasks in one root, distinguished by task_index).
+"""Convert episodes into one combined LeRobot v3 dataset root (all
+requested tasks in one root, distinguished by task_index). Orchestration
+(concurrency, incremental manifest diffing, finalize_dataset) is dataset-
+agnostic -- only the actual decode+align step is per ingestion strategy,
+injected as decode_and_align_fn (see training/data_prep/strategies/mcap.py's
+decode_and_align, the only one this project has exercised against real data
+so far; strategies/agibot_hdf5.py will use this the same way once its
+schema is filled in -- see that module's docstring).
 
 Source is DataConfig.source_uri -- hf://, s3://, or gs:// -- see
-training/data/source.py. Only hf:// has been run against real data.
+training/data_prep/source.py. Only hf:// has been run against real data.
 
 Two independent, configurable trade-offs (see ConvertConfig in
-training/config.py): mode="stream" (default, no local .mcap ever written)
-vs. mode="download" (pulls episode.mcap to local disk first); and
-parallel_camera_decode (all cameras decode concurrently within one episode
-task vs. one after another -- faster per-episode isn't the same as better
-throughput if memory is what actually caps max_concurrent).
+training/data_prep/config.py): mode="stream" (default, no local file ever
+written) vs. mode="download" (pulls the raw episode file to local disk
+first); and parallel_camera_decode (all cameras decode concurrently within
+one episode task vs. one after another -- faster per-episode isn't the same
+as better throughput if memory is what actually caps max_concurrent).
 
-One Ray task per episode does the expensive part (read + decode + align +
-video encode) in parallel; a cheap sequential pass on the driver then
-patches global row indices and writes dataset-level metadata (see
-lerobot_v3_writer.py). Concurrency is bounded by estimated per-episode
-memory use (_estimate_episode_memory_bytes), since each episode task holds
-a full episode's decoded video frames in memory at once.
+One Ray task per episode does the expensive part (decode_and_align_fn) in
+parallel; a cheap sequential pass on the driver then patches global row
+indices and writes dataset-level metadata (see lerobot_v3_writer.py).
+Concurrency is bounded by estimated per-episode memory use
+(_estimate_episode_memory_bytes), since each episode task holds a full
+episode's decoded video frames in memory at once.
 """
 from __future__ import annotations
 
-import concurrent.futures
 import itertools
+from typing import Callable
 
 import ray
 
-from training.config import ConvertConfig, DataConfig
-from training.data.decode import read_raw_episode, read_raw_episode_streaming
-from training.data.episode import align_episode
-from training.data.source import download_one
-from training.data.lerobot_v3_writer import (
+from training.common.robots import RobotSchema
+from training.data_prep.config import ConvertConfig
+from training.data_prep.incremental import plan_incremental_conversion
+from training.data_prep.lerobot_v3_writer import (
     EpisodeRecord,
     compute_conversion_params,
     dataset_exists,
     finalize_dataset,
     read_conversion_params,
-    read_episode_manifest,
-    wipe_dataset,
     write_conversion_params,
     write_episode,
     write_episode_manifest,
 )
-from training.data.video_decode import decode_camera_stream
 
 
 def _cpus_per_episode(convert_cfg: ConvertConfig) -> int:
@@ -52,29 +54,12 @@ def _cpus_per_episode(convert_cfg: ConvertConfig) -> int:
 
 @ray.remote
 def _convert_one(
-    source_uri: str, rel_path: str, task: str, episode_index: int, task_index: int,
-    cfg: DataConfig, out_root: str, token: str | None, convert_cfg: ConvertConfig,
+    decode_and_align_fn: Callable[..., dict], source_uri: str, rel_path: str, task: str,
+    episode_index: int, task_index: int, robot: RobotSchema, image_size: tuple[int, int],
+    out_root: str, token: str | None, convert_cfg: ConvertConfig, ingestion_cfg: object,
 ) -> EpisodeRecord | None:
     try:
-        if convert_cfg.mode == "download":
-            local_path = download_one(source_uri, rel_path, token)
-            raw = read_raw_episode(local_path, cfg)
-        else:
-            raw = read_raw_episode_streaming(source_uri, rel_path, cfg, token)
-
-        if convert_cfg.parallel_camera_decode:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(raw.cameras) or 1) as pool:
-                futures = {
-                    cam_key: pool.submit(decode_camera_stream, raw.cameras[cam_key], cfg.image_size)
-                    for cam_key in list(raw.cameras)
-                }
-                for cam_key, fut in futures.items():
-                    raw.cameras[cam_key] = fut.result()
-        else:
-            for cam_key in list(raw.cameras):
-                raw.cameras[cam_key] = decode_camera_stream(raw.cameras[cam_key], cfg.image_size)
-
-        aligned = align_episode(raw, cfg)
+        aligned = decode_and_align_fn(source_uri, rel_path, robot, ingestion_cfg, token, convert_cfg, image_size)
     except ValueError as e:
         print(f"WARNING: skipping {rel_path} ({task}): decode/align failure: {e}")
         return None
@@ -83,27 +68,31 @@ def _convert_one(
         # missing from the converted dataset (skipped count reported at the end).
         print(f"WARNING: skipping {rel_path} ({task}): network error: {e}")
         return None
-    return write_episode(out_root, episode_index, task, task_index, aligned, cfg)
+    return write_episode(out_root, episode_index, task, task_index, aligned, robot)
 
 
 def _estimate_episode_memory_bytes(
-    cfg: DataConfig, convert_cfg: ConvertConfig, max_frames_estimate: int = 6000,
+    robot: RobotSchema, image_size: tuple[int, int], convert_cfg: ConvertConfig,
+    max_frames_estimate: int = 6000,
 ) -> int:
     """Rough per-episode peak-memory estimate, used both as the memory=
     resource hint on each task and to compute a default max_concurrent.
-    All cameras' decoded frame lists must coexist by the time align_episode
-    runs; parallel_camera_decode additionally keeps that many PyAV decode
-    contexts simultaneously active. Not independently measured (only
-    wall-time was) -- treat this as a reasoned estimate, not a verified figure.
+    All cameras' decoded frame lists must coexist by the time
+    decode_and_align_fn returns; parallel_camera_decode additionally keeps
+    that many decode contexts simultaneously active (for strategies that
+    decode video, e.g. mcap -- a strategy without per-camera video decode
+    at all would see this as a conservative overestimate, which is fine).
+    Not independently measured (only wall-time was) -- treat this as a
+    reasoned estimate, not a verified figure.
     """
-    h, w = cfg.image_size
+    h, w = image_size
     frame_bytes = h * w * 3  # uint8 RGB
-    n_cameras = len(cfg.robot.camera_keys)
+    n_cameras = len(robot.camera_keys)
     one_camera_decoded = frame_bytes * max_frames_estimate  # one camera's finished decoded-frame list
 
     if convert_cfg.parallel_camera_decode:
         # All n_cameras actively decoding at once, each also duplicated by
-        # align_episode's stacked copy: n_cameras * 2x.
+        # the aligned stacked copy: n_cameras * 2x.
         total = one_camera_decoded * 2 * n_cameras
     else:
         # 1 camera actively decoding (2x: list + in-flight buffering) while
@@ -114,24 +103,28 @@ def _estimate_episode_memory_bytes(
 
 
 def convert_to_lerobot_v3(
-    episodes_by_task: dict[str, list[str]], cfg: DataConfig, out_root: str, token: str | None,
+    episodes_by_task: dict[str, list[str]], robot: RobotSchema, image_size: tuple[int, int],
+    out_root: str, token: str | None,
     requested_tasks: list[str], max_episodes_per_task: int,
-    source_uri: str,
+    source_uri: str, dataset_source: str,
+    decode_and_align_fn: Callable[..., dict], ingestion_cfg: object,
     convert_cfg: ConvertConfig | None = None,
     force: bool = False,
 ) -> str:
-    """episodes_by_task: {task: [source_uri-relative episode.mcap paths, ...]}
-    -- the output of training/data/discover.py's select_episodes(). Whether
-    anything gets downloaded to local disk depends on convert_cfg.mode (see
-    ConvertConfig in training/config.py). token is only meaningful for
-    hf:// source_uri.
+    """episodes_by_task: {task: [source_uri-relative episode paths, ...]}
+    -- the output of training/data_prep/discover.py's select_episodes().
+    Whether anything gets downloaded to local disk depends on
+    convert_cfg.mode (see ConvertConfig). token is only meaningful for hf://
+    source_uri. decode_and_align_fn/ingestion_cfg come from whichever
+    ingestion strategy this dataset_source uses (see strategies/registry.py)
+    -- e.g. strategies/mcap.py's decode_and_align + McapIngestionConfig.
 
     requested_tasks/max_episodes_per_task: the RAW request (CLI substrings,
     the cap you asked for), used to detect a stale conversion -- e.g. asking
     for more episodes/task than a prior conversion of the same task names.
     "meta/info.json exists" alone doesn't catch that.
 
-    Incremental: episodes already present (by HF rel_path, via the episode
+    Incremental: episodes already present (by rel_path, via the episode
     manifest) are reused untouched -- no re-streaming/re-decoding. If any
     previously-converted episode is no longer in the request (shrinking the
     cap, dropping a task, etc.), this falls back to a full wipe + rebuild
@@ -145,7 +138,9 @@ def convert_to_lerobot_v3(
     if convert_cfg.mode not in ("stream", "download"):
         raise ValueError(f"convert_cfg.mode must be 'stream' or 'download', got {convert_cfg.mode!r}")
 
-    expected_params = compute_conversion_params(requested_tasks, max_episodes_per_task, cfg)
+    expected_params = compute_conversion_params(
+        requested_tasks, max_episodes_per_task, robot, image_size, dataset_source,
+    )
     exists = dataset_exists(out_root)
 
     if exists and not force:
@@ -162,49 +157,11 @@ def convert_to_lerobot_v3(
         # that hasn't run yet) counts as a mismatch too -- everything below is
         # then treated as new.
 
-    requested = [
-        (task, rel_path) for task in sorted(episodes_by_task) for rel_path in episodes_by_task[task]
-    ]
-    requested_rel_paths = {rel_path for _, rel_path in requested}
+    plan = plan_incremental_conversion(out_root, episodes_by_task, exists=exists, force=force)
+    to_convert, reused, task_to_index = plan.to_convert, plan.reused, plan.task_to_index
 
-    manifest = [] if force else read_episode_manifest(out_root)
-    removed = [e for e in manifest if e["rel_path"] not in requested_rel_paths]
-    if manifest and removed:
-        print(
-            f"{len(removed)} previously-converted episode(s) are no longer requested -- "
-            f"wiping {out_root} and doing a full reconvert."
-        )
-        wipe_dataset(out_root)
-        manifest = []
-    elif force and exists:
-        print(f"--reconvert: wiping {out_root} and rebuilding from scratch.")
-        wipe_dataset(out_root)
-
-    manifest_by_rel_path = {e["rel_path"]: e for e in manifest}
-    to_convert = [(task, rp) for task, rp in requested if rp not in manifest_by_rel_path]
-    reused = [manifest_by_rel_path[rp] for _, rp in requested if rp in manifest_by_rel_path]
-
-    if reused:
-        print(f"{len(reused)} episode(s) already converted -- reusing (no re-stream/re-decode).")
-    if not to_convert:
-        print("Nothing new to convert.")
-    else:
-        print(f"Converting {len(to_convert)} new episode(s) ...")
-
-    # task_index must stay stable across runs -- it's baked permanently into
-    # each episode's data file. Existing tasks keep their assigned index;
-    # only genuinely new tasks get a new one, appended after the current max.
-    existing_task_index = {e["task"]: e["task_index"] for e in manifest}
-    next_task_index = max(existing_task_index.values(), default=-1) + 1
-    task_to_index = dict(existing_task_index)
-    for task in sorted(episodes_by_task):
-        if task not in task_to_index:
-            task_to_index[task] = next_task_index
-            next_task_index += 1
-
-    # Same for episode_index: existing episodes keep theirs, new ones append.
-    next_episode_index = max((e["episode_index"] for e in manifest), default=-1) + 1
     specs = []  # (rel_path, task, episode_index, task_index)
+    next_episode_index = plan.next_episode_index
     for task, rel_path in to_convert:
         specs.append((rel_path, task, next_episode_index, task_to_index[task]))
         next_episode_index += 1
@@ -212,7 +169,7 @@ def convert_to_lerobot_v3(
     new_records: list[EpisodeRecord] = []
     if specs:
         cpus_per_episode = _cpus_per_episode(convert_cfg)
-        per_episode_memory = _estimate_episode_memory_bytes(cfg, convert_cfg)
+        per_episode_memory = _estimate_episode_memory_bytes(robot, image_size, convert_cfg)
         max_concurrent = convert_cfg.max_concurrent
         if max_concurrent is None:
             resources = ray.cluster_resources()
@@ -235,7 +192,8 @@ def convert_to_lerobot_v3(
         def _submit(spec: tuple) -> None:
             rel_path, task, ep_idx, task_idx = spec
             ref = _convert_one.options(num_cpus=cpus_per_episode, memory=per_episode_memory).remote(
-                source_uri, rel_path, task, ep_idx, task_idx, cfg, out_root, token, convert_cfg,
+                decode_and_align_fn, source_uri, rel_path, task, ep_idx, task_idx,
+                robot, image_size, out_root, token, convert_cfg, ingestion_cfg,
             )
             pending[ref] = spec
 
@@ -269,7 +227,7 @@ def convert_to_lerobot_v3(
     if not all_records:
         raise RuntimeError("no episodes available -- every conversion failed and nothing was reused")
 
-    finalize_dataset(out_root, all_records, cfg, task_to_index)
+    finalize_dataset(out_root, all_records, robot, image_size, task_to_index)
     write_conversion_params(out_root, expected_params)
 
     # rel_path is only known here (not on EpisodeRecord); rebuild the manifest

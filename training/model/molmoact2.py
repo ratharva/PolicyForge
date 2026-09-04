@@ -11,7 +11,8 @@ import os
 
 import torch
 
-from training.config import DataConfig, MolmoAct2ConfigOverrides, TrainConfig
+from training.common.config import DataConfig
+from training.config import MolmoAct2ConfigOverrides, TrainConfig
 
 
 def build_molmoact2_config(

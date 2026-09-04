@@ -1,0 +1,40 @@
+# XDOF/ABC-130k's teleop-station export -- MCAP files, protobuf-encoded.
+dataset_source: abc130k
+ingestion_strategy: mcap
+default_source_uri: "hf://datasets/XDOF/ABC-130k"
+tick_fps: 30.0
+
+# Fixed-arity camera set this robot's episodes decode into. "top" is
+# populated from whichever of mcap.top_camera_candidates is present in a
+# given episode, keeping downstream shapes (e.g. ACTConfig's
+# input_features) fixed regardless of which station recorded an episode.
+camera_keys: [top, left_wrist, right_wrist]
+
+# (topic, dim) pairs, concatenated in order into one state/action vector.
+state_components:
+  - ["/left-arm-state", 6]
+  - ["/left-ee-state", 1]
+  - ["/right-arm-state", 6]
+  - ["/right-ee-state", 1]
+action_components:
+  - ["/left-arm-action", 6]
+  - ["/left-ee-action", 1]
+  - ["/right-arm-action", 6]
+  - ["/right-ee-action", 1]
+
+# Only read by the "mcap" ingestion strategy (training/data_prep/strategies/mcap.py).
+mcap:
+  # Field names within a decoded protobuf message.
+  state_value_field: position   # decoded state/action message's value field
+  camera_data_field: data       # decoded camera message's raw-bytes field
+  camera_format_field: format   # decoded camera message's codec-name field
+  # Only one "top" feed is kept even if a station publishes more than one
+  # top-camera topic -- locked to whichever candidate is seen first in an
+  # episode (see mcap.py's _extract()).
+  top_camera_candidates: ["/top-camera", "/top-left-camera"]
+  wrist_camera_topics:
+    left_wrist: /left-wrist-camera
+    right_wrist: /right-wrist-camera
+  # Episode-relative path -> (split, task): "data/{split}/{task}/episode_*/episode.mcap"
+  path_prefix: data
+  episode_filename: episode.mcap

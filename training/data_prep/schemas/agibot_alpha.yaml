@@ -1,0 +1,92 @@
+# AgiBot World Alpha (mobile dual-arm robot, 6-DoF dexterous hand).
+#
+# Real repo structure AND real data, confirmed by actually downloading and
+# inspecting real files after getting gated access (previous drafts of this
+# file were sourced from a third-party converter's BETA config and dataset-
+# card prose -- both now independently confirmed correct for Alpha too,
+# not just assumed):
+#   observations/<task_id>/<episode_range>.tar  -- per-task video tars
+#     (~25-49GB each). Internal layout: <episode_id>/videos/<camera_key>_color.mp4,
+#     <episode_id>/depth/head_depth_<frame>.png (depth: head camera only).
+#   proprio_stats/648533-923022.tar  -- ONE 48GB tar for the WHOLE dataset.
+#     Internal layout: <task_id>/<episode_id>/proprio_stats.h5
+#   task_info/task_<id>.json  -- a LIST of episode dicts: episode_id,
+#     label_info.action_config (sub-action segments: start_frame/end_frame/
+#     action_text/skill), task_name, init_scene_text.
+#
+# NONE of these tars have an index -- confirmed no random access is
+# possible; a member can only be reached by streaming from the start of its
+# tar. Real HDF5 keys/shapes/tick rate below were confirmed by streaming
+# JUST far enough into one real (task 389) episode's tar entries to extract
+# one full ~1.1MB proprio_stats.h5 and one ~29MB video file (a few hundred
+# MB of real streamed bytes total, not a full 48GB download).
+dataset_source: agibot_alpha
+ingestion_strategy: agibot_hdf5
+default_source_uri: "hf://datasets/agibot-world/AgiBotWorld-Alpha"
+tick_fps: 30.0   # confirmed twice, independently: real timestamp[] spacing
+                 # (median diff 33.339ms) AND the real mp4's own encoded
+                 # average_rate (both = 30)
+
+camera_keys: [head, head_center_fisheye, head_left_fisheye, head_right_fisheye,
+              hand_left, hand_right, back_left_fisheye, back_right_fisheye]
+# All 8 confirmed present as real <key>_color.mp4 files in a real episode's
+# video tar entry -- not narrowed to a subset; a future conversion can pick
+# fewer if 8 cameras is more than needed for training.
+
+# (component name, dim) pairs -- component name is the real HDF5 group path
+# under "state/"/"action/" (see agibot_hdf5: block below). Only the
+# components that were non-empty (real data, not shape (0,)) in the real
+# episode inspected are listed -- e.g. state/effector/force, state/end/
+# velocity, action/joint/effort etc. all exist in the file but are empty
+# for this robot config, so they're excluded here, not because they were
+# guessed to be irrelevant.
+state_components:
+  - ["effector/position", 2]
+  - ["end/orientation", 8]    # real shape (T, 2, 4), flattened to 8
+  - ["end/position", 6]        # real shape (T, 2, 3), flattened to 6
+  - ["head/position", 2]
+  - ["joint/current_value", 14]
+  - ["joint/position", 14]
+  - ["robot/orientation", 4]
+  - ["robot/position", 3]
+  - ["waist/position", 2]
+action_components:
+  - ["effector/position", 2]
+  - ["end/orientation", 8]
+  - ["end/position", 6]
+  - ["head/position", 2]
+  - ["joint/position", 14]
+  - ["robot/velocity", 2]
+  - ["waist/position", 2]
+
+# Only read by the "agibot_hdf5" ingestion strategy
+# (training/data_prep/strategies/agibot_hdf5.py).
+agibot_hdf5:
+  observations_tar_prefix: observations   # observations/<task_id>/<range>.tar
+  proprio_stats_tar_prefix: proprio_stats  # proprio_stats/<range>.tar (whole-dataset, one file)
+  task_info_dir: task_info                 # task_info/task_<id>.json
+  # component name -> real HDF5 dataset path (relative to "state/"/"action/").
+  # Multi-dim components (end/orientation, end/position) are read as-is and
+  # flattened (T, 2, 4) -> (T, 8) / (T, 2, 3) -> (T, 6) by the strategy code,
+  # not pre-flattened here.
+  state_hdf5_paths:
+    effector/position: effector/position
+    end/orientation: end/orientation
+    end/position: end/position
+    head/position: head/position
+    joint/current_value: joint/current_value
+    joint/position: joint/position
+    robot/orientation: robot/orientation
+    robot/position: robot/position
+    waist/position: waist/position
+  action_hdf5_paths:
+    effector/position: effector/position
+    end/orientation: end/orientation
+    end/position: end/position
+    head/position: head/position
+    joint/position: joint/position
+    robot/velocity: robot/velocity
+    waist/position: waist/position
+  # Real, confirmed video filename inside <episode_id>/videos/ within the
+  # observations tar.
+  video_filename_template: "{camera_key}_color.mp4"

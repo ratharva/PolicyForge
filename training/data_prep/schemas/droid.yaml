@@ -1,0 +1,45 @@
+# DROID (Franka Panda, 18-institution consortium).
+#
+# CORRECTED from an earlier draft after actually downloading real
+# meta/info.json files rather than trusting a fetched summary (the general
+# lesson this project keeps re-learning): the two HF mirrors this draft
+# originally assumed were schema-identical "full vs. sample" copies are NOT
+# -- IPEC-COMMUNITY/droid_lerobot is codebase_version v2.0 (unsupported by
+# lerobot's own v2.1->v3.0 migration script, which hard-validates for v2.1
+# specifically), while lerobot/droid_100 is ALREADY v3.0 but with a
+# different flattened observation.state dim (7, not 8). cadene/droid_1.0.1
+# is the real v2.1 mirror lerobot's own official porting-guide tooling
+# targets (confirmed: 95,600 episodes, robot_type Franka, matches the
+# porting guide's own DROID_FEATURES schema) -- used here instead.
+dataset_source: droid
+ingestion_strategy: hf_lerobot_mirror
+default_source_uri: "hf://datasets/cadene/droid_1.0.1"
+tick_fps: 15.0
+
+camera_keys: [exterior_1_left, exterior_2_left, wrist_left]
+
+# Real flat columns confirmed directly from cadene/droid_1.0.1's own
+# meta/info.json (not the decomposed observation.state.{gripper,cartesian,
+# joint}_position sub-fields also present in that dataset -- those aren't
+# needed since the flat combined columns already exist).
+state_components:
+  - ["observation.state", 8]
+action_components:
+  - ["action", 8]
+
+# Only read by the "hf_lerobot_mirror" ingestion strategy
+# (training/data_prep/strategies/hf_lerobot_mirror.py).
+hf_lerobot_mirror:
+  full_repo_id: cadene/droid_1.0.1
+  source_format_version: v2.1   # lerobot's convert_dataset_v21_to_v30.py handles this directly
+  # This mirror's real column names -> our logical camera_keys above.
+  camera_key_map:
+    exterior_1_left: observation.images.exterior_1_left
+    exterior_2_left: observation.images.exterior_2_left
+    wrist_left: observation.images.wrist_left
+  # lerobot/droid_100 (2GB, already v3.0, open access) is a fast way to
+  # smoke-test that OUR reader (training/vendor/lerobot_datasource.py) can
+  # load a real HF LeRobot v3 mirror at all -- but its state_dim (7, no
+  # padding dim) differs from this schema's (8), so it's a read-path
+  # sanity check only, not a stand-in for real full_repo_id conversion.
+  read_path_smoke_test_repo_id: lerobot/droid_100

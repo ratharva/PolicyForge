@@ -1,34 +1,13 @@
-"""Central configuration for the training pipeline. Every tunable lives here."""
+"""Training-time configuration: hyperparameters and per-policy overrides.
+DataConfig (the dataset/robot description shared with data prep) lives in
+training/common/config.py -- see that module and
+training/data_prep/schema_loader.py for how a --dataset-source populates it.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from training.robots import RobotSchema, XDOFABCRobot
-
-
-@dataclass
-class DataConfig:
-    # "hf://datasets/<repo_id>" (gated repos need HF_TOKEN), "s3://<bucket>/<prefix>",
-    # or "gs://<bucket>/<prefix>". See training/data/source.py for backend details --
-    # only the hf:// path has been run against real data.
-    source_uri: str = "hf://datasets/XDOF/ABC-130k"
-    cache_dir: str | None = None  # None -> huggingface_hub's default cache
-
-    # Which robot's MCAP export convention source_uri's data follows -- topic
-    # names, message field names, tick rate, and directory layout all live on
-    # this object (see training/robots.py).
-    robot: RobotSchema = field(default_factory=XDOFABCRobot)
-
-    # Training-time preprocessing choice, not a property of the robot itself.
-    image_size: tuple[int, int] = (224, 224)  # (H, W), resized on decode
-
-
-@dataclass
-class ConvertConfig:
-    """Tunables for MCAP -> LeRobot v3 conversion (training/data/convert.py)."""
-    mode: str = "stream"  # "stream" (read MCAP over HTTP) | "download" (cache locally first)
-    parallel_camera_decode: bool = True  # decode all cameras per episode concurrently vs. sequentially
-    max_concurrent: int | None = None  # None -> derive from live CPU/memory
+from training.common.config import DataConfig
 
 
 @dataclass
@@ -148,9 +127,9 @@ class RunConfig:
     # it from the working_dir upload by its resolved path (see
     # build_runtime_env in train.py); a path outside the repo root can miss
     # that exclude and sweep checkpoints into the upload past Ray's 512MiB
-    # package cap. On a shared cluster, override to shared storage (e.g.
-    # /mnt/cluster_storage/act_training) so a worker restart on a different
-    # node can still see checkpoints.
+    # package cap. On a shared cluster, override to shared storage (e.g. a
+    # mounted network filesystem) so a worker restart on a different node
+    # can still see checkpoints.
     storage_root: str = "training/runs"
     # "act" (default), "molmoact2", or "pi05" -- selects which policy
     # model/registry.py builds; train.py's main() overwrites `model` with
@@ -159,4 +138,3 @@ class RunConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ACTConfigOverrides | MolmoAct2ConfigOverrides | Pi05ConfigOverrides = field(default_factory=ACTConfigOverrides)
     train: TrainConfig = field(default_factory=TrainConfig)
-    convert: ConvertConfig = field(default_factory=ConvertConfig)

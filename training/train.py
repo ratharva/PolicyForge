@@ -1,14 +1,14 @@
-"""Entrypoint: (prepare, if not already done) -> build Ray Data pipeline (via
-training/vendor/lerobot_datasource.py) -> launch Ray Train.
+"""Entrypoint: build Ray Data pipeline from an already-converted LeRobot v3
+dataset (via training/vendor/lerobot_datasource.py) -> launch Ray Train.
+
+Assumes training/prepare_data.py has already been run for these --tasks --
+this script does no discover/download/convert of its own. If no prepared
+dataset is found at --v3-root, it exits with the prepare_data.py command to
+run first.
 
 Usage (run from the repo root, i.e. the parent of this training/ directory):
-    export HF_TOKEN=hf_...   # only needed for the default hf:// source; see --source-uri
-    python -m training.train --tasks arrange_the_flowers box_folding --max-episodes-per-task 300
-
-If training/prepare_data.py was already run for these --tasks (or a prior
-train.py run did), this skips discover/convert entirely and reads straight
-from the cached LeRobot v3 dataset under training/lerobot_v3/. Pass
---reconvert to force a rebuild.
+    python -m training.prepare_data --tasks arrange_the_flowers box_folding --max-episodes-per-task 300
+    python -m training.train --tasks arrange_the_flowers box_folding
 """
 from __future__ import annotations
 
@@ -22,25 +22,21 @@ import ray.train
 import ray.train.torch
 import torch
 
-from training.config import ConvertConfig, MolmoAct2ConfigOverrides, Pi05ConfigOverrides, RunConfig
-from training.data.prepare import has_lerobot_v3_data, is_prepared, prepare_dataset, require_token, resolve_v3_root
+from training.common.ray_setup import build_runtime_env, connect_ray
+from training.config import MolmoAct2ConfigOverrides, Pi05ConfigOverrides, RunConfig
 from training.data.ray_dataset import build_lerobot_v3_dataset, offload_molmoact2_preprocessing, transpose_for_training
 from training.data.stats import compute_dataset_stats
+from training.data_prep.lerobot_v3_writer import read_conversion_params
+from training.data_prep.prepare import has_lerobot_v3_data, resolve_v3_root
+from training.data_prep.strategies.registry import available_dataset_sources, get_dataset_source
 from training.history import record_run
-from training.ray_setup import build_runtime_env, connect_ray
 from training.train_loop import train_loop_per_worker
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tasks", nargs="+", required=True, help="task-name substrings")
-    parser.add_argument("--max-episodes-per-task", type=int, default=300,
-                         help="ignored if reusing an already-prepared --v3-root")
-    parser.add_argument("--source-uri", default=None,
-                         help="where the raw MCAP dataset lives: hf://datasets/<repo_id>, "
-                              "s3://<bucket>/<prefix>, or gs://<bucket>/<prefix> (default: "
-                              "config.py's DataConfig.source_uri). Only hf:// is verified against "
-                              "real data; s3://gs:// are unverified -- see README")
+    parser.add_argument("--tasks", nargs="+", required=True,
+                         help="task-name substrings -- must match what training.prepare_data was run with")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--storage-root", default=None)
     parser.add_argument("--num-epochs", type=int, default=1)
@@ -66,36 +62,18 @@ def main() -> None:
                               "behavior, not custom logic here")
     parser.add_argument("--num-workers", type=int, default=None,
                          help="Ray Train DDP workers; default = live GPU count")
-    parser.add_argument("--refresh-listing", action="store_true",
-                         help="re-scan the full source tree instead of using the cached "
-                              "task/episode listing from a previous run")
     parser.add_argument("--v3-root", default=None,
-                         help="where to write/read the converted LeRobot v3 dataset -- local path, "
+                         help="where the already-converted LeRobot v3 dataset lives -- local path, "
                               "s3://<bucket>/<prefix>, or gs://<bucket>/<prefix> (default: "
-                              "training/lerobot_v3/<sorted task names>, local). Only local roots are "
-                              "verified against real data; s3://gs:// are unverified -- see README")
-    parser.add_argument("--reconvert", action="store_true",
-                         help="rebuild the LeRobot v3 dataset even if one already exists at --v3-root")
-    parser.add_argument("--use-existing-v3", action="store_true",
-                         help="trust whatever LeRobot v3 dataset is already at --v3-root as-is and skip "
-                              "discover/convert entirely (no HF_TOKEN needed) -- for data from any source "
-                              "(a prior run of this pipeline, hand-built, downloaded pre-converted), not "
-                              "just ones this pipeline's own staleness check recognizes. --tasks is still "
-                              "required (used for run-naming/model dims) but its match against the data "
-                              "isn't verified -- you're vouching for it.")
-    parser.add_argument("--mode", choices=("stream", "download"), default="stream",
-                         help="stream (default): read MCAP directly from --source-uri, nothing local "
-                              "but the converted output. download: pull each episode.mcap to local "
-                              "disk first, then convert -- see README's conversion-modes section")
-    parser.add_argument("--sequential-camera-decode", action="store_true",
-                         help="decode a episode's 3 cameras one after another instead of concurrently -- "
-                              "slower per episode (~172s vs ~83s measured) but lower memory, which can "
-                              "mean MORE episodes convert concurrently and better aggregate throughput if "
-                              "you're memory-bound (see the --max-concurrent print at conversion start)")
-    parser.add_argument("--max-concurrent", type=int, default=None,
-                         help="override the auto-computed number of concurrent episode conversions "
-                              "(normally derived from live CPU/memory) -- set this deliberately, not "
-                              "casually: too high risks OOM (see README's incident notes)")
+                              "training/lerobot_v3/<dataset-source>/<sorted task names>, local, "
+                              "matching training.prepare_data's own default). Must already exist -- "
+                              "run training.prepare_data first if it doesn't.")
+    parser.add_argument("--dataset-source", default=None, choices=available_dataset_sources(),
+                         help="which dataset schema to use for camera_keys/state_dim/action_dim/"
+                              "tick_fps -- default: read from the prepared dataset's own "
+                              "conversion_params.json (written by prepare_data.py), no flag needed "
+                              "in the common case. Only needed as an override for a hand-built "
+                              "--v3-root with no conversion_params.json.")
 
     # --- MolmoAct2 ---
     parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05"), default="act",
@@ -191,7 +169,6 @@ def main() -> None:
         parser.error("--pi05-pretrained-path is required when --policy-type pi05")
 
     run_cfg = RunConfig(tasks=args.tasks)
-    run_cfg.max_episodes_per_task = args.max_episodes_per_task
     run_cfg.policy_type = args.policy_type
     run_cfg.train.num_epochs = args.num_epochs
     run_cfg.train.batch_size = args.batch_size
@@ -200,11 +177,6 @@ def main() -> None:
     run_cfg.train.early_stop_patience = args.early_stop_patience if args.early_stop_patience > 0 else None
     run_cfg.train.save_only_on_improvement = args.save_only_on_improvement
     run_cfg.train.checkpoint_max_to_keep = args.checkpoint_max_to_keep
-    run_cfg.convert = ConvertConfig(
-        mode=args.mode,
-        parallel_camera_decode=not args.sequential_camera_decode,
-        max_concurrent=args.max_concurrent,
-    )
     if args.policy_type == "molmoact2":
         # RunConfig()'s default `model` is ACTConfigOverrides -- overwritten
         # here now that --policy-type is known.
@@ -233,13 +205,27 @@ def main() -> None:
             gradient_checkpointing=args.pi05_gradient_checkpointing,
             empty_cameras=args.pi05_empty_cameras,
         )
-    if args.source_uri:
-        run_cfg.data.source_uri = args.source_uri
     if args.storage_root:
         run_cfg.storage_root = args.storage_root
     run_cfg.storage_root = os.path.abspath(run_cfg.storage_root)
     run_cfg.run_name = args.run_name or f"{args.policy_type}-{'-'.join(args.tasks)}-{time.strftime('%Y%m%d-%H%M%S')}"
-    v3_root = resolve_v3_root(args.v3_root, args.tasks)
+    v3_root = resolve_v3_root(args.v3_root, args.dataset_source or "abc130k", args.tasks)
+
+    if not has_lerobot_v3_data(v3_root):
+        raise SystemExit(
+            f"No prepared LeRobot v3 dataset found at {v3_root}. Run data prep first:\n"
+            f"    python -m training.prepare_data --tasks {' '.join(args.tasks)}"
+            + (f" --v3-root {args.v3_root}" if args.v3_root else "")
+        )
+    conversion_params = read_conversion_params(v3_root)
+    dataset_source = args.dataset_source or (conversion_params or {}).get("dataset_source") or "abc130k"
+    source = get_dataset_source(dataset_source)
+    run_cfg.data.robot = source.robot
+    run_cfg.data.source_uri = source.default_source_uri
+    if conversion_params:
+        run_cfg.max_episodes_per_task = conversion_params.get(
+            "max_episodes_per_task", run_cfg.max_episodes_per_task
+        )
 
     print("\n=== connect to Ray ===")
     connect_ray(build_runtime_env(storage_root=run_cfg.storage_root))
@@ -256,28 +242,6 @@ def main() -> None:
     print(f"Ray sees {live_gpus} GPU(s); using {num_workers} Ray Train worker(s), use_gpu={use_gpu}")
     if not torch.cuda.is_available() and use_gpu:
         print("WARNING: Ray reports GPUs but this driver process sees none -- check CUDA setup.")
-
-    if args.use_existing_v3:
-        if not has_lerobot_v3_data(v3_root):
-            raise SystemExit(
-                f"--use-existing-v3 was passed but no LeRobot v3 dataset (meta/info.json) "
-                f"exists at {v3_root} -- nothing to trust. Either fix --v3-root, or drop "
-                f"--use-existing-v3 to let this script prepare it."
-            )
-        print(f"\n=== --use-existing-v3: trusting data already at {v3_root} as-is, no HF_TOKEN needed ===")
-    elif is_prepared(v3_root, run_cfg.tasks, run_cfg.max_episodes_per_task, run_cfg.data) and not args.reconvert:
-        print(f"\n=== data already prepared at {v3_root} -- skipping discover/convert ===")
-        print("(pass --reconvert, or run training/prepare_data.py --reconvert, to rebuild it)")
-    else:
-        # Assumes v3_root is reachable at the same absolute path from every
-        # node that runs a Ray Data read task or Ray Train worker -- true on
-        # a single-node setup or with shared storage.
-        token = require_token(run_cfg.data.source_uri)
-        prepare_dataset(
-            token, run_cfg.tasks, run_cfg.max_episodes_per_task, run_cfg.data, v3_root,
-            convert_cfg=run_cfg.convert,
-            refresh_listing=args.refresh_listing, reconvert=args.reconvert,
-        )
 
     print("\n=== build Ray Data pipeline (from LeRobot v3) ===")
     raw_ds = build_lerobot_v3_dataset(v3_root, run_cfg.model.chunk_size)

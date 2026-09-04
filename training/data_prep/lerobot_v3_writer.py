@@ -1,8 +1,10 @@
-"""Write MCAP-decoded, aligned episodes into a LeRobot v3 dataset root that
-training/vendor/lerobot_datasource.py can read directly.
+"""Write decoded, aligned episodes into a LeRobot v3 dataset root that
+training/vendor/lerobot_datasource.py can read directly. Format-agnostic --
+takes plain dict[str, np.ndarray] + RobotSchema, doesn't care which
+ingestion strategy (mcap, hf_lerobot_mirror, agibot_hdf5) produced them.
 
 The root can be local, s3://, or gs:// -- every read/write of a small file
-(parquet, json) here goes through fsspec (training/data/source.py's
+(parquet, json) here goes through fsspec (training/data_prep/source.py's
 open_fs()). Video encoding is the exception -- see _write_episode_video's
 docstring for why that still goes to a local temp file first. Only local
 roots have been run against real data.
@@ -33,8 +35,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from training.config import DataConfig
-from training.data.source import open_fs
+from training.common.robots import RobotSchema
+from training.data_prep.source import open_fs
 
 DATA_PATH_TEMPLATE = "data/chunk-{chunk_index:03d}/file-{file_index:06d}.parquet"
 VIDEO_PATH_TEMPLATE = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:06d}.mp4"
@@ -54,20 +56,27 @@ class EpisodeRecord:
 # Not part of the LeRobot v3 schema -- lets this project detect a stale
 # conversion. Without it, "does meta/info.json exist" is the only check,
 # which says nothing about whether THIS dataset was built for the
-# tasks/episode-cap/schema currently requested.
+# tasks/episode-cap/schema/dataset_source currently requested.
 CONVERSION_PARAMS_FILENAME = "conversion_params.json"
 
 
-def compute_conversion_params(tasks: list[str], max_episodes_per_task: int, cfg: DataConfig) -> dict:
+def compute_conversion_params(
+    tasks: list[str], max_episodes_per_task: int, robot: RobotSchema,
+    image_size: tuple[int, int], dataset_source: str,
+) -> dict:
     """`tasks` are raw CLI substrings, not resolved task directory names --
     comparable both before discovery (train.py's is_prepared() gate) and
-    after (convert.py's inner check) without re-resolving names either time."""
+    after (convert.py's inner check) without re-resolving names either time.
+    `dataset_source` lets train.py resolve the right RobotSchema back out of
+    conversion_params.json without a --dataset-source flag in the common
+    case -- see training/data_prep/strategies/registry.py."""
     return {
+        "dataset_source": dataset_source,
         "tasks": sorted(tasks),
         "max_episodes_per_task": max_episodes_per_task,
-        "tick_fps": cfg.robot.tick_fps,
-        "image_size": list(cfg.image_size),
-        "camera_keys": list(cfg.robot.camera_keys),
+        "tick_fps": robot.tick_fps,
+        "image_size": list(image_size),
+        "camera_keys": list(robot.camera_keys),
     }
 
 
@@ -165,22 +174,26 @@ def _write_episode_data(
 
 def write_episode(
     root: str, episode_index: int, task: str, task_index: int,
-    aligned: dict, cfg: DataConfig,
+    aligned: dict, robot: RobotSchema,
 ) -> EpisodeRecord:
-    """aligned: the dict returned by training/data/episode.py's align_episode
-    (keys "state", "action", "image.<camera_key>")."""
+    """aligned: a dict shaped like whatever an ingestion strategy's
+    decode_and_align() returns (keys "state", "action",
+    "image.<camera_key>") -- see training/data_prep/strategies/."""
     fs, fs_root = open_fs(root)
     is_local = _is_local_root(root)
     state, action = aligned["state"], aligned["action"]
-    _write_episode_data(fs, fs_root, episode_index, task_index, state, action, cfg.robot.tick_fps)
-    for cam_key in cfg.robot.camera_keys:
+    _write_episode_data(fs, fs_root, episode_index, task_index, state, action, robot.tick_fps)
+    for cam_key in robot.camera_keys:
         _write_episode_video(
-            fs, fs_root, is_local, episode_index, cam_key, aligned[f"image.{cam_key}"], cfg.robot.tick_fps,
+            fs, fs_root, is_local, episode_index, cam_key, aligned[f"image.{cam_key}"], robot.tick_fps,
         )
     return EpisodeRecord(episode_index=episode_index, task=task, length=state.shape[0])
 
 
-def finalize_dataset(root: str, records: list[EpisodeRecord], cfg: DataConfig, task_to_index: dict[str, int]) -> None:
+def finalize_dataset(
+    root: str, records: list[EpisodeRecord], robot: RobotSchema,
+    image_size: tuple[int, int], task_to_index: dict[str, int],
+) -> None:
     """task_to_index MUST be stable across incremental conversion runs, not
     recomputed here by sorting -- each episode's `task_index` column is
     written once into its data parquet at write_episode() time and never
@@ -232,7 +245,7 @@ def finalize_dataset(root: str, records: list[EpisodeRecord], cfg: DataConfig, t
         "data/chunk_index": [0] * len(records),
         "data/file_index": [r.episode_index for r in records],
     }
-    for cam_key in cfg.robot.camera_keys:
+    for cam_key in robot.camera_keys:
         ep_cols[f"videos/{cam_key}/chunk_index"] = [0] * len(records)
         ep_cols[f"videos/{cam_key}/file_index"] = [r.episode_index for r in records]
         # Every episode has its own dedicated video file, so it always
@@ -243,12 +256,12 @@ def finalize_dataset(root: str, records: list[EpisodeRecord], cfg: DataConfig, t
         pq.write_table(pa.table(ep_cols), f)
 
     # --- meta/info.json ---
-    h, w = cfg.image_size
+    h, w = image_size
     features = {
-        "observation.state": {"dtype": "float32", "shape": [cfg.robot.state_dim]},
-        "action": {"dtype": "float32", "shape": [cfg.robot.action_dim]},
+        "observation.state": {"dtype": "float32", "shape": [robot.state_dim]},
+        "action": {"dtype": "float32", "shape": [robot.action_dim]},
     }
-    for cam_key in cfg.robot.camera_keys:
+    for cam_key in robot.camera_keys:
         # Short key (e.g. "top") must match the videos/{cam_key}/... columns
         # above and VIDEO_PATH_TEMPLATE's video_key= -- lerobot_datasource.py
         # derives video_keys from these feature names. Renamed to
@@ -258,7 +271,7 @@ def finalize_dataset(root: str, records: list[EpisodeRecord], cfg: DataConfig, t
     info = {
         "total_frames": total_frames,
         "total_episodes": len(records),
-        "fps": cfg.robot.tick_fps,
+        "fps": robot.tick_fps,
         "data_path": DATA_PATH_TEMPLATE,
         "video_path": VIDEO_PATH_TEMPLATE,
         "features": features,
@@ -268,8 +281,8 @@ def finalize_dataset(root: str, records: list[EpisodeRecord], cfg: DataConfig, t
 
     # meta/stats.json must exist and be valid JSON (LeRobotDatasourceMetadata
     # loads it unconditionally) but its content isn't consumed by this
-    # pipeline -- training/data/stats.py computes real normalization stats by
-    # sampling the built Ray Dataset directly instead.
+    # pipeline -- training/data_prep/stats.py computes real normalization
+    # stats by sampling the built Ray Dataset directly instead.
     with fs.open(f"{fs_root}/meta/stats.json", "w") as f:
         json.dump({}, f)
 

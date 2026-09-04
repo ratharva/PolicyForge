@@ -21,7 +21,3 @@ __pycache__/
 
 # agent-facing notes, not part of the repo
 CLAUDE.md
-
-# course reference material -- not part of the shipped pipeline;
-# the two files it actually needs are vendored into training/vendor/
-ray_context/

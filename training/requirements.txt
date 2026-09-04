@@ -9,16 +9,34 @@ ray[data,train]>=2.51
 huggingface_hub
 mcap
 mcap-protobuf-support
-av
+# Pinned <16.0.0, not left unconstrained -- lerobot==0.6.1's own "dataset"
+# extra (needed by the droid ingestion strategy's
+# convert_dataset_v21_to_v30.py -> lerobot.datasets -> pyav_utils.py) hard-
+# requires av<16.0.0,>=15.0.0 (av.option doesn't exist in later av releases,
+# confirmed against installed 18.1.0: AttributeError: module 'av' has no
+# attribute 'option'). Verified 15.1.0 still works correctly for this
+# project's own MCAP raw-elementary-stream decode (video_decode.py) and the
+# LeRobot v3 read path (vendor/lerobot_datasource.py) -- real conversion +
+# training run against real data, not just import-checked.
+av>=15.0.0,<16.0.0
 numpy
 torch
 Pillow
 lerobot==0.6.1
 tensorboard
+pyyaml
+h5py
+
+# Needed by the droid ingestion strategy (training/data_prep/strategies/
+# hf_lerobot_mirror.py) -- lerobot.scripts.convert_dataset_v21_to_v30 (part
+# of lerobot's "dataset" extra) imports both directly; confirmed missing by
+# a real ImportError/ModuleNotFoundError, not assumed.
+jsonlines
+datasets
 
 # Optional: only needed if DataConfig.source_uri or --v3-root uses s3:// or
-# gs:// instead of hf:// / a local path (see README's "Data source" and
-# "Where the converted LeRobot v3 dataset lives" sections).
+# gs:// instead of hf:// / a local path (see docs/03-prepare-data.md's
+# "Data source" and "Where the converted LeRobot v3 dataset lives" sections).
 # s3fs
 # gcsfs
 

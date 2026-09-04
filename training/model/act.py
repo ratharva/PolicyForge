@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import torch
 
-from training.config import ACTConfigOverrides, DataConfig, TrainConfig
+from training.common.config import DataConfig
+from training.config import ACTConfigOverrides, TrainConfig
 
 
 def build_act_config(

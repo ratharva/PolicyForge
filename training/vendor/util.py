@@ -1,9 +1,7 @@
 """
-Training utilities for the VLA fine-tuning + closed-loop notebooks.
-
-Helpers shared across the course notebooks (02 fine-tuning, 03 serving +
-sim eval). They live here so the notebooks stay focused on the Ray-specific
-orchestration, while this module owns the model plumbing.
+VLA fine-tuning + closed-loop training utilities, vendored in as a stable
+dependency -- see CLAUDE.md. This pipeline only uses NumpyToTorchCollate
+directly; the rest is kept as-is rather than pruned.
 
 Sections:
   * PI0.5 attention-mask patch
@@ -612,13 +610,13 @@ def release_phase(ray_module, log_fn=print):
 # Per-node HF snapshot staging (model only -- datasets are streamed via hf://)
 # ============================================================================
 def stage_model_to_local(source_uri, local_dir):
-    """Sync a model/config dir from the PUBLIC S3 mirror to `local_dir` if not present.
+    """Sync a model/config dir from a public S3 mirror to `local_dir` if not present.
 
-    `source_uri` is an ``s3://`` prefix (the tutorial's public mirror under
-    ``s3://anyscale-public-materials-use2/ray_summit_robotics_2026/``). We use the AWS CLI
-    with ``--no-sign-request`` so any cluster reads the public bucket without needing
-    credentials for it. Idempotent: skips the sync when config.json is already present
-    (e.g. already staged on this node, or baked into the image).
+    `source_uri` is an ``s3://`` prefix. We use the AWS CLI with
+    ``--no-sign-request`` so any cluster reads the public bucket without
+    needing credentials for it. Idempotent: skips the sync when config.json
+    is already present (e.g. already staged on this node, or baked into the
+    image).
     """
     local_dir = Path(local_dir)
     if (local_dir / "config.json").exists():
