@@ -5,7 +5,8 @@
 # said otherwise, based on research against a fork branch that was never
 # cross-checked against what's actually pinned below -- see README's
 # "MolmoAct2 environment" section for the correction.)
-ray[data,train]>=2.51
+# >=2.55: 2.49.0-2.54.0 have a Parquet-deserialization RCE (CVE-2026-41486)
+ray[data,train]>=2.55
 huggingface_hub
 mcap
 mcap-protobuf-support

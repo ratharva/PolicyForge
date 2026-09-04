@@ -50,6 +50,15 @@ def default_local_cache_dir() -> str:
     return os.path.join(os.path.dirname(__file__), "..", ".cache", "downloads")
 
 
+def _reject_unsafe_rel_path(rel_path: str) -> None:
+    """rel_path comes from a remote listing -- guard against path traversal."""
+    if os.path.isabs(rel_path):
+        raise ValueError(f"refusing to download an absolute rel_path: {rel_path!r}")
+    normalized = os.path.normpath(rel_path)
+    if normalized == os.pardir or normalized.startswith(os.pardir + os.sep):
+        raise ValueError(f"rel_path {rel_path!r} escapes its intended directory -- refusing")
+
+
 def download_one(
     source_uri: str, rel_path: str, token: str | None = None, cache_dir: str | None = None,
 ) -> str:
@@ -57,6 +66,8 @@ def download_one(
     the local path. hf:// uses hf_hub_download (proven local caching, reused
     automatically on a repeat call). s3://gs:// use fsspec's fs.get() into
     cache_dir, skipped if the target file already exists there."""
+    _reject_unsafe_rel_path(rel_path)
+
     if is_hf_uri(source_uri):
         from huggingface_hub import hf_hub_download
         repo_type, repo_id = parse_hf_uri(source_uri)
@@ -65,7 +76,12 @@ def download_one(
         )
 
     fs, fs_root = open_fs(source_uri)
-    local_path = os.path.join(cache_dir or default_local_cache_dir(), rel_path)
+    base_dir = cache_dir or default_local_cache_dir()
+    local_path = os.path.join(base_dir, rel_path)
+    resolved_base = os.path.realpath(base_dir)
+    resolved_target = os.path.realpath(local_path)
+    if os.path.commonpath([resolved_base, resolved_target]) != resolved_base:
+        raise ValueError(f"rel_path {rel_path!r} would resolve outside {base_dir!r} -- refusing")
     if not os.path.exists(local_path):
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         fs.get(f"{fs_root}/{rel_path}", local_path)

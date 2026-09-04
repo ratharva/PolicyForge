@@ -327,7 +327,18 @@ def wipe_dataset(root: str) -> None:
     LeRobot v3 requires contiguous 0-based episode_index
     (lerobot_datasource.py raises otherwise), so removing one in place
     would require renumbering and renaming every subsequent episode's
-    files -- not implemented. A full wipe + rebuild is simpler and correct."""
+    files -- not implemented. A full wipe + rebuild is simpler and correct.
+
+    Refuses to wipe root/home-shaped paths or anything missing meta/info.json."""
     fs, fs_root = open_fs(root)
+    if "://" not in root:
+        resolved = os.path.realpath(root)
+        if resolved in ("/", os.path.expanduser("~")) or resolved == os.path.dirname(resolved):
+            raise ValueError(f"refusing to wipe {root!r} -- resolves to {resolved!r}, looks like a real root/home directory")
+    if fs.exists(fs_root) and not fs.exists(f"{fs_root}/meta/info.json"):
+        raise ValueError(
+            f"refusing to wipe {root!r} -- no meta/info.json found there, so this doesn't "
+            f"look like a dataset this tool created"
+        )
     if fs.exists(fs_root):
         fs.rm(fs_root, recursive=True)

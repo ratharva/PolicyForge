@@ -35,11 +35,11 @@ def connect_ray(runtime_env: dict) -> "ray.runtime_context.RuntimeContext":
         ctx = ray.init(address="auto", ignore_reinit_error=True, runtime_env=runtime_env)
         print("connected to existing cluster")
     except ConnectionError:
-        # dashboard_host="0.0.0.0" (default is loopback-only "127.0.0.1") so the
-        # dashboard is reachable from outside this machine. Only applies to a
-        # cluster this call starts -- an already-running external cluster needs
-        # the same flag at its own head-node startup instead.
-        ctx = ray.init(ignore_reinit_error=True, runtime_env=runtime_env, dashboard_host="0.0.0.0")
+        # Loopback-only by default (Ray's dashboard has no auth). Override via
+        # POLICYFORGE_DASHBOARD_HOST for remote access, or tunnel instead:
+        # ssh -L 8265:localhost:8265 <host>
+        dashboard_host = os.environ.get("POLICYFORGE_DASHBOARD_HOST", "127.0.0.1")
+        ctx = ray.init(ignore_reinit_error=True, runtime_env=runtime_env, dashboard_host=dashboard_host)
         print("started a local Ray instance")
     dashboard_url = getattr(ctx, "dashboard_url", None)
     if dashboard_url:
