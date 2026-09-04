@@ -31,7 +31,7 @@ from training.data_prep.video_decode import decode_camera_stream
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True, help="task-name substring")
-    parser.add_argument("--dataset-source", default="abc130k")
+    parser.add_argument("--dataset-source", required=True)
     parser.add_argument("--n-frames", type=int, default=6, help="frames per camera to dump")
     parser.add_argument("--chunk-size", type=int, default=100)
     parser.add_argument("--out-dir", default="verify_out")

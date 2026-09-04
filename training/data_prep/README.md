@@ -5,16 +5,17 @@ Discovers, downloads, and converts a raw dataset into LeRobot v3.
 
 ```bash
 export HF_TOKEN=$(cat hf_tok.txt)   # only needed for hf:// sources, and only if the repo is gated
-python -m training.prepare_data --tasks <task-name-substrings> --max-episodes-per-task 20
+python -m training.prepare_data --tasks <task-name-substrings> --dataset-source <abc130k|droid|agibot_alpha> --max-episodes-per-task 20
 ```
 
-Which raw format a `--dataset-source` uses (and which flags below actually
-apply to it) is decided by its `ingestion_strategy`, declared in
+`--dataset-source` has no default -- it's required on every run. Which raw
+format it uses (and which flags below actually apply) is decided by its
+`ingestion_strategy`, declared in
 `training/data_prep/schemas/<dataset_source>.yaml`:
 
 | `--dataset-source` | ingestion strategy | `--tasks` filters? |
 |---|---|---|
-| `abc130k` (default) | `mcap` | yes |
+| `abc130k` | `mcap` | yes |
 | `droid` | `hf_lerobot_mirror` | **no** -- see below |
 | `agibot_alpha` | `agibot_hdf5` | yes |
 
@@ -23,7 +24,7 @@ apply to it) is decided by its `ingestion_strategy`, declared in
 | Flag | Default | Applies to | Meaning |
 |---|---|---|---|
 | `--tasks` (required) | -- | all | task-name substrings, matched against real discovered task names |
-| `--dataset-source` | `abc130k` | all | which schema/strategy to use |
+| `--dataset-source` (required) | -- | all | which schema/strategy to use |
 | `--max-episodes-per-task` | `300` | all | cap per task (fewer if a task has less) |
 | `--source-uri` | schema's `default_source_uri` | `mcap` only | override where the raw dataset lives -- `hf_lerobot_mirror` always uses its schema's `full_repo_id` instead |
 | `--v3-root` | `training/lerobot_v3/<dataset_source>/<sorted task names>` | all | where to write the converted dataset -- local path, `s3://bucket/prefix`, or `gs://bucket/prefix` (S3/GCS unverified against real buckets in this project) |
@@ -35,41 +36,41 @@ apply to it) is decided by its `ingestion_strategy`, declared in
 
 ## Scenarios
 
-### abc130k (default) -- MCAP, XDOF/ABC-130k
+### abc130k -- MCAP, XDOF/ABC-130k
 
 ```bash
 # First run -- fresh conversion
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20
 
 # Same tasks, more episodes -- incrementally reuses the 20 already converted,
 # only fetches/decodes the 10 new ones (matched via the episode manifest,
 # not re-fetched/re-decoded)
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 30
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 30
 
 # Multiple tasks in one v3 root
-python -m training.prepare_data --tasks dress_the_teddy_bear arrange_the_flowers --max-episodes-per-task 20
+python -m training.prepare_data --tasks dress_the_teddy_bear arrange_the_flowers --dataset-source abc130k --max-episodes-per-task 20
 
 # Force a full rebuild even though a matching dataset already exists
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20 --reconvert
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20 --reconvert
 
 # Re-scan the source tree instead of the cached listing (new tasks/episodes
 # appeared upstream since the last run)
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20 --refresh-listing
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20 --refresh-listing
 
 # Download raw episodes to disk first instead of streaming over HTTP
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20 --mode download
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20 --mode download
 
 # Lower peak memory per episode (slower) -- useful on a smaller/shared machine
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20 --sequential-camera-decode
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20 --sequential-camera-decode
 
 # Pin conversion concurrency explicitly instead of the auto-computed value
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20 --max-concurrent 4
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20 --max-concurrent 4
 
 # Custom output location
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20 --v3-root /data/abc130k_teddy_bear
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20 --v3-root /data/abc130k_teddy_bear
 
 # Point at a different raw source (mcap strategy only)
-python -m training.prepare_data --tasks dress_the_teddy_bear --max-episodes-per-task 20 --source-uri hf://datasets/some/other-mcap-mirror
+python -m training.prepare_data --tasks dress_the_teddy_bear --dataset-source abc130k --max-episodes-per-task 20 --source-uri hf://datasets/some/other-mcap-mirror
 ```
 
 ### droid -- DROID (Franka Panda), via lerobot's own v2.1->v3.0 migration
@@ -134,6 +135,8 @@ default disk doesn't have room for a task's full shard set plus the shared
 
 ## Before converting anything -- `discover.py` and `verify_decode.py`
 
+Both also require `--dataset-source` explicitly -- no default.
+
 ```bash
 # List every real task name/id this dataset source has (mcap strategy only)
 python -m training.data_prep.discover --dataset-source abc130k
@@ -142,11 +145,11 @@ python -m training.data_prep.discover --dataset-source abc130k
 # a full conversion -- downloads one episode, decodes + aligns it, prints
 # state/action ranges and action-chunk padding, writes a few PNG frames per
 # camera for visual inspection (mcap strategy only)
-python -m training.data_prep.verify_decode --task dress_the_teddy_bear
+python -m training.data_prep.verify_decode --task dress_the_teddy_bear --dataset-source abc130k
 ```
 
 `verify_decode.py`'s full flag set: `--task` (required, task-name
-substring), `--dataset-source` (default `abc130k`), `--n-frames` (frames per
+substring), `--dataset-source` (required), `--n-frames` (frames per
 camera to dump), `--chunk-size`, `--out-dir`, `--image-size H W`.
 
 ## See also

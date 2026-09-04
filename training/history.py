@@ -40,6 +40,8 @@ def record_run(
             "max_train_steps": run_cfg.train.max_train_steps,
             "lr": run_cfg.train.lr,
             "lr_backbone": run_cfg.train.lr_backbone,
+            "grad_accum": run_cfg.train.grad_accum,
+            "weight_decay": run_cfg.train.weight_decay,
             # Whole model-override dataclass, not cherry-picked fields --
             # policy-agnostic since asdict() captures whichever override
             # type this run actually used.

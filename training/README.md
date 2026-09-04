@@ -8,11 +8,15 @@ command to run first. See [`training/data_prep/README.md`](data_prep/README.md)
 for that step.
 
 ```bash
-python -m training.prepare_data --tasks arrange_the_flowers --max-episodes-per-task 300
-python -m training.train --tasks arrange_the_flowers --max-train-steps 50
+python -m training.prepare_data --tasks arrange_the_flowers --dataset-source abc130k --max-episodes-per-task 300
+python -m training.train --tasks arrange_the_flowers --dataset-source abc130k --policy-type act --max-train-steps 50
 ```
 
 ## General flags
+
+Neither `--dataset-source` nor `--policy-type` has a default -- both are
+either required outright (`--policy-type`) or required unless `--v3-root`
+is given explicitly (`--dataset-source`, see the table row below).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -21,21 +25,25 @@ python -m training.train --tasks arrange_the_flowers --max-train-steps 50
 | `--storage-root` | `TrainConfig` default | where run output (checkpoints, TensorBoard, history) is written |
 | `--num-epochs` | `1` | |
 | `--batch-size` | `8` | |
+| `--lr` | `1e-5` | base learning rate -- the fallback every MolmoAct2 per-group LR flag (`--molmoact2-vit-lr` etc.) uses when left unset |
+| `--lr-backbone` | `1e-5` | ACT-specific backbone LR group -- unused by MolmoAct2/pi05, which have their own LR-group flags |
+| `--grad-accum` | `1` | gradient accumulation steps |
+| `--weight-decay` | `1e-4` | AdamW weight decay |
 | `--max-train-steps` | none (full epoch) | cap total steps -- for a smoke run |
 | `--eval-every-steps` | `200` | report/checkpoint/early-stop-check granularity |
 | `--early-stop-patience` | `5` | stop after this many eval windows with no loss improvement; `0` or negative disables it |
 | `--save-only-on-improvement` | off | only checkpoint when loss improves (less write I/O, but a resume can lose progress back to the last improvement) |
 | `--checkpoint-max-to-keep` | `3` | keeps the N best-scoring checkpoints plus the single most recent one (native Ray Train `CheckpointConfig` behavior) |
 | `--num-workers` | live GPU count | Ray Train DDP worker count |
-| `--v3-root` | matches `prepare_data.py`'s own default for these `--tasks` | must already exist |
-| `--dataset-source` | read from the prepared dataset's own `conversion_params.json` | override only needed for a hand-built `--v3-root` with no `conversion_params.json` |
-| `--policy-type` | `act` | `act`, `molmoact2`, or `pi05` |
+| `--v3-root` | derived from `--dataset-source` + `--tasks` (prepare_data.py's own default path) | must already exist. If omitted, `--dataset-source` is required so the default path can be derived at all |
+| `--dataset-source` (required unless `--v3-root` given) | read from the prepared dataset's own `conversion_params.json` if `--v3-root` is given and omits it | which schema to resolve camera_keys/state_dim/action_dim/tick_fps from |
+| `--policy-type` (required) | -- | `act`, `molmoact2`, or `pi05` |
 
-**Not currently CLI-configurable**: `lr`/`lr_backbone`/`grad_accum`/
-`weight_decay` are fixed at `TrainConfig`'s dataclass defaults (`1e-5`,
-`1e-5`, `1`, `1e-4`) -- there is no `--lr` flag today, despite the
-MolmoAct2 per-group LR flags' help text referencing one as a fallback. Set
-these by editing `TrainConfig` directly if you need to change them.
+```bash
+# Custom base LR, ACT backbone LR, gradient accumulation, and weight decay
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --lr 5e-5 --lr-backbone 1e-5 --grad-accum 4 --weight-decay 1e-3
+```
 
 ## Resuming a run
 
@@ -47,19 +55,21 @@ recent one. Pass `--run-name` explicitly if you want to resume later
 always starts a new run).
 
 ```bash
-python -m training.train --tasks dress_the_teddy_bear --run-name teddy_bear_act_v1 --max-train-steps 500
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --run-name teddy_bear_act_v1 --max-train-steps 500
 # ...interrupted or crashed...
-python -m training.train --tasks dress_the_teddy_bear --run-name teddy_bear_act_v1 --max-train-steps 500
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --run-name teddy_bear_act_v1 --max-train-steps 500
 ```
 
-## ACT (default)
+## ACT
 
 ```bash
 # Smoke run
-python -m training.train --tasks dress_the_teddy_bear --max-train-steps 20
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --max-train-steps 20
 
 # Full run over the data, larger batch
-python -m training.train --tasks dress_the_teddy_bear --batch-size 16 --num-epochs 5
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --batch-size 16 --num-epochs 5
 ```
 
 ## MolmoAct2
@@ -84,13 +94,13 @@ python -m training.train --tasks dress_the_teddy_bear --batch-size 16 --num-epoc
 
 ```bash
 # LoRA on one GPU (the starting point -- get this working before fft)
-python -m training.train --tasks dress_the_teddy_bear --policy-type molmoact2 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type molmoact2 \
     --molmoact2-setup-type "dual-arm robot with wrist and top cameras" \
     --molmoact2-control-mode "delta joint position" \
     --batch-size 8 --max-train-steps 50
 
 # VLM frozen, only the action expert trains
-python -m training.train --tasks dress_the_teddy_bear --policy-type molmoact2 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type molmoact2 \
     --molmoact2-setup-type "dual-arm robot with wrist and top cameras" \
     --molmoact2-control-mode "delta joint position" \
     --molmoact2-train-mode freeze --molmoact2-action-mode continuous \
@@ -99,21 +109,21 @@ python -m training.train --tasks dress_the_teddy_bear --policy-type molmoact2 \
 # Full fine-tune with FSDP2 across multiple GPUs on one node, plus the Ray
 # Data preprocessing offload -- both carry real unverified risk (checkpoint
 # resume under FSDP2, and Ray-Data-Arrow round-tripping tokenizer output)
-python -m training.train --tasks dress_the_teddy_bear --policy-type molmoact2 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type molmoact2 \
     --molmoact2-setup-type "dual-arm robot with wrist and top cameras" \
     --molmoact2-control-mode "delta joint position" \
     --molmoact2-train-mode fft --molmoact2-distributed-strategy fsdp2 \
     --molmoact2-offload-tokenization --batch-size 32
 
 # fft that doesn't fit even under FSDP2 -- trade speed for VRAM headroom
-python -m training.train --tasks dress_the_teddy_bear --policy-type molmoact2 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type molmoact2 \
     --molmoact2-setup-type "dual-arm robot with wrist and top cameras" \
     --molmoact2-control-mode "delta joint position" \
     --molmoact2-train-mode fft --molmoact2-distributed-strategy fsdp2 \
     --molmoact2-fsdp-cpu-offload --batch-size 32
 
 # Custom per-group learning rates
-python -m training.train --tasks dress_the_teddy_bear --policy-type molmoact2 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type molmoact2 \
     --molmoact2-setup-type "dual-arm robot with wrist and top cameras" \
     --molmoact2-control-mode "delta joint position" \
     --molmoact2-vit-lr 1e-6 --molmoact2-connector-lr 5e-5 --molmoact2-action-expert-lr 1e-4
@@ -143,18 +153,18 @@ run shows DDP doesn't fit).
 
 ```bash
 # Full fine-tune on one GPU
-python -m training.train --tasks dress_the_teddy_bear --policy-type pi05 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
     --pi05-pretrained-path <your-real-checkpoint-repo-id> \
     --batch-size 8 --max-train-steps 50
 
 # Freeze the vision encoder, only train the action expert -- reduces the
 # trainable/optimizer-state footprint without needing FSDP2
-python -m training.train --tasks dress_the_teddy_bear --policy-type pi05 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
     --pi05-pretrained-path <your-real-checkpoint-repo-id> \
     --pi05-freeze-vision-encoder --pi05-train-expert-only --batch-size 8
 
 # Checkpoint expects more camera slots than this dataset provides
-python -m training.train --tasks dress_the_teddy_bear --policy-type pi05 \
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
     --pi05-pretrained-path <your-real-checkpoint-repo-id> \
     --pi05-empty-cameras 2
 ```
@@ -164,7 +174,7 @@ python -m training.train --tasks dress_the_teddy_bear --policy-type pi05 \
 ```bash
 # A hand-built v3 root with no conversion_params.json needs an explicit
 # --dataset-source so camera_keys/state_dim/action_dim/tick_fps resolve
-python -m training.train --tasks my_tasks --v3-root /data/hand_built_v3 --dataset-source abc130k
+python -m training.train --tasks my_tasks --v3-root /data/hand_built_v3 --dataset-source abc130k --policy-type act
 ```
 
 ## Checkpoint retention
@@ -172,10 +182,10 @@ python -m training.train --tasks my_tasks --v3-root /data/hand_built_v3 --datase
 ```bash
 # Keep only checkpoints where loss improved (fewer writes, but a resume can
 # lose progress back to the last improvement -- see the flag table above)
-python -m training.train --tasks dress_the_teddy_bear --save-only-on-improvement
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --save-only-on-improvement
 
 # Keep more/fewer checkpoints on disk
-python -m training.train --tasks dress_the_teddy_bear --checkpoint-max-to-keep 10
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --checkpoint-max-to-keep 10
 ```
 
 ## After training

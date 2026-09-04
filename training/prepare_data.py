@@ -26,7 +26,7 @@ DEFAULT_IMAGE_SIZE = (224, 224)  # (H, W) -- matches DataConfig's own default; n
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", nargs="+", required=True, help="task-name substrings")
-    parser.add_argument("--dataset-source", default="abc130k", choices=available_dataset_sources())
+    parser.add_argument("--dataset-source", required=True, choices=available_dataset_sources())
     parser.add_argument("--max-episodes-per-task", type=int, default=300)
     parser.add_argument("--source-uri", default=None,
                          help="where the raw dataset lives (default: the chosen --dataset-source's "

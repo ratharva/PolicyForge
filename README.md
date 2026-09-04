@@ -22,18 +22,21 @@ anything itself. A few representative examples (full flag reference and
 every scenario -- other datasets, other policies, resuming a run, FSDP2,
 LoRA, etc. -- in the linked docs below):
 
+`--dataset-source` and `--policy-type` have no default -- both must be
+given explicitly on every run.
+
 ```bash
-# Prepare a dataset, then train the default policy (ACT) on it
-python -m training.prepare_data --tasks arrange_the_flowers --max-episodes-per-task 20
-python -m training.train --tasks arrange_the_flowers --max-train-steps 50
+# Prepare abc130k, then train ACT on it
+python -m training.prepare_data --tasks arrange_the_flowers --dataset-source abc130k --max-episodes-per-task 20
+python -m training.train --tasks arrange_the_flowers --policy-type act --max-train-steps 50
 
 # A gated dataset (AgiBot World Alpha) -- downloads whole tar shards to
 # local disk first, real sizes vary a lot by task, check before running
-python -m training.prepare_data --tasks fridge --max-episodes-per-task 2 --dataset-source agibot_alpha
+python -m training.prepare_data --tasks fridge --dataset-source agibot_alpha --max-episodes-per-task 2
 
 # Finetune a VLA policy (π0.5) instead of ACT -- needs a real pretrained
 # checkpoint you've found on the HF Hub yourself, see training/README.md
-python -m training.train --tasks arrange_the_flowers --policy-type pi05 \
+python -m training.train --tasks arrange_the_flowers --dataset-source abc130k --policy-type pi05 \
     --pi05-pretrained-path <your-real-checkpoint-repo-id> --max-train-steps 50
 ```
 

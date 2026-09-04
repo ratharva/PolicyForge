@@ -126,7 +126,7 @@ if __name__ == "__main__":
     from training.data_prep.strategies.mcap import path_to_split_and_task
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-source", default="abc130k")
+    parser.add_argument("--dataset-source", required=True)
     args = parser.parse_args()
 
     from training.data_prep.strategies.registry import get_dataset_source

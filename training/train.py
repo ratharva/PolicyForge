@@ -41,6 +41,16 @@ def main() -> None:
     parser.add_argument("--storage-root", default=None)
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-5,
+                         help="base learning rate -- the fallback every MolmoAct2 per-group LR flag "
+                              "(--molmoact2-vit-lr etc.) uses when left unset")
+    parser.add_argument("--lr-backbone", type=float, default=1e-5,
+                         help="ACT-specific backbone LR group -- unused by MolmoAct2/pi05, which have "
+                              "their own LR-group flags")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                         help="gradient accumulation steps")
+    parser.add_argument("--weight-decay", type=float, default=1e-4,
+                         help="AdamW weight decay")
     parser.add_argument("--max-train-steps", type=int, default=None,
                          help="cap total steps for a smoke run; omit for a full run over the data")
     parser.add_argument("--eval-every-steps", type=int, default=200,
@@ -76,9 +86,9 @@ def main() -> None:
                               "--v3-root with no conversion_params.json.")
 
     # --- MolmoAct2 ---
-    parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05"), default="act",
-                         help="which policy family to train -- ACT (default, this repo's original "
-                              "lightweight policy, trains from random init), MolmoAct2 (~8B-param VLA), "
+    parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05"), required=True,
+                         help="which policy family to train -- act (this repo's original "
+                              "lightweight policy, trains from random init), molmoact2 (~8B-param VLA), "
                               "or pi05 (~2.3B-param VLA, needs --pi05-pretrained-path) -- all three "
                               "share the same lerobot install, see README")
     parser.add_argument("--molmoact2-checkpoint-path", default="allenai/MolmoAct2",
@@ -172,6 +182,10 @@ def main() -> None:
     run_cfg.policy_type = args.policy_type
     run_cfg.train.num_epochs = args.num_epochs
     run_cfg.train.batch_size = args.batch_size
+    run_cfg.train.lr = args.lr
+    run_cfg.train.lr_backbone = args.lr_backbone
+    run_cfg.train.grad_accum = args.grad_accum
+    run_cfg.train.weight_decay = args.weight_decay
     run_cfg.train.max_train_steps = args.max_train_steps
     run_cfg.train.eval_every_steps = args.eval_every_steps
     run_cfg.train.early_stop_patience = args.early_stop_patience if args.early_stop_patience > 0 else None
@@ -209,7 +223,13 @@ def main() -> None:
         run_cfg.storage_root = args.storage_root
     run_cfg.storage_root = os.path.abspath(run_cfg.storage_root)
     run_cfg.run_name = args.run_name or f"{args.policy_type}-{'-'.join(args.tasks)}-{time.strftime('%Y%m%d-%H%M%S')}"
-    v3_root = resolve_v3_root(args.v3_root, args.dataset_source or "abc130k", args.tasks)
+    if not args.v3_root and not args.dataset_source:
+        raise SystemExit(
+            "Can't determine where the prepared dataset lives -- pass either --v3-root "
+            "(an explicit path) or --dataset-source (to derive the default path prepare_data.py "
+            "would have used)."
+        )
+    v3_root = resolve_v3_root(args.v3_root, args.dataset_source, args.tasks)
 
     if not has_lerobot_v3_data(v3_root):
         raise SystemExit(
@@ -218,7 +238,12 @@ def main() -> None:
             + (f" --v3-root {args.v3_root}" if args.v3_root else "")
         )
     conversion_params = read_conversion_params(v3_root)
-    dataset_source = args.dataset_source or (conversion_params or {}).get("dataset_source") or "abc130k"
+    dataset_source = args.dataset_source or (conversion_params or {}).get("dataset_source")
+    if not dataset_source:
+        raise SystemExit(
+            f"{v3_root}'s conversion_params.json doesn't record a dataset_source (likely a "
+            f"hand-built v3 root) -- pass --dataset-source explicitly."
+        )
     source = get_dataset_source(dataset_source)
     run_cfg.data.robot = source.robot
     run_cfg.data.source_uri = source.default_source_uri
