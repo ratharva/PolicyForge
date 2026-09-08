@@ -34,6 +34,23 @@ camera_keys: [head, head_center_fisheye, head_left_fisheye, head_right_fisheye,
 # video tar entry -- not narrowed to a subset; a future conversion can pick
 # fewer if 8 cameras is more than needed for training.
 
+# Depth: head camera only, per this file's own header comment
+# (<episode_id>/depth/head_depth_<frame>.png, one PNG per frame, in the
+# SAME observations tar as the videos above) -- sourced from the same
+# real-download inspection as everything else in this file, but NOT
+# independently re-verified for this addition (no fresh gated download was
+# done to add this field): specifically unconfirmed are the PNG bit depth
+# (assumed 16-bit grayscale, common for depth sensors) and whether every
+# episode has exactly as many depth frames as color video frames (assumed,
+# not confirmed, unlike state/action-vs-video length, which the header
+# comment above DOES confirm via a real byte-for-byte check). Extraction
+# (training/data_prep/strategies/agibot_hdf5.py) sorts by the frame number
+# parsed out of the filename numerically, not by string/lexicographic
+# order or an assumed zero-padding width -- so it's robust to whatever the
+# real padding turns out to be. Confirm both assumptions against one real
+# downloaded episode before converting at scale.
+depth_camera_keys: [head]
+
 # (component name, dim) pairs -- component name is the real HDF5 group path
 # under "state/"/"action/" (see agibot_hdf5: block below). Only the
 # components that were non-empty (real data, not shape (0,)) in the real
@@ -59,6 +76,16 @@ action_components:
   - ["joint/position", 14]
   - ["robot/velocity", 2]
   - ["waist/position", 2]
+
+# Named subsets of action_components above representing alternative
+# "action spaces" this dataset happens to record both of -- joint/position
+# (joint space) and end/position + end/orientation (end-effector space).
+# Everything else (effector/position, head/position, robot/velocity,
+# waist/position) is space-agnostic and always included regardless of
+# --action-space selection -- see RobotSchema.select_action_space.
+action_space_components:
+  joint: [joint/position]
+  end_effector: [end/position, end/orientation]
 
 # Only read by the "agibot_hdf5" ingestion strategy
 # (training/data_prep/strategies/agibot_hdf5.py).
@@ -91,3 +118,8 @@ agibot_hdf5:
   # Real, confirmed video filename inside <episode_id>/videos/ within the
   # observations tar.
   video_filename_template: "{camera_key}_color.mp4"
+  # Prefix (not a full filename -- frame number/padding is parsed out
+  # numerically, not assumed) for depth files inside <episode_id>/depth/
+  # within the observations tar. Empty/absent -- as for every dataset
+  # other than agibot_alpha -- means "no depth ingestion".
+  depth_filename_prefix_template: "{camera_key}_depth_"

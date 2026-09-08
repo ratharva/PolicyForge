@@ -49,9 +49,13 @@ def build_robot_schema(spec: dict) -> RobotSchema:
     try:
         return RobotSchema(
             camera_keys=tuple(spec["camera_keys"]),
+            depth_camera_keys=tuple(spec.get("depth_camera_keys", ())),
             state_components=tuple((n, d) for n, d in spec["state_components"]),
             action_components=tuple((n, d) for n, d in spec["action_components"]),
             tick_fps=spec["tick_fps"],
+            action_space_components={
+                space: tuple(names) for space, names in spec.get("action_space_components", {}).items()
+            },
         )
     except KeyError as e:
         raise ValueError(f"schema for {spec.get('dataset_source')!r} is missing field {e}") from e

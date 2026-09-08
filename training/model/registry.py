@@ -39,6 +39,28 @@ class PolicyAdapter:
     # preprocessor upstream (training/data/ray_dataset.py) -- train_loop.py
     # then skips calling preprocessor(batch) itself for this policy.
     preprocessing_offloaded: bool = False
+    # (policy, inputs) -> {camera_or_output_name: (T,H,W,C) uint8 frames} or
+    # None. Pure groundwork for a future policy that actually predicts
+    # visual frames (e.g. a world model) -- ACT/MolmoAct2/PI05 all only
+    # ever predict actions (confirmed: every one of their output_features
+    # dicts declares "action" and nothing visual), so this is None for all
+    # three today and train_loop.py's eval pass silently skips the
+    # predicted-frames GIF entirely when it's unset. A future adapter that
+    # DOES predict frames sets this and gets "watch the generated frames
+    # improve across training" for free -- see train_loop.py's eval-pass
+    # block, logged under eval_gif/<key> at the same step as the eval pass,
+    # so W&B's own per-step media history is what shows the improvement
+    # over time, no extra "compare across steps" mechanism needed.
+    predict_frames: Callable[[Any, dict], dict[str, Any] | None] | None = None
+    # (policy, inputs) -> {metric_name: value}. None (every policy today)
+    # -- train_loop.py skips this entirely. A custom/future adapter that
+    # computes something beyond forward_loss's own metrics dict sets this;
+    # its keys get merged into the SAME step_metrics/eval_step_metrics
+    # dict forward_loss's own metrics already flow through, so they
+    # automatically show up under train/*, window/*, epoch/*, AND eval/*
+    # (both TensorBoard and W&B, subject to the same --wandb-metrics/
+    # --wandb-metric-groups filtering) -- no new plumbing needed.
+    extra_metrics: Callable[[Any, dict], dict[str, float]] | None = None
 
 
 def _act_adapter() -> PolicyAdapter:

@@ -70,6 +70,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -104,6 +105,11 @@ class AgiBotHdf5IngestionConfig:
     state_hdf5_paths: dict[str, str]
     action_hdf5_paths: dict[str, str]
     video_filename_template: str
+    # Prefix (NOT a full filename -- see _find_depth_frames) for a depth
+    # camera's per-frame PNGs, e.g. "{camera_key}_depth_" for
+    # "<eid>/depth/head_depth_<frame>.png". Empty means no depth ingestion
+    # (true for every dataset using this strategy other than agibot_alpha).
+    depth_filename_prefix_template: str = ""
     revision: str | None = None
 
 
@@ -116,6 +122,7 @@ def build_ingestion_config(spec: dict) -> AgiBotHdf5IngestionConfig:
         state_hdf5_paths=dict(a["state_hdf5_paths"]),
         action_hdf5_paths=dict(a["action_hdf5_paths"]),
         video_filename_template=a["video_filename_template"],
+        depth_filename_prefix_template=a.get("depth_filename_prefix_template", ""),
         revision=spec.get("revision"),
     )
 
@@ -300,30 +307,47 @@ MAX_TAR_MEMBER_BYTES = 2_000_000_000  # 2GB -- real proprio/video members are MB
 _COPY_CHUNK_BYTES = 8_000_000
 
 
-def _extract_from_local_tar(tar_path: str, wanted_names: set[str], out_dir: str) -> dict[str, str]:
+def _extract_from_local_tar(
+    tar_path: str, wanted_names: set[str], out_dir: str, wanted_prefixes: set[str] | None = None,
+) -> dict[str, str]:
     """Single-pass scan of an already-local tar, extracting every member
-    whose name is in wanted_names as it's encountered and stopping once all
-    have been found. Skipping a non-wanted member is a real fseek (tarfile's
-    own next()), not a network round trip, so -- unlike the old live-HF
-    version -- no resync/parallel-region machinery is needed for this to be
-    fast. Returns {member_name: local_path}; members not found are simply
-    absent from the result."""
+    whose name is in wanted_names (exact match) OR starts with one of
+    wanted_prefixes (used for depth: one PNG per frame, so the exact set of
+    real member names -- their frame-number formatting/padding -- isn't
+    known upfront, only the directory prefix is, see
+    AgiBotHdf5IngestionConfig.depth_filename_prefix_template). Skipping a
+    non-wanted member is a real fseek (tarfile's own next()), not a network
+    round trip, so -- unlike the old live-HF version -- no resync/parallel-
+    region machinery is needed for this to be fast. Exact-name matching can
+    still stop early once every wanted_name is found; prefix matching
+    can't (no index tells us we've seen every member under a prefix), so
+    passing any wanted_prefixes means scanning the WHOLE tar regardless of
+    wanted_names. Returns {member_name: local_path}; wanted_names not found
+    are simply absent from the result (still warned about below) --
+    wanted_prefixes have no equivalent "expected count" to warn against."""
     found: dict[str, str] = {}
     remaining = set(wanted_names)
+    prefixes = wanted_prefixes or set()
     os.makedirs(out_dir, exist_ok=True)
     with tarfile.open(tar_path, "r") as tar:
         for member in tar:
-            if not remaining:
+            if not remaining and not prefixes:
                 break
-            if member.isfile() and member.name in remaining:
-                if member.size > MAX_TAR_MEMBER_BYTES:
-                    raise ValueError(f"{member.name} in {tar_path} is {member.size} bytes, exceeds cap")
-                local_path = os.path.join(out_dir, member.name.replace("/", "__"))
-                src = tar.extractfile(member)
-                with open(local_path, "wb") as f:
-                    while chunk := src.read(_COPY_CHUNK_BYTES):
-                        f.write(chunk)
-                found[member.name] = local_path
+            if not member.isfile():
+                continue
+            is_exact = member.name in remaining
+            is_prefixed = any(member.name.startswith(p) for p in prefixes)
+            if not (is_exact or is_prefixed):
+                continue
+            if member.size > MAX_TAR_MEMBER_BYTES:
+                raise ValueError(f"{member.name} in {tar_path} is {member.size} bytes, exceeds cap")
+            local_path = os.path.join(out_dir, member.name.replace("/", "__"))
+            src = tar.extractfile(member)
+            with open(local_path, "wb") as f:
+                while chunk := src.read(_COPY_CHUNK_BYTES):
+                    f.write(chunk)
+            found[member.name] = local_path
+            if is_exact:
                 remaining.discard(member.name)
     if remaining:
         print(f"WARNING: {len(remaining)} member(s) not found in {tar_path}: "
@@ -332,8 +356,10 @@ def _extract_from_local_tar(tar_path: str, wanted_names: set[str], out_dir: str)
 
 
 @ray.remote
-def _scan_local_shard(tar_path: str, wanted_names: list[str], out_dir: str) -> dict[str, str]:
-    return _extract_from_local_tar(tar_path, set(wanted_names), out_dir)
+def _scan_local_shard(
+    tar_path: str, wanted_names: list[str], out_dir: str, wanted_prefixes: list[str] | None = None,
+) -> dict[str, str]:
+    return _extract_from_local_tar(tar_path, set(wanted_names), out_dir, set(wanted_prefixes or ()))
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +398,62 @@ def _decode_video_bytes(data: bytes, image_size: tuple[int, int]) -> np.ndarray:
     return np.stack(frames)
 
 
+_DEPTH_FRAME_RE = re.compile(r"(\d+)\.png$")
+
+
+def _decode_depth_png(path: str, image_size: tuple[int, int]) -> np.ndarray:
+    """Decodes one depth frame PNG, preserving its real dtype/bit-depth
+    (commonly 16-bit grayscale for depth sensors, but not assumed --
+    np.array(img) reflects whatever the file actually is; unconfirmed for
+    real agibot_alpha depth files, see agibot_alpha.yaml's comment).
+    Resized to image_size like RGB cameras (_decode_video_bytes) -- so
+    depth doesn't need its own separately-tracked resolution anywhere
+    downstream -- using NEAREST (not bilinear/bicubic), which doesn't blend
+    across real depth discontinuities the way a smooth resize would."""
+    from PIL import Image
+
+    with Image.open(path) as img:
+        h, w = image_size
+        if img.size != (w, h):  # PIL's .size is (W, H)
+            img = img.resize((w, h), Image.NEAREST)
+        return np.array(img)
+
+
+def _decode_depth_frames(
+    depth_members: dict[str, str], episode_id: str, camera_key: str, prefix_template: str,
+    image_size: tuple[int, int],
+) -> np.ndarray:
+    """depth_members: {full tar member name: local path} for EVERY depth
+    member found under this episode's "<eid>/depth/" prefix (every depth
+    camera, if there's more than one) -- filtered here to `camera_key`'s
+    own files, then sorted by the frame number parsed OUT of the filename
+    NUMERICALLY (not lexicographically), so this is robust to whatever the
+    real files' zero-padding width turns out to be -- deliberately not
+    guessed. Stacks into (T, H, W) or (T, H, W, C)."""
+    cam_prefix = prefix_template.format(camera_key=camera_key)
+    matches: list[tuple[int, str]] = []
+    for member_name, local_path in depth_members.items():
+        filename = member_name.rsplit("/", 1)[-1]
+        if not filename.startswith(cam_prefix):
+            continue
+        m = _DEPTH_FRAME_RE.search(filename)
+        if not m:
+            raise ValueError(
+                f"depth frame filename {filename!r} (episode {episode_id}) doesn't end in "
+                f"<digits>.png -- can't determine frame order"
+            )
+        matches.append((int(m.group(1)), local_path))
+    if not matches:
+        raise ValueError(f"no depth frames found for camera {camera_key!r}, episode {episode_id!r} "
+                          f"under prefix {cam_prefix!r}")
+    matches.sort(key=lambda t: t[0])
+    return np.stack([_decode_depth_png(path, image_size) for _frame_idx, path in matches])
+
+
 def _transform_episode(
     proprio_path: str, video_paths: dict[str, str], robot: RobotSchema,
     agibot_cfg: AgiBotHdf5IngestionConfig, image_size: tuple[int, int],
+    episode_id: str, depth_tar_members: dict[str, str] | None = None,
 ) -> dict[str, np.ndarray]:
     with h5py.File(proprio_path, "r") as h5file:
         state = _read_proprio_components(h5file, "state", agibot_cfg.state_hdf5_paths)
@@ -383,6 +462,26 @@ def _transform_episode(
     for cam_key in robot.camera_keys:
         with open(video_paths[cam_key], "rb") as f:
             aligned[f"image.{cam_key}"] = _decode_video_bytes(f.read(), image_size)
+    t = state.shape[0]
+    for cam_key in robot.depth_camera_keys:
+        depth = _decode_depth_frames(
+            depth_tar_members or {}, episode_id, cam_key, agibot_cfg.depth_filename_prefix_template,
+            image_size,
+        )
+        if depth.shape[0] != t:
+            # Fails loudly (caught by prepare()'s per-episode try/except,
+            # which skips just this episode) rather than silently
+            # misaligning -- the "1 depth frame per video/state frame"
+            # cadence assumption isn't independently confirmed for real
+            # data, see agibot_alpha.yaml's comment.
+            raise ValueError(
+                f"episode {episode_id}: depth camera {cam_key!r} has {depth.shape[0]} frames but "
+                f"state/action/video have {t} -- the assumed 1-depth-frame-per-video-frame cadence "
+                f"doesn't hold for this episode; needs real resampling, not implemented"
+            )
+        if depth.ndim == 3:
+            depth = depth[..., None]  # (T,H,W) -> (T,H,W,1)
+        aligned[f"depth.{cam_key}"] = depth
     return aligned
 
 
@@ -407,6 +506,11 @@ def prepare(
             print(f"LeRobot v3 dataset already exists at {v3_root}, matching this request "
                   f"-- skipping conversion (pass --reconvert to rebuild it anyway)")
             return v3_root
+        print(
+            f"LeRobot v3 dataset at {v3_root} exists but doesn't match this request -- forcing a full rebuild.\n"
+            f"  stored:    {stored}\n  requested: {expected_params}"
+        )
+        force = True  # a schema/param mismatch must not be reused via incremental planning below
 
     print("\n=== discover real tasks/episodes ===")
     task_episodes = select_task_episodes(source_uri, agibot_cfg, tasks, max_episodes_per_task, token)
@@ -419,26 +523,28 @@ def prepare(
 
     plan = plan_incremental_conversion(v3_root, stable_ids_by_task, exists=exists, force=force)
 
-    # Pre-assign episode_index to every to-convert entry BEFORE attempting
-    # extraction (same convention convert_to_lerobot_v3 uses) -- a failed
-    # episode just leaves its index unused, the manifest is built from this
-    # fixed mapping either way, not from a counter that only advances on success.
-    specs = []  # (task_name, task_id, episode_id, episode_index)
-    episode_index = plan.next_episode_index
+    # episode_index is assigned only on success, below -- NOT pre-assigned
+    # here. lerobot_datasource.py requires strictly contiguous 0-based
+    # indices; pre-assigning one per requested episode and then skipping
+    # failures would leave gaps (e.g. [0, 2] if episode 1 fails), which
+    # finalize_dataset would write without complaint but which then makes
+    # the ENTIRE dataset unreadable at train time.
+    specs = []  # (task_name, task_id, episode_id)
     for task_name, stable_id in plan.to_convert:
         task_id, episode_id = stable_id.split("/")
-        specs.append((task_name, task_id, episode_id, episode_index))
-        episode_index += 1
+        specs.append((task_name, task_id, episode_id))
 
     new_records: list[EpisodeRecord] = []
+    new_idx_to_stable: dict[int, str] = {}
+    next_episode_index = plan.next_episode_index
     out_dir = tempfile.mkdtemp(prefix="agibot_extract_")
     try:
         if specs:
             print(f"\n=== resolve shards + extract {len(specs)} new episode(s) ===")
             # Group by task_id (shards are downloaded per-task) then by shard path.
-            by_task_id: dict[str, list[tuple[str, str, int]]] = {}  # task_id -> [(task_name, episode_id, episode_index), ...]
-            for task_name, task_id, episode_id, ep_idx in specs:
-                by_task_id.setdefault(task_id, []).append((task_name, episode_id, ep_idx))
+            by_task_id: dict[str, list[tuple[str, str]]] = {}  # task_id -> [(task_name, episode_id), ...]
+            for task_name, task_id, episode_id in specs:
+                by_task_id.setdefault(task_id, []).append((task_name, episode_id))
 
             # proprio_stats is one archive shared across every task -- download it
             # once here, distinct from any task's observations download below, so
@@ -448,32 +554,50 @@ def prepare(
 
             proprio_paths: dict[str, str] = {}  # episode_id -> local path
             video_paths: dict[str, dict[str, str]] = {}  # episode_id -> {camera_key: local path}
+            # episode_id -> {full tar member name: local path}, every depth
+            # frame found under that episode's "<eid>/depth/" prefix (every
+            # depth camera, if there's more than one) -- unlike video_paths,
+            # not pre-organized by camera_key, since the exact set of real
+            # member names isn't known upfront (see _extract_from_local_tar).
+            depth_paths: dict[str, dict[str, str]] = {}
 
             for task_id, entries in by_task_id.items():
-                episode_ids = [eid for _tn, eid, _ei in entries]
+                episode_ids = [eid for _tn, eid in entries]
 
                 print(f"  task {task_id}: downloading observations shard(s) ...")
                 obs_shards = download_task_observation_shards(source_uri, task_id, agibot_cfg, token)
                 shard_map = resolve_local_shards(episode_ids, obs_shards, proprio_shards)
 
                 obs_wanted: dict[str, list[str]] = {}  # local obs shard path -> [member_name, ...]
+                obs_prefixes: dict[str, list[str]] = {}  # local obs shard path -> [depth prefix, ...]
                 proprio_wanted: dict[str, list[str]] = {}  # local proprio shard path -> [member_name, ...]
                 for eid in episode_ids:
                     obs_path, proprio_path = shard_map[eid]
                     for cam_key in robot.camera_keys:
                         video_filename = agibot_cfg.video_filename_template.format(camera_key=cam_key)
                         obs_wanted.setdefault(obs_path, []).append(f"{eid}/videos/{video_filename}")
+                    if robot.depth_camera_keys:
+                        obs_prefixes.setdefault(obs_path, []).append(f"{eid}/depth/")
                     proprio_wanted.setdefault(proprio_path, []).append(f"{task_id}/{eid}/proprio_stats.h5")
 
                 print(f"  task {task_id}: scanning {len(obs_wanted)} local observations shard(s) + "
                       f"{len(proprio_wanted)} local proprio shard(s) for {len(episode_ids)} episode(s) ...")
-                refs = [_scan_local_shard.remote(path, names, out_dir) for path, names in obs_wanted.items()]
+                # Any shard with an active depth prefix can't stop early (see
+                # _extract_from_local_tar) -- a real, deliberate cost only
+                # paid when robot.depth_camera_keys is non-empty.
+                refs = [
+                    _scan_local_shard.remote(path, names, out_dir, obs_prefixes.get(path, []))
+                    for path, names in obs_wanted.items()
+                ]
                 refs += [_scan_local_shard.remote(path, names, out_dir) for path, names in proprio_wanted.items()]
                 for found in ray.get(refs):
                     for member_name, local_path in found.items():
                         if member_name.endswith("proprio_stats.h5"):
                             eid = member_name.split("/")[1]
                             proprio_paths[eid] = local_path
+                        elif "/depth/" in member_name:
+                            eid = member_name.split("/")[0]
+                            depth_paths.setdefault(eid, {})[member_name] = local_path
                         else:
                             eid, _videos, filename = member_name.split("/")
                             cam_key = next(
@@ -482,7 +606,7 @@ def prepare(
                             )
                             video_paths.setdefault(eid, {})[cam_key] = local_path
 
-            for task_name, task_id, episode_id, ep_idx in specs:
+            for task_name, task_id, episode_id in specs:
                 have_proprio = episode_id in proprio_paths
                 have_videos = len(video_paths.get(episode_id, {})) == len(robot.camera_keys)
                 if not (have_proprio and have_videos):
@@ -493,17 +617,26 @@ def prepare(
                 try:
                     aligned = _transform_episode(
                         proprio_paths[episode_id], video_paths[episode_id], robot, agibot_cfg, image_size,
+                        episode_id=episode_id, depth_tar_members=depth_paths.get(episode_id, {}),
                     )
                 except (OSError, KeyError, ValueError) as e:
                     print(f"WARNING: skipping episode {episode_id} (task {task_name}): transform failure: {e}")
                     continue
+                ep_idx = next_episode_index
+                next_episode_index += 1
                 record = write_episode(v3_root, ep_idx, task_name, plan.task_to_index[task_name], aligned, robot)
                 new_records.append(record)
+                new_idx_to_stable[ep_idx] = f"{task_id}/{episode_id}"
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
     reused_records = [
-        EpisodeRecord(episode_index=e["episode_index"], task=e["task"], length=e["length"])
+        EpisodeRecord(
+            episode_index=e["episode_index"], task=e["task"], length=e["length"],
+            # Carry forward depth metadata so it survives a run with 0 new episodes.
+            depth_shapes={k: tuple(v) for k, v in e.get("depth_shapes", {}).items()},
+            depth_dtypes=e.get("depth_dtypes", {}),
+        )
         for e in plan.reused
     ]
     all_records = reused_records + new_records
@@ -513,7 +646,7 @@ def prepare(
     finalize_dataset(v3_root, all_records, robot, image_size, plan.task_to_index)
     write_conversion_params(v3_root, expected_params)
 
-    idx_to_stable = {ep_idx: f"{task_id}/{episode_id}" for _tn, task_id, episode_id, ep_idx in specs}
+    idx_to_stable = dict(new_idx_to_stable)
     idx_to_stable.update({e["episode_index"]: e["rel_path"] for e in plan.reused})
     write_episode_manifest(v3_root, [
         {
@@ -522,6 +655,8 @@ def prepare(
             "episode_index": r.episode_index,
             "task_index": plan.task_to_index[r.task],
             "length": r.length,
+            "depth_shapes": r.depth_shapes,
+            "depth_dtypes": r.depth_dtypes,
         }
         for r in all_records
     ])

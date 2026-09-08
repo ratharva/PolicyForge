@@ -52,11 +52,9 @@ def build_molmoact2_config(
     else:
         raise ValueError(f"train_mode must be one of 'lora', 'fft', 'freeze', got {overrides.train_mode!r}")
 
-    h, w = data_cfg.image_size
-    input_features = {
-        f"observation.images.{k}": PolicyFeature(type=FeatureType.VISUAL, shape=(3, h, w))
-        for k in data_cfg.robot.camera_keys
-    }
+    from training.model.image_normalization import visual_input_features
+
+    input_features = visual_input_features(data_cfg)
     input_features["observation.state"] = PolicyFeature(
         type=FeatureType.STATE, shape=(data_cfg.robot.state_dim,)
     )
@@ -64,6 +62,24 @@ def build_molmoact2_config(
         "action": PolicyFeature(type=FeatureType.ACTION, shape=(data_cfg.robot.action_dim,))
     }
 
+    # image_keys (distinct from input_features, which just declares dims)
+    # is the ONLY thing that controls which cameras MolmoAct2's own
+    # processor actually extracts and feeds to the vision tower/VLM prompt
+    # -- confirmed by reading processor_molmoact2.py's _resolve_image_keys
+    # directly. The default below (RGB camera_keys only) silently drops
+    # any depth camera: it's still declared as an input_features VISUAL
+    # entry, so it gets normalized/transferred for nothing. Fail fast
+    # instead of guessing this is safe -- an explicit --config-file
+    # model.image_keys (including depth) is the deliberate opt-in once
+    # someone's verified it end to end against a real checkpoint.
+    if overrides.image_keys is None and data_cfg.robot.depth_camera_keys:
+        raise ValueError(
+            f"this dataset has depth camera(s) {data_cfg.robot.depth_camera_keys} but MolmoAct2's "
+            f"image_keys would default to RGB-only cameras {data_cfg.robot.camera_keys}, silently "
+            f"never feeding depth to the model -- pass model.image_keys explicitly via --config-file "
+            f"(including observation.images.depth_<key> for each one) to opt in, or use a dataset "
+            f"without depth cameras for --policy-type molmoact2."
+        )
     image_keys = overrides.image_keys or [f"observation.images.{k}" for k in data_cfg.robot.camera_keys]
 
     return MolmoAct2Config(
@@ -86,10 +102,14 @@ def build_molmoact2_config(
         image_keys=image_keys,
         setup_type=overrides.setup_type,
         control_mode=overrides.control_mode,
-        # MEAN_STD (not the real default IDENTITY/QUANTILES) so
+        # STATE/ACTION: MEAN_STD (not the real default IDENTITY/QUANTILES) so
         # training/data/stats.py's mean/std-only compute_dataset_stats works
-        # unchanged.
-        normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
+        # unchanged. VISUAL: IDENTITY -- training/model/image_normalization.py
+        # now owns all image scaling instead (applied in train_loop.py/
+        # offload_molmoact2_preprocessing before this policy's preprocessor
+        # runs), so lerobot's own per-FeatureType normalizer must not also
+        # scale images.
+        normalization_mapping={"VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
         optimizer_lr=train_cfg.lr,
         optimizer_vit_lr=overrides.optimizer_vit_lr or train_cfg.lr,
         optimizer_connector_lr=overrides.optimizer_connector_lr or train_cfg.lr,

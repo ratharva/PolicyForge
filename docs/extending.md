@@ -29,6 +29,25 @@ narrative/verification history behind each design choice.
      - ["another_component", 1]
    action_components:
      - ["component_name", 6]
+
+   # Optional -- omit entirely unless the real raw data actually has these:
+   depth_camera_keys: []            # single-channel depth cameras, disjoint
+                                     # from camera_keys' RGB ones (see
+                                     # agibot_alpha.yaml + agibot_hdf5.py for
+                                     # the one real example -- depth needs
+                                     # ingestion-strategy support, this field
+                                     # alone doesn't add it)
+   action_space_components: {}      # only if action_components mixes MORE
+                                     # THAN ONE alternative "action space" for
+                                     # the same robot (e.g. agibot_alpha
+                                     # records both joint- and end-effector-
+                                     # space components) -- maps a space name
+                                     # to the subset of action_components
+                                     # names it selects; everything else is
+                                     # always included regardless of
+                                     # --action-space. See RobotSchema.
+                                     # select_action_space and training/
+                                     # README.md's --action-space flag.
    ```
 3. Fill in the strategy-named block (`mcap:` / `hf_lerobot_mirror:` /
    `agibot_hdf5:`) -- field meanings are strategy-specific; the closest
@@ -154,9 +173,18 @@ real weights.
    post-parse validation for anything conditionally required.
 5. **`needs_task=True`** if the policy is language-conditioned -- `task`
    already flows through `LeRobotDatasource` into every batch by default.
-6. **Normalization**: default to `MEAN_STD` (matches
+6. **Normalization**: default to `MEAN_STD` for STATE/ACTION (matches
    `training/data/stats.py`'s `compute_dataset_stats`) unless the policy's
-   own defaults genuinely need something else.
+   own defaults genuinely need something else. **VISUAL must be
+   `"IDENTITY"`, always** -- `training/model/image_normalization.py` owns
+   100% of per-camera image scaling now (applied in `train_loop.py` before
+   this policy's preprocessor runs), so the policy's own normalizer must
+   not also scale images, or they'd be double-normalized. Build
+   `input_features` via `training/model/image_normalization.py`'s
+   `visual_input_features(data_cfg)` (mirror `act.py`), not a hand-rolled
+   `{camera_keys: PolicyFeature(VISUAL, ...)}` dict -- it also covers any
+   `depth_camera_keys`, declared 3-channel to match the automatic
+   single-channel-to-3-channel replication that function's caller applies.
 7. **Check the environment before assuming a new one is needed**:
    ```bash
    python -c "import lerobot.policies as p; import pkgutil; \

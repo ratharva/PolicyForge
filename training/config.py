@@ -7,11 +7,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import draccus
+
 from training.common.config import DataConfig
 
 
 @dataclass
-class ACTConfigOverrides:
+class PolicyOverrides(draccus.ChoiceRegistry):
+    """Shared base for the three *ConfigOverrides dataclasses below, so
+    draccus's choice-registry mechanism can select one from a --config-file
+    YAML's `model: {type: act|molmoact2|pi05, ...}` section (see
+    training/train.py's --config-file). Purely a draccus-integration
+    detail -- runtime code (train_loop.py, model/*.py) keeps accessing
+    RunConfig.model by plain attribute access, unaffected by this base."""
+
+
+@PolicyOverrides.register_subclass("act")
+@dataclass
+class ACTConfigOverrides(PolicyOverrides):
     """Values passed to lerobot's ACTConfig -- field names must match the
     installed lerobot version; see training/model/act.py."""
     chunk_size: int = 100
@@ -30,8 +43,9 @@ class ACTConfigOverrides:
     dropout: float = 0.1
 
 
+@PolicyOverrides.register_subclass("molmoact2")
 @dataclass
-class MolmoAct2ConfigOverrides:
+class MolmoAct2ConfigOverrides(PolicyOverrides):
     """Values passed to lerobot's MolmoAct2Config; see training/model/molmoact2.py."""
     checkpoint_path: str = "allenai/MolmoAct2"
     chunk_size: int = 30          # MolmoAct2Config's own default -- NOT ACT's 100
@@ -70,8 +84,9 @@ class MolmoAct2ConfigOverrides:
     offload_tokenization: bool = False
 
 
+@PolicyOverrides.register_subclass("pi05")
 @dataclass
-class Pi05ConfigOverrides:
+class Pi05ConfigOverrides(PolicyOverrides):
     """Values passed to lerobot's PI05Config; see training/model/pi05.py.
 
     Deliberately no single "train_mode" convenience string like
@@ -117,6 +132,76 @@ class TrainConfig:
     save_only_on_improvement: bool = False
     checkpoint_max_to_keep: int = 3
 
+    # Opt-in perf instrumentation (training/perf_logging.py) -- off by
+    # default so a normal run pays zero cost: accurate step-timing needs
+    # torch.cuda.synchronize() calls, which serialize async CUDA work and
+    # cost real throughput whenever they're on. See train_loop.py.
+    log_perf_metrics: bool = False
+    # (start_step, end_step) inclusive range to capture a real
+    # torch.profiler trace for -- only meaningful when log_perf_metrics is
+    # also True. None disables profiling entirely.
+    profile_steps: tuple[int, int] | None = None
+
+    # TensorBoard is unconditional otherwise -- True (default) preserves
+    # that exactly. False (--no-tensorboard) skips creating tb_writer
+    # entirely, e.g. when only W&B is wanted.
+    tensorboard: bool = True
+
+    # --- W&B (training/wandb_logging.py), via ray.air.integrations.wandb's
+    # setup_wandb() -- off by default, additive: everything TensorBoard
+    # already logs also goes to W&B at the same cadences when enabled.
+    wandb: bool = False
+    # None (default): don't pass a `mode` to wandb.init() at all -- the
+    # WANDB_MODE env var (or wandb's own "online" default) decides, same
+    # as before this flag existed. A real value ("online" | "offline" |
+    # "disabled") passed explicitly OVERRIDES the env var (wandb's own
+    # kwarg-beats-env-var behavior) -- confirmed directly that defaulting
+    # this to "online" instead of None broke WANDB_MODE=offline entirely,
+    # since an explicit kwarg always wins.
+    wandb_mode: str | None = None
+    wandb_project: str | None = None
+    wandb_entity: str | None = None
+    # Allowlist (fnmatch globs OK, e.g. "perf/*") -- None (default) logs
+    # every metric already being computed, so turning on --wandb doesn't
+    # silently hide anything unless explicitly filtered. Named groups
+    # below expand into and merge with this at setup time -- see
+    # training/wandb_logging.py's METRIC_GROUPS/expand_metric_groups.
+    wandb_metrics: list[str] | None = None
+    # Denylist (fnmatch globs OK), applied after the allowlist.
+    wandb_exclude_metrics: list[str] = field(default_factory=list)
+    # Friendly names for common wandb_metrics glob groups (e.g. "core",
+    # "perf", "media") -- see training/wandb_logging.py's METRIC_GROUPS.
+    # Use --list-wandb-metrics to see every real group/metric name without
+    # reading source or running a training job.
+    wandb_metric_groups: list[str] = field(default_factory=list)
+    # Episode-preview GIFs -- which cameras to sample (empty = off, opt-in
+    # per camera), how often (None -> reuse eval_every_steps), how many
+    # frames per GIF.
+    wandb_gif_cameras: list[str] = field(default_factory=list)
+    wandb_gif_every_steps: int | None = None
+    wandb_gif_frames: int = 30
+    # Predicted-frames GIFs (PolicyAdapter.predict_frames -- see
+    # training/model/registry.py; inert for every policy today, groundwork
+    # for a future world-model-style policy) -- how often to log them,
+    # relative to the eval pass they're generated inside (see
+    # train_loop.py): None (default) logs one every eval pass; a real
+    # value only logs one every Nth eval pass at that step multiple, e.g.
+    # eval_every_steps=200 + this=1000 logs one every 5th eval pass. Can
+    # only ever be a multiple of eval_every_steps -- generating these
+    # needs a real eval batch, which only exists when the eval pass itself
+    # runs, unlike wandb_gif_every_steps above (real recorded episodes,
+    # no eval batch needed, so that one can use any cadence).
+    wandb_predict_frames_every_steps: int | None = None
+
+    # None (default): no held-out split, no real eval/inference pass --
+    # episode-preview GIFs sample from anywhere in the dataset. A real
+    # fraction (0 < x < 1): that fraction of episodes is held out of
+    # TRAINING entirely and used for a real eval pass (reusing
+    # adapter.forward_loss under torch.no_grad()) at the eval_every_steps
+    # cadence, and GIFs sample specifically from the held-out set. See
+    # training/data/ray_dataset.py's split_by_episode.
+    eval_split_fraction: float | None = None
+
 
 @dataclass
 class RunConfig:
@@ -136,5 +221,5 @@ class RunConfig:
     # the right override type once --policy-type is parsed.
     policy_type: str = "act"
     data: DataConfig = field(default_factory=DataConfig)
-    model: ACTConfigOverrides | MolmoAct2ConfigOverrides | Pi05ConfigOverrides = field(default_factory=ACTConfigOverrides)
+    model: PolicyOverrides = field(default_factory=ACTConfigOverrides)
     train: TrainConfig = field(default_factory=TrainConfig)

@@ -2,9 +2,12 @@
 subset of the built Ray Dataset -- not a full pass, which isn't needed for
 stable mean/std estimates.
 
-Image stats are computed over raw [0, 255] float32 pixel values, NOT rescaled
+Image stats are computed over raw pixel values (RGB: [0, 255]; depth
+cameras: whatever the raw sensor units are, e.g. millimeters), NOT rescaled
 to [0, 1] -- this must match training/vendor/util.py's NumpyToTorchCollate, which
-widens uint8 images to float32 with no /255 rescale.
+widens uint8/uint16 images to float32 with no rescale. Only consumed by
+cameras using image_normalization.py's "mean_std" mode -- others (unit01,
+depth, log) use a fixed formula instead, see that module.
 
 Call this on the dataset BEFORE any HWC->CHW transpose stage (see
 training/data/ray_dataset.py's build_lerobot_v3_dataset vs.
@@ -39,13 +42,15 @@ def compute_dataset_stats(ds, cfg: DataConfig, n_samples: int = 500) -> dict:
         },
     }
 
-    for cam_key in cfg.robot.camera_keys:
-        col = f"observation.images.{cam_key}"
-        imgs = np.stack([r[col] for r in rows]).astype(np.float32)  # (N,H,W,3), range [0,255]
-        imgs = imgs.transpose(0, 3, 1, 2)  # (N,3,H,W)
+    image_cols = [f"observation.images.{k}" for k in cfg.robot.camera_keys]
+    image_cols += [f"observation.images.depth_{k}" for k in cfg.robot.depth_camera_keys]
+    for col in image_cols:
+        imgs = np.stack([r[col] for r in rows]).astype(np.float32)  # (N,H,W,C), range [0,255] for RGB
+        imgs = imgs.transpose(0, 3, 1, 2)  # (N,C,H,W)
+        c = imgs.shape[1]  # 3 for RGB; depth cameras are single-channel, not hardcoded here
         stats[col] = {
-            "mean": imgs.mean(axis=(0, 2, 3)).reshape(3, 1, 1).tolist(),
-            "std": imgs.std(axis=(0, 2, 3)).reshape(3, 1, 1).tolist(),
+            "mean": imgs.mean(axis=(0, 2, 3)).reshape(c, 1, 1).tolist(),
+            "std": imgs.std(axis=(0, 2, 3)).reshape(c, 1, 1).tolist(),
         }
 
     print(f"  computed stats for: {list(stats.keys())}")

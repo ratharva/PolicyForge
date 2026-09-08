@@ -21,6 +21,7 @@ is given explicitly (`--dataset-source`, see the table row below).
 | Flag | Default | Meaning |
 |---|---|---|
 | `--tasks` (required) | -- | must match what `prepare_data.py` was run with |
+| `--config-file` | none | optional YAML file providing a base `RunConfig` -- every flag in this doc still works and takes precedence; see "Config files" below |
 | `--run-name` | `<policy_type>-<tasks>-<timestamp>` | also the resume key -- see below |
 | `--storage-root` | `TrainConfig` default | where run output (checkpoints, TensorBoard, history) is written |
 | `--num-epochs` | `1` | |
@@ -43,6 +44,125 @@ is given explicitly (`--dataset-source`, see the table row below).
 # Custom base LR, ACT backbone LR, gradient accumulation, and weight decay
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
     --lr 5e-5 --lr-backbone 1e-5 --grad-accum 4 --weight-decay 1e-3
+```
+
+## Config files
+
+`--config-file PATH` loads a YAML file into a base `RunConfig`, parsed with
+[`draccus`](https://github.com/dlwh/draccus) -- the same library lerobot's
+own `ACTConfig`/`PI05Config`/`MolmoAct2Config` are built on (already an
+installed dependency, pulled in transitively by `lerobot==0.6.1`). It's
+purely additive: **every named flag in this doc still works exactly as it
+always has, and takes precedence over anything the YAML sets** --
+`--config-file` only fills in values nothing else was explicitly passed
+for. `--tasks` and `--policy-type` are still required on the command line
+even when the file also sets them (there's no way to make a required flag
+optional only when a config file exists without changing the CLI's shape
+for everyone, which this was deliberately kept from doing).
+
+Precedence, low to high: dataclass defaults (`training/config.py`) <
+`--config-file`'s YAML < a named CLI flag actually typed on the command
+line. One accepted limitation: a CLI flag whose value happens to equal its
+own default is indistinguishable from not having passed it at all, so the
+config-file's value (if any) wins in that case -- if you need to force a
+value back to its default while using a config file, remove it from the
+file instead of relying on the flag.
+
+The YAML mirrors `RunConfig`'s real shape (`training/config.py`,
+`training/common/config.py`'s `DataConfig`) -- top-level `tasks`/
+`policy_type`/`run_name`/`storage_root`, nested `train:`/`data:` sections,
+and a `model:` section whose `type: act|molmoact2|pi05` key selects which
+of the three `*ConfigOverrides` dataclasses the rest of that section's
+fields apply to (draccus's "choice registry" mechanism -- if `model.type`
+disagrees with the resolved `--policy-type`, `train.py` exits with a clear
+error rather than guessing which one you meant).
+
+Five real, draccus-verified examples in
+[`training/configs/`](configs/README.md) -- one per policy, plus one
+showing the `data:` section (action-space selection, delta actions,
+per-camera image normalization including a depth camera):
+
+```bash
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+    --policy-type act --config-file training/configs/act_example.yaml
+
+# A named flag still overrides whatever the file sets
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+    --policy-type act --config-file training/configs/act_example.yaml --batch-size 32
+```
+
+## Action space & per-camera image normalization
+
+General flags -- apply regardless of `--policy-type`, applied once to the
+Ray Dataset before normalization stats are computed (not a per-policy
+concern).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--action-space` | none (every action component) | which named subset of the dataset's `action_components` to train on -- e.g. `joint` or `end_effector` for `agibot_alpha`, which records both. Valid names are dataset-specific (the schema's `action_space_components` keys); most datasets declare none, so this only applies to `agibot_alpha` today |
+| `--action-representation` | `absolute` | `absolute` (unchanged) or `delta`: `action -= observation.state` per dim, using each action component's **same-named** state component as the reference point -- components with no same-named state component (e.g. `agibot_alpha`'s `robot/velocity`, which has no state counterpart) stay absolute, there's no reference point to use |
+| `--action-delta-exclude` | none | action component names to keep absolute even under `--action-representation delta` (e.g. a gripper component) |
+| `--image-normalization` | none | per-camera mode, `CAMERA=MODE` pairs, e.g. `--image-normalization top=unit01 depth_head=depth`. Modes: `mean_std` (default, dataset-computed mean/std, current behavior), `unit01` (`x/255`), `unit_pm1` (`x/127.5 - 1`), `depth` (`clip(x,0,max)/max`), `log` (`log1p(x)/log1p(max)`) |
+| `--image-normalization-default` | `mean_std` | mode for any camera not covered by `--image-normalization` |
+| `--image-normalization-max` | none | `CAMERA=VALUE` pairs -- **required** for any camera using `depth`/`log` (the raw-value ceiling to clip/scale by, e.g. max depth in millimeters); no guessed default |
+
+A single-channel camera (a depth camera, in practice) is automatically
+replicated to 3 channels after normalization, so it flows through the same
+vision backbone every RGB camera does -- see
+`training/model/image_normalization.py`.
+
+```bash
+# Train agibot_alpha on joint-space actions instead of the full 36-dim
+# action vector (which mixes joint- and end-effector-space components)
+python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-type act \
+    --action-space joint
+
+# Delta (relative-to-state) actions, keeping one component absolute --
+# needs a dataset whose action/state components are actually same-named
+# (abc130k's aren't: e.g. "/left-arm-action" vs "/left-arm-state", so
+# --action-representation delta would leave every dim absolute there --
+# see the --action-representation row above). agibot_alpha's are:
+# "effector/position" appears in both state_components and
+# action_components, so it gets a real delta unless excluded like this.
+python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-type act \
+    --action-representation delta --action-delta-exclude effector/position
+
+# Per-camera normalization: one RGB camera to [0,1], another to [-1,1],
+# a depth camera clipped/scaled by its real max range (millimeters)
+python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-type act \
+    --image-normalization top=unit01 wrist=unit_pm1 depth_head=depth \
+    --image-normalization-max depth_head=5000
+```
+
+## Performance instrumentation
+
+General flags -- apply regardless of `--policy-type`. Off by default:
+accurate step timing needs `torch.cuda.synchronize()` calls, which
+serialize async CUDA work and cost real throughput whenever they're on, so
+this is opt-in rather than always-on.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--log-perf-metrics` | off | logs GPU utilization/VRAM, per-step timing (`perf/data_wait_s`/`preprocess_s`/`compute_s`/`optimizer_step_s`), effective batch size, throughput (`perf/samples_per_sec`), and an IO-bound-vs-compute-bound ratio (`perf/io_bound_fraction`) to TensorBoard under `perf/*`. Needs `nvidia-ml-py` installed for GPU compute-utilization % (`perf/gpu_util_pct`, `perf/gpu_mem_util_pct`) -- VRAM stats (`perf/vram_*`) work without it; missing `nvidia-ml-py` just skips those two, logged once as a warning, not a crash |
+| `--profile-steps START:END` | none | requires `--log-perf-metrics`. Captures a real `torch.profiler` trace for steps `START..END` (inclusive) into the run's `tensorboard/` dir -- viewable in TensorBoard's PyTorch Profiler tab, same `tensorboard --logdir` command as everything else. Rank 0 only. Keep the range small (10-20 steps is usually plenty) -- traces get large fast; a range over 50 steps prints a warning |
+
+`perf/io_bound_fraction` is `data_wait_s / (data_wait_s + preprocess_s +
+compute_s)` per window -- loosely, high (>0.3-0.5) + low `gpu_util_pct`
+means IO-bound (more Ray Data actors/CPU, bigger prefetch buffer, faster
+decode is the fix); low + high `gpu_util_pct` means compute-bound (bigger
+batch, mixed precision, model-side work is the fix). `perf/checkpoint_save_s`
+is logged whenever a checkpoint actually writes -- without it, a periodic
+step-time spike every `--eval-every-steps` looks like unexplained noise
+instead of "checkpointing is slow."
+
+```bash
+# Find out whether a run is IO- or compute-bound
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --log-perf-metrics --max-train-steps 200
+
+# Same, plus a kernel-level trace of steps 50-65 for a deeper look
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --log-perf-metrics --profile-steps 50:65 --max-train-steps 200
 ```
 
 ## Resuming a run

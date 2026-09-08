@@ -19,11 +19,9 @@ def build_act_config(
     from lerobot.configs.types import FeatureType, PolicyFeature
     from lerobot.policies.act.configuration_act import ACTConfig
 
-    h, w = data_cfg.image_size
-    input_features = {
-        f"observation.images.{k}": PolicyFeature(type=FeatureType.VISUAL, shape=(3, h, w))
-        for k in data_cfg.robot.camera_keys
-    }
+    from training.model.image_normalization import visual_input_features
+
+    input_features = visual_input_features(data_cfg)
     input_features["observation.state"] = PolicyFeature(
         type=FeatureType.STATE, shape=(data_cfg.robot.state_dim,)
     )
@@ -35,6 +33,12 @@ def build_act_config(
         input_features=input_features,
         output_features=output_features,
         device=device,  # explicit to avoid lerobot's implicit GPU auto-resolution
+        # VISUAL: "IDENTITY" -- training/model/image_normalization.py now owns
+        # all image scaling (applied in train_loop.py before this policy's
+        # preprocessor runs), so lerobot's own per-FeatureType normalizer
+        # must not also scale images. STATE/ACTION keep ACTConfig's real
+        # default (MEAN_STD), untouched.
+        normalization_mapping={"VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
         chunk_size=overrides.chunk_size,
         n_action_steps=overrides.n_action_steps,
         vision_backbone=overrides.vision_backbone,

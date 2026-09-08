@@ -27,6 +27,13 @@ lerobot==0.6.1
 tensorboard
 pyyaml
 h5py
+# Not listed explicitly here on purpose -- draccus is already pulled in
+# transitively by lerobot==0.6.1 (`pip show draccus` -> Required-by:
+# lerobot; it's what ACTConfig/PI05Config/MolmoAct2Config are built on).
+# training/train.py's --config-file now imports and calls it directly too
+# (draccus.parse), not just via lerobot -- if lerobot ever stops requiring
+# it, add `draccus` here explicitly rather than assuming it'll still be
+# present.
 
 # Needed by the droid ingestion strategy (training/data_prep/strategies/
 # hf_lerobot_mirror.py) -- lerobot.scripts.convert_dataset_v21_to_v30 (part
@@ -46,3 +53,19 @@ datasets
 # section. Not needed for --molmoact2-train-mode lora (the default), which
 # uses plain DDP like ACT.
 # accelerate>=1.13.0
+
+# Optional: only needed for --log-perf-metrics's GPU compute-utilization %
+# (torch.cuda.utilization()/memory_usage() both call into NVML under the
+# hood -- confirmed via a real ModuleNotFoundError from torch itself
+# without this installed). VRAM allocator stats (perf/vram_*) work without
+# it; only perf/gpu_util_pct and perf/gpu_mem_util_pct need it, and
+# training/perf_logging.py degrades gracefully (one warning, no crash) if
+# it's missing.
+# nvidia-ml-py
+
+# Optional: only needed for --wandb (training/wandb_logging.py, via Ray's
+# own ray.air.integrations.wandb.setup_wandb()) -- imported lazily inside
+# train_loop.py, same pattern as nvidia-ml-py above, so it's never required
+# unless --wandb is actually passed. Needs a real W&B login/API key too
+# (`wandb login`), not just the package.
+# wandb

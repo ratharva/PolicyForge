@@ -1,0 +1,26 @@
+# Sample --config-file for --policy-type molmoact2, full fine-tune under
+# FSDP2 (needs `accelerate` installed -- see training/requirements.txt --
+# and carries real, still-unverified checkpoint-resume risk at scale, see
+# training/README.md's FSDP2 section before using this for a real run).
+#
+#   python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+#       --policy-type molmoact2 --config-file training/configs/molmoact2_fft_example.yaml
+
+train:
+  batch_size: 32
+  eval_every_steps: 200
+
+model:
+  type: molmoact2
+  setup_type: "dual-arm robot with wrist and top cameras"
+  control_mode: "delta joint position"
+  train_mode: fft                        # full fine-tune, no LoRA
+  distributed_strategy: fsdp2            # only makes sense with train_mode: fft
+  fsdp_cpu_offload: false                # true trades speed for fitting on fewer/smaller GPUs
+  gradient_checkpointing: true
+  # Per-group learning rates -- MolmoAct2's get_optim_params() returns 4
+  # groups (vlm/vit/connector/action_expert); omit any of these to fall
+  # back to train.lr for that group.
+  optimizer_vit_lr: 1.0e-6
+  optimizer_connector_lr: 5.0e-5
+  optimizer_action_expert_lr: 1.0e-4

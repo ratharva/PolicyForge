@@ -1,0 +1,39 @@
+# Sample --config-file for --policy-type act.
+#
+#   python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+#       --policy-type act --config-file training/configs/act_example.yaml
+#
+# --tasks/--policy-type are still required on the command line (see
+# training/README.md's "Config files" section for why) -- everything else
+# here is optional; any field can also be overridden with its usual named
+# flag, which always wins over what's set here.
+
+# Redundant with the required --tasks flag above -- shown here for
+# reference only, the CLI flag always wins (see the README section above).
+tasks: [dress_the_teddy_bear]
+
+train:
+  num_epochs: 5
+  batch_size: 16
+  lr: 5.0e-5
+  lr_backbone: 1.0e-5
+  grad_accum: 1
+  weight_decay: 1.0e-4
+  eval_every_steps: 200
+  early_stop_patience: 5
+  checkpoint_max_to_keep: 3
+
+model:
+  # This "type" key is draccus's choice-registry discriminator -- it's
+  # what selects ACTConfigOverrides vs MolmoAct2ConfigOverrides vs
+  # Pi05ConfigOverrides (see training/config.py's PolicyOverrides). Must
+  # match --policy-type, or training.train exits with a clear error.
+  type: act
+  chunk_size: 100
+  n_action_steps: 100
+  vision_backbone: resnet18
+  dim_model: 512
+  use_vae: true
+  latent_dim: 32
+  kl_weight: 10.0
+  dropout: 0.1

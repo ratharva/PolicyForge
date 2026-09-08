@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import av
 import numpy as np
@@ -51,6 +51,13 @@ class EpisodeRecord:
     episode_index: int
     task: str
     length: int
+    # Depth camera_key -> real (H, W, C) shape / numpy dtype name this
+    # episode's depth arrays actually had -- depth keeps its native sensor
+    # resolution (unlike RGB cameras, which are resized to image_size), so
+    # finalize_dataset reads this off a real record instead of guessing.
+    # Empty for every dataset without depth_camera_keys.
+    depth_shapes: dict[str, tuple[int, int, int]] = field(default_factory=dict)
+    depth_dtypes: dict[str, str] = field(default_factory=dict)
 
 
 # Not part of the LeRobot v3 schema -- lets this project detect a stale
@@ -79,6 +86,7 @@ def compute_conversion_params(
         "tick_fps": robot.tick_fps,
         "image_size": list(image_size),
         "camera_keys": list(robot.camera_keys),
+        "depth_camera_keys": list(robot.depth_camera_keys),
         "revision": revision,
     }
 
@@ -155,11 +163,20 @@ def _write_episode_video(
 def _write_episode_data(
     fs, fs_root: str, episode_index: int, task_index: int,
     state: np.ndarray, action: np.ndarray, fps: float,
+    depth: dict[str, np.ndarray] | None = None,
 ) -> None:
     """state/action: (T, dim) float32. `index` is a LOCAL 0-based placeholder
-    here -- finalize_dataset() patches it to the real global offset."""
+    here -- finalize_dataset() patches it to the real global offset.
+
+    depth: {camera_key: (T,H,W,C) array}, written flattened to (T, H*W*C)
+    per-row -- same "list of fixed-length 1D arrays" pyarrow convention
+    state/action already use, just longer rows. NOT video-encoded (depth
+    isn't RGB -- see training/data_prep/strategies/agibot_hdf5.py); the
+    real (H,W,C)/dtype needed to reshape this back on read is recorded by
+    the caller (write_episode) into the returned EpisodeRecord, since this
+    flat column alone doesn't carry it."""
     t = state.shape[0]
-    table = pa.table({
+    columns = {
         "index": pa.array(np.arange(t), type=pa.int64()),
         "episode_index": pa.array([episode_index] * t, type=pa.int64()),
         "frame_index": pa.array(np.arange(t), type=pa.int64()),
@@ -167,7 +184,10 @@ def _write_episode_data(
         "task_index": pa.array([task_index] * t, type=pa.int64()),
         "observation.state": pa.array(list(state.astype(np.float32))),
         "action": pa.array(list(action.astype(np.float32))),
-    })
+    }
+    for cam_key, arr in (depth or {}).items():
+        columns[f"depth.{cam_key}"] = pa.array(list(arr.reshape(t, -1)))
+    table = pa.table(columns)
     rel_path = DATA_PATH_TEMPLATE.format(chunk_index=0, file_index=episode_index)
     abs_path = f"{fs_root}/{rel_path}"
     fs.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -181,16 +201,56 @@ def write_episode(
 ) -> EpisodeRecord:
     """aligned: a dict shaped like whatever an ingestion strategy's
     decode_and_align() returns (keys "state", "action",
-    "image.<camera_key>") -- see training/data_prep/strategies/."""
+    "image.<camera_key>", and "depth.<camera_key>" for
+    robot.depth_camera_keys) -- see training/data_prep/strategies/."""
     fs, fs_root = open_fs(root)
     is_local = _is_local_root(root)
     state, action = aligned["state"], aligned["action"]
-    _write_episode_data(fs, fs_root, episode_index, task_index, state, action, robot.tick_fps)
+    depth = {cam_key: aligned[f"depth.{cam_key}"] for cam_key in robot.depth_camera_keys}
+    _write_episode_data(fs, fs_root, episode_index, task_index, state, action, robot.tick_fps, depth=depth)
     for cam_key in robot.camera_keys:
         _write_episode_video(
             fs, fs_root, is_local, episode_index, cam_key, aligned[f"image.{cam_key}"], robot.tick_fps,
         )
-    return EpisodeRecord(episode_index=episode_index, task=task, length=state.shape[0])
+    return EpisodeRecord(
+        episode_index=episode_index, task=task, length=state.shape[0],
+        depth_shapes={k: tuple(v.shape[1:]) for k, v in depth.items()},
+        depth_dtypes={k: str(v.dtype) for k, v in depth.items()},
+    )
+
+
+def renumber_episode(root: str, old_index: int, new_index: int, camera_keys: tuple[str, ...]) -> None:
+    """Moves one already-written episode's data/video files from old_index
+    to new_index, patching the data parquet's own episode_index column to
+    match (video files carry no such column, just a path rename). No-op if
+    old_index == new_index. Used by convert.py to compact away index gaps
+    left by episodes that failed conversion mid-batch -- a failed episode
+    never gets this far (write_episode is only called on success), but
+    running episodes in parallel means some earlier-numbered episode can
+    still fail after a later-numbered one already succeeded and wrote its
+    files under its original (soon-to-be-gapped) index."""
+    if old_index == new_index:
+        return
+    fs, fs_root = open_fs(root)
+
+    old_data_path = f"{fs_root}/{DATA_PATH_TEMPLATE.format(chunk_index=0, file_index=old_index)}"
+    new_data_path = f"{fs_root}/{DATA_PATH_TEMPLATE.format(chunk_index=0, file_index=new_index)}"
+    with fs.open(old_data_path, "rb") as f:
+        table = pq.read_table(f)
+    table = table.set_column(
+        table.schema.get_field_index("episode_index"), "episode_index",
+        pa.array([new_index] * table.num_rows, type=pa.int64()),
+    )
+    fs.makedirs(os.path.dirname(new_data_path), exist_ok=True)
+    with fs.open(new_data_path, "wb") as f:
+        pq.write_table(table, f)
+    fs.rm(old_data_path)
+
+    for cam_key in camera_keys:
+        old_video_path = f"{fs_root}/{VIDEO_PATH_TEMPLATE.format(video_key=cam_key, chunk_index=0, file_index=old_index)}"
+        new_video_path = f"{fs_root}/{VIDEO_PATH_TEMPLATE.format(video_key=cam_key, chunk_index=0, file_index=new_index)}"
+        fs.makedirs(os.path.dirname(new_video_path), exist_ok=True)
+        fs.mv(old_video_path, new_video_path)
 
 
 def finalize_dataset(
@@ -271,6 +331,22 @@ def finalize_dataset(
         # "observation.images.<cam_key>" at read time -- see
         # ray_dataset.py's build_lerobot_v3_dataset.
         features[cam_key] = {"dtype": "video", "shape": [h, w, 3]}
+    for cam_key in robot.depth_camera_keys:
+        # Real shape/dtype from whatever a real written episode actually
+        # produced -- depth keeps its native sensor resolution (unlike RGB
+        # cameras, which are resized to image_size), so this is read off a
+        # record, not guessed. Deliberately NOT "dtype": "video" -- that's
+        # what makes lerobot_datasource.py's video_keys derivation skip
+        # this column and fall through to its generic non-video passthrough
+        # (this column is a flat (T, H*W*C) parquet array, not muxed mp4).
+        shaped = next((r for r in records if cam_key in r.depth_shapes), None)
+        if shaped is None:
+            print(f"WARNING: no episode recorded a shape for depth camera {cam_key!r} -- "
+                  f"every episode with it must have failed or been skipped; omitting it from info.json")
+            continue
+        features[f"depth.{cam_key}"] = {
+            "dtype": shaped.depth_dtypes[cam_key], "shape": list(shaped.depth_shapes[cam_key]),
+        }
     info = {
         "total_frames": total_frames,
         "total_episodes": len(records),
@@ -307,9 +383,10 @@ EPISODE_MANIFEST_FILENAME = "episode_manifest.json"
 
 
 def read_episode_manifest(root: str) -> list[dict]:
-    """[{"rel_path", "task", "episode_index", "task_index", "length"}, ...],
-    or [] if this dataset predates the manifest (treated as "nothing to
-    reuse" by convert.py -- safe, just means a full reconvert once)."""
+    """[{"rel_path", "task", "episode_index", "task_index", "length",
+    "depth_shapes", "depth_dtypes"}, ...], or [] if this dataset predates
+    the manifest. depth_shapes/depth_dtypes may be absent on old manifests --
+    callers must .get() them with a {} default."""
     fs, fs_root = open_fs(root)
     path = f"{fs_root}/meta/{EPISODE_MANIFEST_FILENAME}"
     if not fs.exists(path):

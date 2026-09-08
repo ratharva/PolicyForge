@@ -1,0 +1,46 @@
+# Sample --config-file showcasing the data-level fields (action space,
+# per-camera image normalization) added alongside --config-file support --
+# these are agibot_alpha-specific, since it's the one dataset schema today
+# that records more than one action space and has a depth camera. See
+# training/README.md's "Action space & per-camera image normalization"
+# section for what each field means.
+#
+#   python -m training.train --tasks fridge --dataset-source agibot_alpha \
+#       --policy-type act --config-file training/configs/agibot_action_space_example.yaml
+
+train:
+  batch_size: 8
+  eval_every_steps: 200
+
+model:
+  type: act
+
+data:
+  # Train on agibot_alpha's joint-space action components only (14-dim
+  # joint/position + always-included gripper/head/waist/velocity
+  # components), instead of the full 36-dim vector that also mixes in
+  # end-effector-space components. "end_effector" is the other real
+  # choice for this dataset -- see agibot_alpha.yaml's
+  # action_space_components.
+  action_space: joint
+  # Delta (relative-to-state) actions instead of absolute targets --
+  # action -= observation.state per dim, using each action component's
+  # same-named state component as the reference point. Components with no
+  # same-named state component (e.g. this dataset's robot/velocity) stay
+  # absolute regardless.
+  action_representation: delta
+  # Kept absolute even under delta, e.g. a gripper open/close value --
+  # replace with this dataset's real gripper component name.
+  action_delta_exclude: [effector/position]
+
+  # Per-camera image normalization -- "head" (RGB) to [-1,1], "depth_head"
+  # (the depth camera -- see agibot_alpha.yaml's depth_camera_keys)
+  # clipped/scaled by its real max depth range in millimeters. Every other
+  # camera falls back to default_image_normalization (mean_std, current
+  # behavior, unchanged).
+  image_normalization:
+    head: unit_pm1
+    depth_head: depth
+  image_normalization_max:
+    depth_head: 5000
+  default_image_normalization: mean_std
