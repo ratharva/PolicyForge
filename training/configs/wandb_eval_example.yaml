@@ -1,0 +1,48 @@
+# Sample --config-file showing W&B logging, metric filtering, episode-
+# preview GIFs, and a real held-out eval split -- see training/README.md's
+# "W&B" section for what each field means.
+#
+#   WANDB_MODE=offline python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+#       --policy-type act --config-file training/configs/wandb_eval_example.yaml
+#
+# --tasks/--policy-type are still required on the command line -- see
+# training/README.md's "Config files" section. WANDB_MODE=offline above
+# avoids needing a real W&B login for a smoke test; drop it for a real run
+# (needs `wandb login` once first).
+
+train:
+  batch_size: 8
+  eval_every_steps: 200
+
+  # TensorBoard/W&B are independently toggleable -- this keeps both on
+  # (tensorboard defaults to true; set it to false here to drop it and
+  # keep only W&B).
+  tensorboard: true
+  wandb: true
+  wandb_project: policyforge
+  # wandb_entity: your-team-or-username
+
+  # Allowlist: only these (plus anything matching a glob) go to W&B --
+  # comment this out (or set to null) to send everything, same as
+  # TensorBoard already does.
+  wandb_metrics: [loss, l1_loss, kld_loss, "perf/*"]
+  # Denylist, applied after the allowlist above.
+  wandb_exclude_metrics: [perf/checkpoint_save_s]
+
+  # Episode-preview GIFs: a real recorded episode's own consecutive
+  # frames (not a shuffled training batch), logged to W&B every
+  # wandb_gif_every_steps (here, same as eval_every_steps since it's
+  # unset -- set it to a different value to decouple the two cadences).
+  wandb_gif_cameras: [top]
+  wandb_gif_frames: 30
+
+  # Real held-out eval split -- 20% of episodes never appear in training
+  # at all; a real policy.eval()/no_grad() pass runs on them every
+  # eval_every_steps, logged under eval/*, and the GIFs above sample
+  # specifically from this held-out set instead of anywhere in the
+  # dataset. Omit/null this field for the default (no split, no eval
+  # pass, GIFs from anywhere) -- see training/README.md.
+  eval_split_fraction: 0.2
+
+model:
+  type: act

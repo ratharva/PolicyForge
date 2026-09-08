@@ -62,3 +62,10 @@ datasets
 # training/perf_logging.py degrades gracefully (one warning, no crash) if
 # it's missing.
 # nvidia-ml-py
+
+# Optional: only needed for --wandb (training/wandb_logging.py, via Ray's
+# own ray.air.integrations.wandb.setup_wandb()) -- imported lazily inside
+# train_loop.py, same pattern as nvidia-ml-py above, so it's never required
+# unless --wandb is actually passed. Needs a real W&B login/API key too
+# (`wandb login`), not just the package.
+# wandb

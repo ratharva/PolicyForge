@@ -288,6 +288,43 @@ def transpose_for_training(
 
 
 # ---------------------------------------------------------------------------
+# Held-out eval split (opt-in -- --eval-split-fraction, see training/train_loop.py)
+# ---------------------------------------------------------------------------
+
+
+def _episode_in_eval(row: dict, seed: int, eval_fraction: float) -> bool:
+    """Deterministic hash of (seed, episode_index) -> True/False, NOT
+    `episode_index % N`, which biases unevenly at odd fractions (e.g. 0.3
+    would systematically favor certain residues depending on how episode
+    ids are distributed) -- a hash spreads membership uniformly regardless
+    of eval_fraction's value, and is reproducible across a run (same seed
+    -> same split) without persisting anything."""
+    import hashlib
+
+    h = hashlib.sha256(f"{seed}:{row['episode_index']}".encode()).digest()
+    frac = int.from_bytes(h[:8], "big") / 2**64
+    return frac < eval_fraction
+
+
+def split_by_episode(
+    ds: "ray.data.Dataset", eval_fraction: float, seed: int = 0,
+) -> tuple["ray.data.Dataset", "ray.data.Dataset"]:
+    """Splits `ds` into (train_ds, eval_ds) by `episode_index` -- a whole
+    episode goes entirely to one side, never split within an episode.
+    KNOWN COST: implemented as two separate `.filter()` calls over the same
+    upstream `ds`, so Ray Data's lazy execution re-runs the full upstream
+    pipeline (including video decode, the expensive part) TWICE, once per
+    side -- acceptable for `--eval-split-fraction`'s opt-in, dev/moderate-
+    scale use case, but a real cost worth knowing about before reaching for
+    this on a very large dataset. Call on `raw_ds` (before
+    transpose_for_training/action-space stages), same as
+    `select_action_space`/`to_relative_action_space`."""
+    eval_ds = ds.filter(lambda row: _episode_in_eval(row, seed, eval_fraction))
+    train_ds = ds.filter(lambda row: not _episode_in_eval(row, seed, eval_fraction))
+    return train_ds, eval_ds
+
+
+# ---------------------------------------------------------------------------
 # MolmoAct2 Ray Data preprocessing offload (optional -- --molmoact2-offload-tokenization)
 # ---------------------------------------------------------------------------
 # Runs MolmoAct2's real HF tokenizer + image-processor preprocessing

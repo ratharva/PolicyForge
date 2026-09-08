@@ -138,6 +138,47 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=None,
                          help="Ray Train DDP workers; default = live GPU count")
 
+    # --- TensorBoard / W&B (training/wandb_logging.py) ---
+    parser.add_argument("--no-tensorboard", action="store_false", dest="tensorboard", default=True,
+                         help="disable TensorBoard logging (on by default) -- e.g. when only --wandb "
+                              "is wanted. Independently toggleable from --wandb, not either/or")
+    parser.add_argument("--wandb", action="store_true",
+                         help="log to Weights & Biases via ray.air.integrations.wandb.setup_wandb() "
+                              "-- off by default. Additive: everything TensorBoard already logs also "
+                              "goes to W&B at the same cadences. Needs `wandb` installed "
+                              "(see training/requirements.txt) and a real W&B login/API key")
+    parser.add_argument("--wandb-project", default=None, help="W&B project name")
+    parser.add_argument("--wandb-entity", default=None, help="W&B entity (team/user)")
+    parser.add_argument("--wandb-metrics", nargs="+", default=None, metavar="NAME",
+                         help="allowlist of metric names to send to W&B (fnmatch globs OK, e.g. "
+                              "'perf/*') -- default: everything already being computed. Doesn't "
+                              "affect TensorBoard, which always gets everything")
+    parser.add_argument("--wandb-exclude-metrics", nargs="+", default=[], metavar="NAME",
+                         help="denylist of metric names to keep OUT of W&B (fnmatch globs OK), "
+                              "applied after --wandb-metrics")
+    parser.add_argument("--wandb-gif-cameras", nargs="+", default=[], metavar="CAMERA",
+                         help="log a short GIF from this camera every --wandb-gif-every-steps, "
+                              "sampled from a real recorded episode's own consecutive frames (not a "
+                              "shuffled training batch) -- off by default. Requires --wandb")
+    parser.add_argument("--wandb-gif-every-steps", type=int, default=None,
+                         help="GIF logging cadence -- default: reuse --eval-every-steps")
+    parser.add_argument("--wandb-gif-frames", type=int, default=30,
+                         help="frames per GIF")
+    parser.add_argument("--wandb-predict-frames-every-steps", type=int, default=None,
+                         help="how often to log a policy's OWN predicted-frames GIF (only meaningful "
+                              "for a future policy that implements PolicyAdapter.predict_frames -- "
+                              "inert for act/molmoact2/pi05 today, which only predict actions) -- "
+                              "default: log one every eval pass. Can only be a multiple of "
+                              "--eval-every-steps, since generating one needs a real eval batch, which "
+                              "only exists when the eval pass itself runs")
+    parser.add_argument("--eval-split-fraction", type=float, default=None,
+                         help="hold out this fraction of episodes from training entirely, for a real "
+                              "eval pass (policy.eval()/no_grad(), reusing the same forward_loss) "
+                              "every --eval-every-steps, logged under eval/* -- default: no split, no "
+                              "eval pass, matching today's behavior exactly. When set, "
+                              "--wandb-gif-cameras also sample specifically from the held-out set "
+                              "instead of anywhere in the dataset")
+
     # --- perf instrumentation (training/perf_logging.py) ---
     parser.add_argument("--log-perf-metrics", action="store_true",
                          help="log GPU utilization/VRAM, per-step timing (data-wait/preprocess/"
@@ -338,6 +379,31 @@ def main() -> None:
     _apply_if_explicit(run_cfg.train, "log_perf_metrics", args, "log_perf_metrics", parser)
     if args.profile_steps is not None:  # already parsed into the (start, end) tuple `profile_steps` above
         run_cfg.train.profile_steps = profile_steps
+    _apply_if_explicit(run_cfg.train, "tensorboard", args, "tensorboard", parser)
+    _apply_if_explicit(run_cfg.train, "wandb", args, "wandb", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_project", args, "wandb_project", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_entity", args, "wandb_entity", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_metrics", args, "wandb_metrics", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_exclude_metrics", args, "wandb_exclude_metrics", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_gif_cameras", args, "wandb_gif_cameras", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_gif_every_steps", args, "wandb_gif_every_steps", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_gif_frames", args, "wandb_gif_frames", parser)
+    _apply_if_explicit(
+        run_cfg.train, "wandb_predict_frames_every_steps", args, "wandb_predict_frames_every_steps", parser,
+    )
+    _apply_if_explicit(run_cfg.train, "eval_split_fraction", args, "eval_split_fraction", parser)
+
+    if run_cfg.train.wandb_gif_cameras and not run_cfg.train.wandb:
+        parser.error("--wandb-gif-cameras requires --wandb")
+    if (
+        run_cfg.train.wandb_predict_frames_every_steps
+        and run_cfg.train.wandb_predict_frames_every_steps % run_cfg.train.eval_every_steps != 0
+    ):
+        parser.error(
+            f"--wandb-predict-frames-every-steps {run_cfg.train.wandb_predict_frames_every_steps} must be a "
+            f"multiple of --eval-every-steps {run_cfg.train.eval_every_steps} -- a predicted-frames GIF can "
+            f"only be generated when the eval pass itself runs, so any other value would never fire"
+        )
 
     # --- model: make sure run_cfg.model's concrete type actually matches
     # the resolved policy_type before layering any --molmoact2-*/--pi05-*
@@ -497,18 +563,50 @@ def main() -> None:
             name=run_cfg.run_name,
         )
 
+    # Held-out eval split (--eval-split-fraction, opt-in) -- held out of
+    # TRAINING entirely, including normalization stats below (computing
+    # stats from episodes the eval pass then scores against would leak
+    # information the held-out set is supposed to be free of). Real
+    # eval_episode_indices computed directly from meta/episodes (the same
+    # deterministic hash split_by_episode uses, done here without touching
+    # Ray Data at all -- cheap, driver-side) so train_loop.py's GIF
+    # sampling can pick from it without re-querying the dataset.
+    eval_ds = None
+    eval_episode_indices = None
+    if run_cfg.train.eval_split_fraction:
+        from training.data.ray_dataset import _episode_in_eval, split_by_episode
+        from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
+
+        meta = LeRobotDatasourceMetadata(v3_root)
+        all_episode_indices = meta.episodes.column("episode_index").to_pylist()
+        eval_episode_indices = [
+            idx for idx in all_episode_indices
+            if _episode_in_eval({"episode_index": idx}, seed=0, eval_fraction=run_cfg.train.eval_split_fraction)
+        ]
+        print(
+            f"  eval split: {len(eval_episode_indices)}/{len(all_episode_indices)} episodes held out "
+            f"of training (--eval-split-fraction {run_cfg.train.eval_split_fraction})"
+        )
+        raw_ds, eval_raw_ds = split_by_episode(raw_ds, run_cfg.train.eval_split_fraction, seed=0)
+
     print("\n=== compute normalization stats ===")
     # Sampled from raw_ds (pre-transpose, HWC), AFTER action-space selection/
-    # delta-conversion above -- so stats reflect whatever's actually trained
-    # on (computing stats on absolute actions then converting to delta
-    # afterwards would normalize deltas using absolute-action mean/std,
-    # which is wrong). See training/data/stats.py.
+    # delta-conversion/eval-split above -- so stats reflect whatever's
+    # actually trained on (computing stats on absolute actions then
+    # converting to delta afterwards would normalize deltas using
+    # absolute-action mean/std, which is wrong; same reasoning for
+    # excluding the held-out eval episodes). See training/data/stats.py.
     dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
 
     ds = transpose_for_training(
         raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name,
         depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
     )
+    if eval_episode_indices is not None:
+        eval_ds = transpose_for_training(
+            eval_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-eval",
+            depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+        )
 
     if run_cfg.policy_type == "molmoact2" and run_cfg.model.offload_tokenization:
         print("\n=== offload MolmoAct2 preprocessing (tokenizer + image processor) to Ray Data ===")
@@ -517,6 +615,11 @@ def main() -> None:
             ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
             concurrency=concurrency, name=run_cfg.run_name,
         )
+        if eval_ds is not None:
+            eval_ds = offload_molmoact2_preprocessing(
+                eval_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
+                concurrency=concurrency, name=f"{run_cfg.run_name}-eval",
+            )
 
     if run_cfg.train.save_only_on_improvement:
         # A checkpoint is only attached when the loss improved, so every
@@ -533,10 +636,21 @@ def main() -> None:
             checkpoint_score_attribute="loss", checkpoint_score_order="min",
         )
 
+    datasets = {"train": ds}
+    if eval_ds is not None:
+        datasets["eval"] = eval_ds
+
     print(f"\n=== launch Ray Train: {run_cfg.run_name} ===")
     trainer = ray.train.torch.TorchTrainer(
         train_loop_per_worker=train_loop_per_worker,
-        train_loop_config={"run_cfg": run_cfg, "dataset_stats": dataset_stats},
+        train_loop_config={
+            "run_cfg": run_cfg, "dataset_stats": dataset_stats,
+            # v3_root/eval_episode_indices aren't part of RunConfig's own
+            # schema (internal plumbing for training/wandb_logging.py's
+            # sample_episode_frames, not user-facing config) -- threaded
+            # through train_loop_config the same way dataset_stats already is.
+            "v3_root": v3_root, "eval_episode_indices": eval_episode_indices,
+        },
         scaling_config=ray.train.ScalingConfig(num_workers=num_workers, use_gpu=use_gpu),
         run_config=ray.train.RunConfig(
             name=run_cfg.run_name,
@@ -544,7 +658,7 @@ def main() -> None:
             failure_config=ray.train.FailureConfig(max_failures=1),
             checkpoint_config=checkpoint_config,
         ),
-        datasets={"train": ds},
+        datasets=datasets,
     )
     try:
         result = trainer.fit()
@@ -567,7 +681,8 @@ def main() -> None:
     print(f"\nfinal metrics: {result.metrics}")
     print(f"checkpoint: {result.checkpoint}")
     print(f"\nView history:    python -m training.history --storage-root {run_cfg.storage_root}")
-    print(f"View TensorBoard: tensorboard --logdir {os.path.join(run_cfg.storage_root, run_cfg.run_name, 'tensorboard')}")
+    if run_cfg.train.tensorboard:
+        print(f"View TensorBoard: tensorboard --logdir {os.path.join(run_cfg.storage_root, run_cfg.run_name, 'tensorboard')}")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import pickle
+import random
 import tempfile
 import time
 
@@ -20,11 +21,18 @@ from torch.utils.tensorboard import SummaryWriter
 
 from training import perf_logging
 from training.vendor.util import NumpyToTorchCollate
-from training.config import RunConfig
+from training.config import RunConfig, TrainConfig
 from training.model.image_normalization import apply_image_normalization
 from training.model.registry import PolicyAdapter, get_adapter
+from training.wandb_logging import filter_metrics, sample_episode_frames
 
 log = logging.getLogger("act_train")
+
+# Caps the held-out eval pass (--eval-split-fraction) to a bounded number of
+# batches per eval_every_steps window, regardless of how large the eval
+# split is -- an unbounded full pass every window would defeat the point
+# of frequent windowed reporting.
+_EVAL_MAX_BATCHES = 50
 
 
 def _sync_should_stop(should_stop: bool, device: torch.device) -> bool:
@@ -36,6 +44,35 @@ def _sync_should_stop(should_stop: bool, device: torch.device) -> bool:
     flag = torch.tensor([1.0 if should_stop else 0.0], device=device)
     torch.distributed.broadcast(flag, src=0)
     return bool(flag.item())
+
+
+def _log_all(
+    tb_writer, wandb_run, prefix: str, values: dict, step: int, train_cfg: TrainConfig,
+    wandb_step: int | None = None,
+) -> None:
+    """Writes `values` (bare keys, e.g. {"loss": ...}) to both loggers
+    under `f"{prefix}/{key}"` -- TensorBoard unfiltered (as today), W&B
+    subject to train_cfg.wandb_metrics/wandb_exclude_metrics (see
+    training/wandb_logging.py's filter_metrics). Either logger being None
+    (--no-tensorboard / --wandb not passed) is a no-op for that logger.
+
+    `wandb_step` (defaults to `step`) exists because W&B's `step` is ONE
+    shared counter across every key in a run, unlike TensorBoard's
+    per-tag x-axis -- confirmed by reproducing it directly: logging
+    epoch/* at `step=epoch` (0, 1, 2, ...) after window/*/train/* already
+    used much larger training-step values silently DROPPED the epoch/*
+    point entirely (wandb only accepts non-decreasing steps; it does not
+    error, it just discards). The epoch-report call site passes the real
+    training step here instead, keeping `epoch` as a value inside the
+    dict rather than as the step."""
+    prefixed = {f"{prefix}/{k}": v for k, v in values.items()}
+    if tb_writer is not None:
+        for k, v in prefixed.items():
+            tb_writer.add_scalar(k, v, step)
+    if wandb_run is not None:
+        filtered = filter_metrics(prefixed, train_cfg.wandb_metrics, train_cfg.wandb_exclude_metrics)
+        if filtered:
+            wandb_run.log(filtered, step=wandb_step if wandb_step is not None else step)
 
 
 def _report_with_checkpoint(
@@ -159,15 +196,62 @@ def train_loop_per_worker(config: dict) -> None:
     image_keys |= {f"observation.images.depth_{k}" for k in data_cfg.robot.depth_camera_keys}
     collate = NumpyToTorchCollate(device, image_keys=image_keys)
 
-    # Only rank 0 writes -- every worker's shard is a different data slice,
-    # so only rank 0's loss curve is coherent, and multiple workers writing
-    # to the same run would corrupt one events file.
+    # Held-out eval split (opt-in -- --eval-split-fraction): a second named
+    # dataset registered by train.py alongside "train" when set, absent
+    # otherwise. Real held-out inference pass; see the eval_every_steps
+    # block below.
+    eval_shard = ray.train.get_dataset_shard("eval") if train_cfg.eval_split_fraction else None
+
+    # Only rank 0 writes TensorBoard -- every worker's shard is a different
+    # data slice, so only rank 0's loss curve is coherent, and multiple
+    # workers writing to the same run would corrupt one events file.
+    # train_cfg.tensorboard=False (--no-tensorboard) skips this entirely,
+    # e.g. when only W&B is wanted.
     tb_writer = None
-    if rank == 0:
+    if rank == 0 and train_cfg.tensorboard:
         tb_dir = os.path.join(run_cfg.storage_root, run_cfg.run_name, "tensorboard")
         os.makedirs(tb_dir, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=tb_dir, flush_secs=10)
         print(f"TensorBoard logs: {tb_dir}  (run: tensorboard --logdir {tb_dir})")
+
+    # W&B (training/wandb_logging.py) -- setup_wandb() does its own
+    # rank-zero check internally (via Ray's own session), so it's called on
+    # EVERY rank, not gated by `if rank == 0:` the way tb_writer is above;
+    # non-zero ranks get back a disabled no-op run object. Imported lazily
+    # (like every other optional dependency in this codebase -- see
+    # perf_logging.py's nvidia-ml-py handling) so wandb never needs to be
+    # installed unless --wandb is actually passed.
+    wandb_run = None
+    if train_cfg.wandb:
+        from ray.air.integrations.wandb import setup_wandb
+
+        wandb_run = setup_wandb(
+            config={"run_name": run_cfg.run_name, "policy_type": run_cfg.policy_type},
+            project=train_cfg.wandb_project, entity=train_cfg.wandb_entity, name=run_cfg.run_name,
+        )
+
+    # Episode-preview GIFs (training/wandb_logging.py's sample_episode_frames)
+    # -- opt-in per camera. Reads directly from the converted v3 root's own
+    # video files, not from Ray Data, so it needs v3_root (plumbed in by
+    # train.py, not part of RunConfig's own schema -- see that file) and,
+    # when a real eval split exists, the held-out episode-index set so GIFs
+    # come specifically from data the model never trained on.
+    v3_root = config.get("v3_root")
+    eval_episode_indices = config.get("eval_episode_indices")
+    gif_rng = random.Random(0)
+    # Computed once here, not per-window: the held-out set when a real eval
+    # split exists (so GIFs come specifically from data never trained on),
+    # else every real episode_index in the dataset (one lightweight
+    # meta/episodes read, not a Ray Data query). None/empty when GIFs
+    # aren't configured at all, so no extra I/O happens in the common case.
+    gif_episode_pool: list[int] | None = None
+    if rank == 0 and train_cfg.wandb_gif_cameras and v3_root:
+        if eval_episode_indices:
+            gif_episode_pool = list(eval_episode_indices)
+        else:
+            from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
+
+            gif_episode_pool = list(range(LeRobotDatasourceMetadata(v3_root).total_episodes))
 
     # Shared by early-stop patience and checkpoint-improvement-gating -- one
     # running "best loss seen this run", updated at both window and epoch
@@ -189,7 +273,7 @@ def train_loop_per_worker(config: dict) -> None:
     world_size = ray.train.get_context().get_world_size()
     if train_cfg.log_perf_metrics and rank == 0:
         eff_bs = perf_logging.effective_batch_size(train_cfg, world_size)
-        tb_writer.add_scalar("perf/effective_batch_size", eff_bs, 0)
+        _log_all(tb_writer, wandb_run, "perf", {"effective_batch_size": eff_bs}, 0, train_cfg)
         print(
             f"Effective batch size: {eff_bs} (batch_size={train_cfg.batch_size} x "
             f"grad_accum={train_cfg.grad_accum} x world_size={world_size})"
@@ -299,18 +383,19 @@ def train_loop_per_worker(config: dict) -> None:
                     epoch, step, loss.item(),
                     " ".join(f"{k}={v:.4f}" for k, v in step_metrics.items()),
                 )
-                tb_writer.add_scalar("train/loss", loss.item(), step)
-                for k, v in step_metrics.items():
-                    tb_writer.add_scalar(f"train/{k}", v, step)
+                train_values = {"loss": loss.item(), **step_metrics}
                 for i, g in enumerate(optimizer.param_groups):
-                    tb_writer.add_scalar(f"train/lr_group{i}", g["lr"], step)
+                    train_values[f"lr_group{i}"] = g["lr"]
+                _log_all(tb_writer, wandb_run, "train", train_values, step, train_cfg)
                 if train_cfg.log_perf_metrics:
-                    tb_writer.add_scalar("perf/data_wait_s", data_wait_s, step)
-                    tb_writer.add_scalar("perf/preprocess_s", t_prep.elapsed, step)
-                    tb_writer.add_scalar("perf/compute_s", t_compute.elapsed, step)
+                    perf_values = {
+                        "data_wait_s": data_wait_s, "preprocess_s": t_prep.elapsed, "compute_s": t_compute.elapsed,
+                    }
                     if ran_optimizer_step:
-                        tb_writer.add_scalar("perf/optimizer_step_s", t_opt.elapsed, step)
-                tb_writer.flush()
+                        perf_values["optimizer_step_s"] = t_opt.elapsed
+                    _log_all(tb_writer, wandb_run, "perf", perf_values, step, train_cfg)
+                if tb_writer is not None:
+                    tb_writer.flush()
 
             # Step-windowed report: finer-grained than epoch, so early
             # stopping and best-checkpoint scoring have more than one data
@@ -328,27 +413,28 @@ def train_loop_per_worker(config: dict) -> None:
 
                 improved = False
                 if rank == 0:
-                    for k, v in window_metrics.items():
-                        if k not in ("epoch", "steps", "report_kind"):
-                            tb_writer.add_scalar(f"window/{k}", v, step)
+                    _log_all(
+                        tb_writer, wandb_run, "window",
+                        {k: v for k, v in window_metrics.items() if k not in ("epoch", "steps", "report_kind")},
+                        step, train_cfg,
+                    )
                     if train_cfg.log_perf_metrics:
                         window_wall_s = time.perf_counter() - window_wall_start
                         io_bound_denom = window_data_wait_sum + window_preprocess_sum + window_compute_sum
-                        tb_writer.add_scalar(
-                            "perf/io_bound_fraction",
-                            window_data_wait_sum / io_bound_denom if io_bound_denom > 0 else 0.0, step,
-                        )
-                        tb_writer.add_scalar(
-                            "perf/samples_per_sec",
-                            window_n_for_perf * train_cfg.batch_size * world_size / window_wall_s
-                            if window_wall_s > 0 else 0.0, step,
-                        )
+                        perf_window_values = {
+                            "io_bound_fraction": window_data_wait_sum / io_bound_denom if io_bound_denom > 0 else 0.0,
+                            "samples_per_sec": (
+                                window_n_for_perf * train_cfg.batch_size * world_size / window_wall_s
+                                if window_wall_s > 0 else 0.0
+                            ),
+                        }
                         if window_optimizer_step_n > 0:
-                            tb_writer.add_scalar(
-                                "perf/optimizer_step_s_avg",
-                                window_optimizer_step_sum / window_optimizer_step_n, step,
+                            perf_window_values["optimizer_step_s_avg"] = (
+                                window_optimizer_step_sum / window_optimizer_step_n
                             )
-                    tb_writer.flush()
+                        _log_all(tb_writer, wandb_run, "perf", perf_window_values, step, train_cfg)
+                    if tb_writer is not None:
+                        tb_writer.flush()
 
                     improved = window_metrics["loss"] < best_loss_seen
                     if improved:
@@ -367,6 +453,80 @@ def train_loop_per_worker(config: dict) -> None:
                 window_optimizer_step_sum, window_optimizer_step_n = 0.0, 0
                 window_wall_start = time.perf_counter()
 
+                # Real held-out eval pass (--eval-split-fraction only) --
+                # reuses adapter.forward_loss unmodified, just under
+                # policy.eval()/no_grad() and fed from the held-out shard.
+                # Deliberately does NOT feed into checkpoint-improvement
+                # scoring/early-stopping above (still training-loss-based,
+                # unchanged) -- this is additional observability, not a
+                # change to the existing selection criteria.
+                if eval_shard is not None:
+                    policy.eval()
+                    eval_loss_sum, eval_n = 0.0, 0
+                    eval_metrics_sum: dict[str, float] = {}
+                    last_eval_inputs = None
+                    with torch.no_grad():
+                        for i, eval_batch in enumerate(
+                            eval_shard.iter_torch_batches(batch_size=train_cfg.batch_size, collate_fn=collate)
+                        ):
+                            if i >= _EVAL_MAX_BATCHES:
+                                break
+                            if not adapter.needs_task:
+                                eval_batch.pop("task", None)
+                            if not adapter.preprocessing_offloaded:
+                                eval_batch = apply_image_normalization(
+                                    eval_batch, data_cfg.image_normalization, data_cfg.default_image_normalization,
+                                    dataset_stats, data_cfg.image_normalization_max,
+                                )
+                            eval_inputs = eval_batch if adapter.preprocessing_offloaded else preprocessor(eval_batch)
+                            last_eval_inputs = eval_inputs
+                            eval_loss, eval_step_metrics = adapter.forward_loss(policy, eval_inputs)
+                            eval_loss_sum += eval_loss.item()
+                            eval_n += 1
+                            for k, v in eval_step_metrics.items():
+                                eval_metrics_sum[k] = eval_metrics_sum.get(k, 0.0) + v
+
+                        # Predicted-frames GIFs -- pure groundwork for a
+                        # future policy that actually predicts visual
+                        # frames (e.g. a world model); see PolicyAdapter.
+                        # predict_frames's docstring. Inert no-op for
+                        # ACT/MolmoAct2/PI05 today (adapter.predict_frames
+                        # is None for all three). Logged at this eval
+                        # pass's own step, same key across the run, so
+                        # W&B's own per-step media history is what shows
+                        # the generated frames improving over training --
+                        # no extra "compare across steps" logic needed.
+                        # --wandb-predict-frames-every-steps controls how
+                        # often, relative to eval passes (can only be a
+                        # multiple of eval_every_steps -- generating one
+                        # needs a real eval batch, which only exists here).
+                        predict_frames_every = train_cfg.wandb_predict_frames_every_steps or train_cfg.eval_every_steps
+                        if (
+                            adapter.predict_frames is not None and rank == 0
+                            and wandb_run is not None and last_eval_inputs is not None
+                            and step % predict_frames_every == 0
+                        ):
+                            predicted = adapter.predict_frames(policy, last_eval_inputs)
+                            if predicted:
+                                import wandb
+
+                                wandb_run.log(
+                                    {
+                                        f"eval_gif/{name}": wandb.Video(
+                                            frames.transpose(0, 3, 1, 2), format="gif", fps=data_cfg.robot.tick_fps,
+                                        )
+                                        for name, frames in predicted.items()
+                                    },
+                                    step=step,
+                                )
+                    policy.train()
+                    if rank == 0 and eval_n > 0:
+                        eval_values = {
+                            "loss": eval_loss_sum / eval_n,
+                            **{k: v / eval_n for k, v in eval_metrics_sum.items()},
+                        }
+                        _log_all(tb_writer, wandb_run, "eval", eval_values, step, train_cfg)
+
                 should_stop = _sync_should_stop(should_stop, device)  # every rank must call this
                 save_checkpoint = improved if train_cfg.save_only_on_improvement else True
                 with perf_logging.Timer() as t_ckpt:
@@ -375,7 +535,31 @@ def train_loop_per_worker(config: dict) -> None:
                         run_cfg, epoch, step, epoch_complete=False, rank=rank, save_checkpoint=save_checkpoint,
                     )
                 if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
-                    tb_writer.add_scalar("perf/checkpoint_save_s", t_ckpt.elapsed, step)
+                    _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
+
+            # Episode-preview GIFs -- independent cadence from the window
+            # report above (wandb_gif_every_steps can differ from
+            # eval_every_steps), so this is its own top-level check, not
+            # nested in the block above.
+            if rank == 0 and wandb_run is not None and gif_episode_pool:
+                gif_every = train_cfg.wandb_gif_every_steps or train_cfg.eval_every_steps
+                if step % gif_every == 0:
+                    ep_idx = gif_rng.choice(gif_episode_pool)
+                    for cam in train_cfg.wandb_gif_cameras:
+                        try:
+                            frames = sample_episode_frames(
+                                v3_root, ep_idx, cam, train_cfg.wandb_gif_frames, data_cfg.image_size,
+                            )
+                        except ValueError as e:
+                            log.warning("GIF sampling failed for camera %r, episode %d: %s", cam, ep_idx, e)
+                            continue
+                        import wandb
+
+                        frames_chw = frames.transpose(0, 3, 1, 2)
+                        wandb_run.log(
+                            {f"gif/{cam}": wandb.Video(frames_chw, format="gif", fps=data_cfg.robot.tick_fps)},
+                            step=step,
+                        )
 
             t_iter_end = time.perf_counter()
             if should_stop:
@@ -396,10 +580,13 @@ def train_loop_per_worker(config: dict) -> None:
 
         improved = False
         if rank == 0:
-            for k, v in metrics.items():
-                if k not in ("epoch", "steps", "report_kind"):
-                    tb_writer.add_scalar(f"epoch/{k}", v, epoch)
-            tb_writer.flush()
+            _log_all(
+                tb_writer, wandb_run, "epoch",
+                {k: v for k, v in metrics.items() if k not in ("epoch", "steps", "report_kind")},
+                epoch, train_cfg, wandb_step=step,
+            )
+            if tb_writer is not None:
+                tb_writer.flush()
 
             improved = metrics["loss"] < best_loss_seen
             if improved:
@@ -412,7 +599,7 @@ def train_loop_per_worker(config: dict) -> None:
                 run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
             )
         if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
-            tb_writer.add_scalar("perf/checkpoint_save_s", t_ckpt.elapsed, step)
+            _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
 
         if should_stop or (train_cfg.max_train_steps and step >= train_cfg.max_train_steps):
             break
@@ -441,3 +628,6 @@ def train_loop_per_worker(config: dict) -> None:
 
     if tb_writer is not None:
         tb_writer.close()
+
+    if wandb_run is not None:
+        wandb_run.finish()

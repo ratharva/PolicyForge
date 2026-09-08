@@ -142,6 +142,51 @@ class TrainConfig:
     # also True. None disables profiling entirely.
     profile_steps: tuple[int, int] | None = None
 
+    # TensorBoard is unconditional otherwise -- True (default) preserves
+    # that exactly. False (--no-tensorboard) skips creating tb_writer
+    # entirely, e.g. when only W&B is wanted.
+    tensorboard: bool = True
+
+    # --- W&B (training/wandb_logging.py), via ray.air.integrations.wandb's
+    # setup_wandb() -- off by default, additive: everything TensorBoard
+    # already logs also goes to W&B at the same cadences when enabled.
+    wandb: bool = False
+    wandb_project: str | None = None
+    wandb_entity: str | None = None
+    # Allowlist (fnmatch globs OK, e.g. "perf/*") -- None (default) logs
+    # every metric already being computed, so turning on --wandb doesn't
+    # silently hide anything unless explicitly filtered.
+    wandb_metrics: list[str] | None = None
+    # Denylist (fnmatch globs OK), applied after the allowlist.
+    wandb_exclude_metrics: list[str] = field(default_factory=list)
+    # Episode-preview GIFs -- which cameras to sample (empty = off, opt-in
+    # per camera), how often (None -> reuse eval_every_steps), how many
+    # frames per GIF.
+    wandb_gif_cameras: list[str] = field(default_factory=list)
+    wandb_gif_every_steps: int | None = None
+    wandb_gif_frames: int = 30
+    # Predicted-frames GIFs (PolicyAdapter.predict_frames -- see
+    # training/model/registry.py; inert for every policy today, groundwork
+    # for a future world-model-style policy) -- how often to log them,
+    # relative to the eval pass they're generated inside (see
+    # train_loop.py): None (default) logs one every eval pass; a real
+    # value only logs one every Nth eval pass at that step multiple, e.g.
+    # eval_every_steps=200 + this=1000 logs one every 5th eval pass. Can
+    # only ever be a multiple of eval_every_steps -- generating these
+    # needs a real eval batch, which only exists when the eval pass itself
+    # runs, unlike wandb_gif_every_steps above (real recorded episodes,
+    # no eval batch needed, so that one can use any cadence).
+    wandb_predict_frames_every_steps: int | None = None
+
+    # None (default): no held-out split, no real eval/inference pass --
+    # episode-preview GIFs sample from anywhere in the dataset. A real
+    # fraction (0 < x < 1): that fraction of episodes is held out of
+    # TRAINING entirely and used for a real eval pass (reusing
+    # adapter.forward_loss under torch.no_grad()) at the eval_every_steps
+    # cadence, and GIFs sample specifically from the held-out set. See
+    # training/data/ray_dataset.py's split_by_episode.
+    eval_split_fraction: float | None = None
+
 
 @dataclass
 class RunConfig:
