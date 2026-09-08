@@ -506,6 +506,11 @@ def prepare(
             print(f"LeRobot v3 dataset already exists at {v3_root}, matching this request "
                   f"-- skipping conversion (pass --reconvert to rebuild it anyway)")
             return v3_root
+        print(
+            f"LeRobot v3 dataset at {v3_root} exists but doesn't match this request -- forcing a full rebuild.\n"
+            f"  stored:    {stored}\n  requested: {expected_params}"
+        )
+        force = True  # a schema/param mismatch must not be reused via incremental planning below
 
     print("\n=== discover real tasks/episodes ===")
     task_episodes = select_task_episodes(source_uri, agibot_cfg, tasks, max_episodes_per_task, token)

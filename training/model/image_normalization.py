@@ -27,7 +27,11 @@ def _require_max(cam: str, mode: str, max_values: dict[str, float]) -> float:
             f"max value (--image-normalization-max {cam}=<value>) -- no guessed default, since "
             f"it depends on the real sensor's value range (e.g. max depth in millimeters)."
         )
-    return max_values[cam]
+    value = max_values[cam]
+    if value <= 0:
+        # 0 divides by zero (depth/log); negative gives inverted clipping/NaN logs.
+        raise ValueError(f"image-normalization max for camera {cam!r} must be positive, got {value}")
+    return value
 
 
 def _normalize_one(x, mode: str, cam: str, stats: dict, key: str, max_values: dict[str, float]):

@@ -556,7 +556,11 @@ def train_loop_per_worker(config: dict) -> None:
                                 )
                             eval_inputs = eval_batch if adapter.preprocessing_offloaded else preprocessor(eval_batch)
                             last_eval_inputs = eval_inputs
-                            eval_loss, eval_step_metrics = adapter.forward_loss(policy, eval_inputs)
+                            if dist_ctx is not None and hasattr(dist_ctx, "autocast"):
+                                with dist_ctx.autocast():
+                                    eval_loss, eval_step_metrics = adapter.forward_loss(policy, eval_inputs)
+                            else:
+                                eval_loss, eval_step_metrics = adapter.forward_loss(policy, eval_inputs)
                             if adapter.extra_metrics is not None:
                                 eval_step_metrics = {**eval_step_metrics, **adapter.extra_metrics(policy, eval_inputs)}
                             eval_loss_sum += eval_loss.item()

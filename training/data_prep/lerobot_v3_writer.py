@@ -86,6 +86,7 @@ def compute_conversion_params(
         "tick_fps": robot.tick_fps,
         "image_size": list(image_size),
         "camera_keys": list(robot.camera_keys),
+        "depth_camera_keys": list(robot.depth_camera_keys),
         "revision": revision,
     }
 

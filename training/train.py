@@ -580,6 +580,9 @@ def main() -> None:
             f"image-normalization mode 'depth'/'log' needs --image-normalization-max for camera(s) "
             f"{sorted(missing_max)}"
         )
+    non_positive_max = {cam: v for cam, v in run_cfg.data.image_normalization_max.items() if v <= 0}
+    if non_positive_max:
+        raise SystemExit(f"--image-normalization-max values must be positive, got {non_positive_max}")
 
     run_cfg.data.source_uri = source.default_source_uri
     if conversion_params:

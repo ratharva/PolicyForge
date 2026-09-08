@@ -151,12 +151,10 @@ def convert_to_lerobot_v3(
                   f"-- skipping conversion (pass --reconvert to rebuild it anyway)")
             return out_root
         print(
-            f"LeRobot v3 dataset at {out_root} exists but doesn't match this request.\n"
+            f"LeRobot v3 dataset at {out_root} exists but doesn't match this request -- forcing a full rebuild.\n"
             f"  stored:    {stored_params}\n  requested: {expected_params}"
         )
-        # No stored params at all (pre-dates this check, or a prior wipe+rebuild
-        # that hasn't run yet) counts as a mismatch too -- everything below is
-        # then treated as new.
+        force = True  # a schema/param mismatch must not be reused via incremental planning below
 
     plan = plan_incremental_conversion(out_root, episodes_by_task, exists=exists, force=force)
     to_convert, reused, task_to_index = plan.to_convert, plan.reused, plan.task_to_index
