@@ -1,0 +1,24 @@
+# Sample --config-file for --policy-type pi05.
+#
+#   python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+#       --policy-type pi05 --config-file training/configs/pi05_example.yaml
+#
+# model.pretrained_path is REQUIRED (either here or via
+# --pi05-pretrained-path) -- "finetuning" implies starting from real
+# pretrained weights, and there's no verified real public checkpoint repo
+# id to default to (find one on the HF Hub yourself and replace the
+# placeholder below). --tasks/--policy-type are still required on the
+# command line -- see training/README.md's "Config files" section.
+
+train:
+  num_epochs: 3
+  batch_size: 8
+  eval_every_steps: 200
+
+model:
+  type: pi05
+  pretrained_path: "REPLACE_ME/a-real-pi05-checkpoint"
+  freeze_vision_encoder: false
+  train_expert_only: false
+  gradient_checkpointing: true
+  empty_cameras: 0

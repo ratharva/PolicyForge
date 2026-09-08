@@ -7,11 +7,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import draccus
+
 from training.common.config import DataConfig
 
 
 @dataclass
-class ACTConfigOverrides:
+class PolicyOverrides(draccus.ChoiceRegistry):
+    """Shared base for the three *ConfigOverrides dataclasses below, so
+    draccus's choice-registry mechanism can select one from a --config-file
+    YAML's `model: {type: act|molmoact2|pi05, ...}` section (see
+    training/train.py's --config-file). Purely a draccus-integration
+    detail -- runtime code (train_loop.py, model/*.py) keeps accessing
+    RunConfig.model by plain attribute access, unaffected by this base."""
+
+
+@PolicyOverrides.register_subclass("act")
+@dataclass
+class ACTConfigOverrides(PolicyOverrides):
     """Values passed to lerobot's ACTConfig -- field names must match the
     installed lerobot version; see training/model/act.py."""
     chunk_size: int = 100
@@ -30,8 +43,9 @@ class ACTConfigOverrides:
     dropout: float = 0.1
 
 
+@PolicyOverrides.register_subclass("molmoact2")
 @dataclass
-class MolmoAct2ConfigOverrides:
+class MolmoAct2ConfigOverrides(PolicyOverrides):
     """Values passed to lerobot's MolmoAct2Config; see training/model/molmoact2.py."""
     checkpoint_path: str = "allenai/MolmoAct2"
     chunk_size: int = 30          # MolmoAct2Config's own default -- NOT ACT's 100
@@ -70,8 +84,9 @@ class MolmoAct2ConfigOverrides:
     offload_tokenization: bool = False
 
 
+@PolicyOverrides.register_subclass("pi05")
 @dataclass
-class Pi05ConfigOverrides:
+class Pi05ConfigOverrides(PolicyOverrides):
     """Values passed to lerobot's PI05Config; see training/model/pi05.py.
 
     Deliberately no single "train_mode" convenience string like
@@ -146,5 +161,5 @@ class RunConfig:
     # the right override type once --policy-type is parsed.
     policy_type: str = "act"
     data: DataConfig = field(default_factory=DataConfig)
-    model: ACTConfigOverrides | MolmoAct2ConfigOverrides | Pi05ConfigOverrides = field(default_factory=ACTConfigOverrides)
+    model: PolicyOverrides = field(default_factory=ACTConfigOverrides)
     train: TrainConfig = field(default_factory=TrainConfig)

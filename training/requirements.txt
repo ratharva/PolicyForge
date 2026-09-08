@@ -27,6 +27,13 @@ lerobot==0.6.1
 tensorboard
 pyyaml
 h5py
+# Not listed explicitly here on purpose -- draccus is already pulled in
+# transitively by lerobot==0.6.1 (`pip show draccus` -> Required-by:
+# lerobot; it's what ACTConfig/PI05Config/MolmoAct2Config are built on).
+# training/train.py's --config-file now imports and calls it directly too
+# (draccus.parse), not just via lerobot -- if lerobot ever stops requiring
+# it, add `draccus` here explicitly rather than assuming it'll still be
+# present.
 
 # Needed by the droid ingestion strategy (training/data_prep/strategies/
 # hf_lerobot_mirror.py) -- lerobot.scripts.convert_dataset_v21_to_v30 (part

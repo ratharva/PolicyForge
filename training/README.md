@@ -21,6 +21,7 @@ is given explicitly (`--dataset-source`, see the table row below).
 | Flag | Default | Meaning |
 |---|---|---|
 | `--tasks` (required) | -- | must match what `prepare_data.py` was run with |
+| `--config-file` | none | optional YAML file providing a base `RunConfig` -- every flag in this doc still works and takes precedence; see "Config files" below |
 | `--run-name` | `<policy_type>-<tasks>-<timestamp>` | also the resume key -- see below |
 | `--storage-root` | `TrainConfig` default | where run output (checkpoints, TensorBoard, history) is written |
 | `--num-epochs` | `1` | |
@@ -43,6 +44,51 @@ is given explicitly (`--dataset-source`, see the table row below).
 # Custom base LR, ACT backbone LR, gradient accumulation, and weight decay
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
     --lr 5e-5 --lr-backbone 1e-5 --grad-accum 4 --weight-decay 1e-3
+```
+
+## Config files
+
+`--config-file PATH` loads a YAML file into a base `RunConfig`, parsed with
+[`draccus`](https://github.com/dlwh/draccus) -- the same library lerobot's
+own `ACTConfig`/`PI05Config`/`MolmoAct2Config` are built on (already an
+installed dependency, pulled in transitively by `lerobot==0.6.1`). It's
+purely additive: **every named flag in this doc still works exactly as it
+always has, and takes precedence over anything the YAML sets** --
+`--config-file` only fills in values nothing else was explicitly passed
+for. `--tasks` and `--policy-type` are still required on the command line
+even when the file also sets them (there's no way to make a required flag
+optional only when a config file exists without changing the CLI's shape
+for everyone, which this was deliberately kept from doing).
+
+Precedence, low to high: dataclass defaults (`training/config.py`) <
+`--config-file`'s YAML < a named CLI flag actually typed on the command
+line. One accepted limitation: a CLI flag whose value happens to equal its
+own default is indistinguishable from not having passed it at all, so the
+config-file's value (if any) wins in that case -- if you need to force a
+value back to its default while using a config file, remove it from the
+file instead of relying on the flag.
+
+The YAML mirrors `RunConfig`'s real shape (`training/config.py`,
+`training/common/config.py`'s `DataConfig`) -- top-level `tasks`/
+`policy_type`/`run_name`/`storage_root`, nested `train:`/`data:` sections,
+and a `model:` section whose `type: act|molmoact2|pi05` key selects which
+of the three `*ConfigOverrides` dataclasses the rest of that section's
+fields apply to (draccus's "choice registry" mechanism -- if `model.type`
+disagrees with the resolved `--policy-type`, `train.py` exits with a clear
+error rather than guessing which one you meant).
+
+Five real, draccus-verified examples in
+[`training/configs/`](configs/README.md) -- one per policy, plus one
+showing the `data:` section (action-space selection, delta actions,
+per-camera image normalization including a depth camera):
+
+```bash
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+    --policy-type act --config-file training/configs/act_example.yaml
+
+# A named flag still overrides whatever the file sets
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
+    --policy-type act --config-file training/configs/act_example.yaml --batch-size 32
 ```
 
 ## Action space & per-camera image normalization

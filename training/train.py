@@ -16,6 +16,8 @@ import argparse
 import os
 import time
 
+import draccus
+import draccus.utils
 import ray
 import ray.data
 import ray.train
@@ -23,7 +25,7 @@ import ray.train.torch
 import torch
 
 from training.common.ray_setup import build_runtime_env, connect_ray
-from training.config import MolmoAct2ConfigOverrides, Pi05ConfigOverrides, RunConfig
+from training.config import ACTConfigOverrides, MolmoAct2ConfigOverrides, Pi05ConfigOverrides, RunConfig
 from training.data.ray_dataset import (
     build_lerobot_v3_dataset, offload_molmoact2_preprocessing, select_action_space,
     to_relative_action_space, transpose_for_training,
@@ -49,10 +51,57 @@ def _parse_kv_pairs(pairs: list[str] | None, value_type=str) -> dict:
     return out
 
 
+# --- --config-file (training/README.md's "Config files" section) ---
+# A YAML file, parsed into a base RunConfig via draccus.parse (the same
+# library lerobot's own ACTConfig/PI05Config/MolmoAct2Config are built on --
+# every named CLI flag below still works exactly as it does today and
+# takes precedence over anything the YAML sets; --config-file only fills
+# in values nothing else was explicitly passed for.
+_POLICY_MODEL_CLASSES = {
+    "act": ACTConfigOverrides, "molmoact2": MolmoAct2ConfigOverrides, "pi05": Pi05ConfigOverrides,
+}
+
+
+def _apply_if_explicit(
+    target, attr: str, args: argparse.Namespace, dest: str, parser: argparse.ArgumentParser, transform=None,
+) -> None:
+    """Only overwrites target.attr when --dest was actually passed on the
+    command line (its parsed value differs from the parser's own default
+    for it) -- so a --config-file-loaded value survives when the user
+    didn't explicitly override that particular flag. No add_argument
+    default= needed to change for this: parser.get_default(dest) already
+    reflects whatever's declared there. `transform`, if given, is applied
+    to the raw CLI value before assignment (e.g. early_stop_patience's
+    "<= 0 means disabled" -> None convention) -- explicitness is still
+    judged on the RAW value, before transform. Known, accepted limitation:
+    a CLI value that happens to equal its own default is indistinguishable
+    from not having passed the flag at all, and the config-file's value
+    (if any) wins in that case."""
+    value = getattr(args, dest)
+    if value != parser.get_default(dest):
+        setattr(target, attr, transform(value) if transform else value)
+
+
+def _load_base_run_config(config_file: str | None) -> RunConfig:
+    if not config_file:
+        return RunConfig()
+    try:
+        return draccus.parse(RunConfig, config_path=config_file, args=[])
+    except draccus.utils.DraccusException as e:
+        detail = f"{e}" + (f" (caused by: {e.__cause__})" if e.__cause__ else "")
+        raise SystemExit(f"--config-file {config_file}: {detail}") from e
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", nargs="+", required=True,
                          help="task-name substrings -- must match what training.prepare_data was run with")
+    parser.add_argument("--config-file", default=None,
+                         help="optional YAML file (draccus-parsed, same library lerobot's own policy "
+                              "configs use) providing a base RunConfig -- every named flag below still "
+                              "works exactly as today and takes precedence over anything the YAML sets; "
+                              "this only fills in values nothing else was explicitly passed for. See "
+                              "training/README.md's config-file section for the YAML shape")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--storage-root", default=None)
     parser.add_argument("--num-epochs", type=int, default=1)
@@ -231,30 +280,19 @@ def main() -> None:
                               "checkpoint expects more camera slots than this dataset has")
     args = parser.parse_args()
 
-    if args.policy_type == "molmoact2":
-        if not args.molmoact2_setup_type or not args.molmoact2_control_mode:
-            parser.error("--molmoact2-setup-type and --molmoact2-control-mode are required when --policy-type molmoact2")
-        if args.molmoact2_distributed_strategy == "fsdp2" and args.molmoact2_train_mode != "fft":
-            parser.error("--molmoact2-distributed-strategy fsdp2 only makes sense with --molmoact2-train-mode fft")
-    if args.policy_type == "pi05" and not args.pi05_pretrained_path:
-        parser.error("--pi05-pretrained-path is required when --policy-type pi05")
+    # Policy-specific "required iff"/cross-field validation moved below,
+    # AFTER --config-file layering -- it must check the FINAL resolved
+    # run_cfg.model (which a YAML file can also populate), not raw CLI args
+    # alone, or a value coming only from --config-file would silently skip
+    # validation entirely.
 
+    # Parsed here (CLI-only); merged onto --config-file's own
+    # image_normalization/image_normalization_max dicts (CLI wins per-key)
+    # further down, once run_cfg exists -- full validation (unknown mode
+    # name, missing max for a depth/log camera) happens after that merge,
+    # against the FINAL resolved dicts, not these CLI-only ones.
     image_normalization = _parse_kv_pairs(args.image_normalization)
     image_normalization_max = _parse_kv_pairs(args.image_normalization_max, value_type=float)
-    for cam, mode in image_normalization.items():
-        if mode not in IMAGE_NORMALIZATION_MODES:
-            parser.error(f"--image-normalization {cam}={mode}: unknown mode, must be one of {IMAGE_NORMALIZATION_MODES}")
-    needs_max = {cam for cam, mode in image_normalization.items() if mode in ("depth", "log")}
-    if args.image_normalization_default in ("depth", "log"):
-        # Every camera not explicitly listed falls back to this mode too --
-        # can't know which cameras that is until --dataset-source resolves
-        # camera_keys, so this is re-checked again below.
-        needs_max_default = True
-    else:
-        needs_max_default = False
-    missing_max = needs_max - set(image_normalization_max)
-    if missing_max:
-        parser.error(f"--image-normalization-max required for camera(s) {sorted(missing_max)} (mode 'depth'/'log')")
 
     profile_steps = None
     if args.profile_steps is not None:
@@ -274,53 +312,107 @@ def main() -> None:
                 f"fast, consider a smaller range (10-20 steps is usually plenty)."
             )
 
-    run_cfg = RunConfig(tasks=args.tasks)
-    run_cfg.policy_type = args.policy_type
-    run_cfg.train.num_epochs = args.num_epochs
-    run_cfg.train.batch_size = args.batch_size
-    run_cfg.train.lr = args.lr
-    run_cfg.train.lr_backbone = args.lr_backbone
-    run_cfg.train.grad_accum = args.grad_accum
-    run_cfg.train.weight_decay = args.weight_decay
-    run_cfg.train.max_train_steps = args.max_train_steps
-    run_cfg.train.eval_every_steps = args.eval_every_steps
-    run_cfg.train.early_stop_patience = args.early_stop_patience if args.early_stop_patience > 0 else None
-    run_cfg.train.save_only_on_improvement = args.save_only_on_improvement
-    run_cfg.train.checkpoint_max_to_keep = args.checkpoint_max_to_keep
-    run_cfg.train.log_perf_metrics = args.log_perf_metrics
-    run_cfg.train.profile_steps = profile_steps
-    if args.policy_type == "molmoact2":
-        # RunConfig()'s default `model` is ACTConfigOverrides -- overwritten
-        # here now that --policy-type is known.
-        run_cfg.model = MolmoAct2ConfigOverrides(
-            checkpoint_path=args.molmoact2_checkpoint_path,
-            setup_type=args.molmoact2_setup_type,
-            control_mode=args.molmoact2_control_mode,
-            action_mode=args.molmoact2_action_mode,
-            train_mode=args.molmoact2_train_mode,
-            lora_rank=args.molmoact2_lora_rank,
-            lora_alpha=args.molmoact2_lora_alpha,
-            lora_dropout=args.molmoact2_lora_dropout,
-            gradient_checkpointing=args.molmoact2_gradient_checkpointing,
-            optimizer_vit_lr=args.molmoact2_vit_lr,
-            optimizer_connector_lr=args.molmoact2_connector_lr,
-            optimizer_action_expert_lr=args.molmoact2_action_expert_lr,
-            distributed_strategy=args.molmoact2_distributed_strategy,
-            fsdp_cpu_offload=args.molmoact2_fsdp_cpu_offload,
-            offload_tokenization=args.molmoact2_offload_tokenization,
-        )
-    if args.policy_type == "pi05":
-        run_cfg.model = Pi05ConfigOverrides(
-            pretrained_path=args.pi05_pretrained_path,
-            freeze_vision_encoder=args.pi05_freeze_vision_encoder,
-            train_expert_only=args.pi05_train_expert_only,
-            gradient_checkpointing=args.pi05_gradient_checkpointing,
-            empty_cameras=args.pi05_empty_cameras,
-        )
-    if args.storage_root:
-        run_cfg.storage_root = args.storage_root
+    # --- base RunConfig: --config-file's YAML (draccus-parsed) if given,
+    # else the plain dataclass defaults -- see _load_base_run_config. Every
+    # field below is then layered on top ONLY if its CLI flag was actually
+    # passed (_apply_if_explicit), so an unset flag leaves whatever the
+    # config-file (or the dataclass default) already had, and today's
+    # exact behavior is unchanged when --config-file is omitted.
+    run_cfg = _load_base_run_config(args.config_file)
+    _apply_if_explicit(run_cfg, "tasks", args, "tasks", parser)
+    _apply_if_explicit(run_cfg, "policy_type", args, "policy_type", parser)
+    _apply_if_explicit(run_cfg.train, "num_epochs", args, "num_epochs", parser)
+    _apply_if_explicit(run_cfg.train, "batch_size", args, "batch_size", parser)
+    _apply_if_explicit(run_cfg.train, "lr", args, "lr", parser)
+    _apply_if_explicit(run_cfg.train, "lr_backbone", args, "lr_backbone", parser)
+    _apply_if_explicit(run_cfg.train, "grad_accum", args, "grad_accum", parser)
+    _apply_if_explicit(run_cfg.train, "weight_decay", args, "weight_decay", parser)
+    _apply_if_explicit(run_cfg.train, "max_train_steps", args, "max_train_steps", parser)
+    _apply_if_explicit(run_cfg.train, "eval_every_steps", args, "eval_every_steps", parser)
+    _apply_if_explicit(
+        run_cfg.train, "early_stop_patience", args, "early_stop_patience", parser,
+        transform=lambda v: v if v > 0 else None,
+    )
+    _apply_if_explicit(run_cfg.train, "save_only_on_improvement", args, "save_only_on_improvement", parser)
+    _apply_if_explicit(run_cfg.train, "checkpoint_max_to_keep", args, "checkpoint_max_to_keep", parser)
+    _apply_if_explicit(run_cfg.train, "log_perf_metrics", args, "log_perf_metrics", parser)
+    if args.profile_steps is not None:  # already parsed into the (start, end) tuple `profile_steps` above
+        run_cfg.train.profile_steps = profile_steps
+
+    # --- model: make sure run_cfg.model's concrete type actually matches
+    # the resolved policy_type before layering any --molmoact2-*/--pi05-*
+    # flags onto it. A still-untouched default ACTConfigOverrides means
+    # the config-file had no opinion (indistinguishable, after parsing,
+    # from never having a `model:` section at all -- both produce exactly
+    # this) -- silently build the right type instead, same as today's
+    # pre-config-file behavior. Anything else mismatched (the config-file
+    # explicitly chose or customized a DIFFERENT policy's model) is a real
+    # conflict, not silently resolved.
+    expected_model_cls = _POLICY_MODEL_CLASSES[run_cfg.policy_type]
+    if not isinstance(run_cfg.model, expected_model_cls):
+        if isinstance(run_cfg.model, ACTConfigOverrides) and run_cfg.model == ACTConfigOverrides():
+            run_cfg.model = expected_model_cls()
+        else:
+            raise SystemExit(
+                f"--config-file's model section is for a different policy than the resolved "
+                f"--policy-type {run_cfg.policy_type!r} -- match --config-file's model.type to "
+                f"--policy-type, or drop one of them."
+            )
+
+    if run_cfg.policy_type == "molmoact2":
+        m = run_cfg.model
+        _apply_if_explicit(m, "checkpoint_path", args, "molmoact2_checkpoint_path", parser)
+        _apply_if_explicit(m, "setup_type", args, "molmoact2_setup_type", parser)
+        _apply_if_explicit(m, "control_mode", args, "molmoact2_control_mode", parser)
+        _apply_if_explicit(m, "action_mode", args, "molmoact2_action_mode", parser)
+        _apply_if_explicit(m, "train_mode", args, "molmoact2_train_mode", parser)
+        _apply_if_explicit(m, "lora_rank", args, "molmoact2_lora_rank", parser)
+        _apply_if_explicit(m, "lora_alpha", args, "molmoact2_lora_alpha", parser)
+        _apply_if_explicit(m, "lora_dropout", args, "molmoact2_lora_dropout", parser)
+        _apply_if_explicit(m, "gradient_checkpointing", args, "molmoact2_gradient_checkpointing", parser)
+        _apply_if_explicit(m, "optimizer_vit_lr", args, "molmoact2_vit_lr", parser)
+        _apply_if_explicit(m, "optimizer_connector_lr", args, "molmoact2_connector_lr", parser)
+        _apply_if_explicit(m, "optimizer_action_expert_lr", args, "molmoact2_action_expert_lr", parser)
+        _apply_if_explicit(m, "distributed_strategy", args, "molmoact2_distributed_strategy", parser)
+        _apply_if_explicit(m, "fsdp_cpu_offload", args, "molmoact2_fsdp_cpu_offload", parser)
+        _apply_if_explicit(m, "offload_tokenization", args, "molmoact2_offload_tokenization", parser)
+        if not m.setup_type or not m.control_mode:
+            parser.error(
+                "--molmoact2-setup-type and --molmoact2-control-mode are required when --policy-type "
+                "molmoact2 (either as CLI flags or in --config-file's model section)"
+            )
+        if m.distributed_strategy == "fsdp2" and m.train_mode != "fft":
+            parser.error("--molmoact2-distributed-strategy fsdp2 only makes sense with --molmoact2-train-mode fft")
+
+    if run_cfg.policy_type == "pi05":
+        m = run_cfg.model
+        _apply_if_explicit(m, "pretrained_path", args, "pi05_pretrained_path", parser)
+        _apply_if_explicit(m, "freeze_vision_encoder", args, "pi05_freeze_vision_encoder", parser)
+        _apply_if_explicit(m, "train_expert_only", args, "pi05_train_expert_only", parser)
+        _apply_if_explicit(m, "gradient_checkpointing", args, "pi05_gradient_checkpointing", parser)
+        _apply_if_explicit(m, "empty_cameras", args, "pi05_empty_cameras", parser)
+        if not m.pretrained_path:
+            parser.error(
+                "--pi05-pretrained-path is required when --policy-type pi05 (either as a CLI flag or "
+                "in --config-file's model section)"
+            )
+
+    # --- data: action-space/image-normalization -- CLI wins per-key for the
+    # two dict fields (a config-file's other camera entries are preserved,
+    # not wholesale replaced); the scalar fields use the same
+    # _apply_if_explicit as everything else above.
+    run_cfg.data.image_normalization = {**run_cfg.data.image_normalization, **image_normalization}
+    run_cfg.data.image_normalization_max = {**run_cfg.data.image_normalization_max, **image_normalization_max}
+    _apply_if_explicit(run_cfg.data, "default_image_normalization", args, "image_normalization_default", parser)
+    _apply_if_explicit(run_cfg.data, "action_space", args, "action_space", parser)
+    _apply_if_explicit(run_cfg.data, "action_representation", args, "action_representation", parser)
+    _apply_if_explicit(run_cfg.data, "action_delta_exclude", args, "action_delta_exclude", parser)
+
+    _apply_if_explicit(run_cfg, "storage_root", args, "storage_root", parser)
     run_cfg.storage_root = os.path.abspath(run_cfg.storage_root)
-    run_cfg.run_name = args.run_name or f"{args.policy_type}-{'-'.join(args.tasks)}-{time.strftime('%Y%m%d-%H%M%S')}"
+    _apply_if_explicit(run_cfg, "run_name", args, "run_name", parser)
+    if not run_cfg.run_name:
+        run_cfg.run_name = f"{run_cfg.policy_type}-{'-'.join(run_cfg.tasks)}-{time.strftime('%Y%m%d-%H%M%S')}"
     if not args.v3_root and not args.dataset_source:
         raise SystemExit(
             "Can't determine where the prepared dataset lives -- pass either --v3-root "
@@ -344,35 +436,33 @@ def main() -> None:
         )
     source = get_dataset_source(dataset_source)
     original_robot = source.robot
-    if args.action_space is not None and args.action_space not in original_robot.action_space_components:
+    if run_cfg.data.action_space is not None and run_cfg.data.action_space not in original_robot.action_space_components:
         raise SystemExit(
-            f"--action-space {args.action_space!r} isn't available for dataset_source "
+            f"--action-space {run_cfg.data.action_space!r} isn't available for dataset_source "
             f"{dataset_source!r} -- available: {sorted(original_robot.action_space_components) or '(none)'}"
         )
-    run_cfg.data.robot = original_robot.select_action_space(args.action_space)
-    run_cfg.data.action_space = args.action_space
-    run_cfg.data.action_representation = args.action_representation
-    run_cfg.data.action_delta_exclude = args.action_delta_exclude
+    run_cfg.data.robot = original_robot.select_action_space(run_cfg.data.action_space)
 
-    unknown_cams = set(image_normalization) - set(original_robot.camera_keys) - set(original_robot.depth_camera_keys)
+    for cam, mode in run_cfg.data.image_normalization.items():
+        if mode not in IMAGE_NORMALIZATION_MODES:
+            raise SystemExit(f"image-normalization {cam}={mode}: unknown mode, must be one of {IMAGE_NORMALIZATION_MODES}")
+    unknown_cams = set(run_cfg.data.image_normalization) - set(original_robot.camera_keys) - set(original_robot.depth_camera_keys)
     if unknown_cams:
         raise SystemExit(
             f"--image-normalization refers to unknown camera(s) {sorted(unknown_cams)} -- "
             f"available: {sorted(original_robot.camera_keys + original_robot.depth_camera_keys)}"
         )
-    if needs_max_default:
-        default_needs_max = (
+    needs_max = {cam for cam, mode in run_cfg.data.image_normalization.items() if mode in ("depth", "log")}
+    if run_cfg.data.default_image_normalization in ("depth", "log"):
+        needs_max |= (
             set(original_robot.camera_keys) | set(original_robot.depth_camera_keys)
-        ) - set(image_normalization) - set(image_normalization_max)
-        if default_needs_max:
-            raise SystemExit(
-                f"--image-normalization-default {args.image_normalization_default!r} needs "
-                f"--image-normalization-max for camera(s) {sorted(default_needs_max)} (not covered "
-                f"by --image-normalization, so they'd use the depth/log default)"
-            )
-    run_cfg.data.image_normalization = image_normalization
-    run_cfg.data.default_image_normalization = args.image_normalization_default
-    run_cfg.data.image_normalization_max = image_normalization_max
+        ) - set(run_cfg.data.image_normalization)
+    missing_max = needs_max - set(run_cfg.data.image_normalization_max)
+    if missing_max:
+        raise SystemExit(
+            f"image-normalization mode 'depth'/'log' needs --image-normalization-max for camera(s) "
+            f"{sorted(missing_max)}"
+        )
 
     run_cfg.data.source_uri = source.default_source_uri
     if conversion_params:
