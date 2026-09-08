@@ -180,15 +180,18 @@ reasonable starting point -- not verified against real training quality.
 ### Normalization
 
 MolmoAct2's own default is quantile-based normalization for state/action
-(`STATE`/`ACTION: QUANTILES`); `training/model/molmoact2.py` overrides this
-to `MEAN_STD` for all three (`VISUAL`/`STATE`/`ACTION`) at construction so
-`training/data/stats.py`'s existing `compute_dataset_stats` (mean/std only)
-works unchanged -- a deliberate simplification, not a claim that it's
-optimal. Forcing `MEAN_STD` for `VISUAL` too (the real default there is
-`IDENTITY`) construction-succeeds (verified via a real `MolmoAct2Config(...)`
-call) but is still unverified to produce numerically correct results
-end-to-end inside `make_molmoact2_pre_post_processors` -- that needs a real
-batch through the real processor, not just successful construction.
+(`STATE`/`ACTION: QUANTILES`); `training/model/molmoact2.py` overrides
+`STATE`/`ACTION` to `MEAN_STD` at construction so `training/data/stats.py`'s
+existing `compute_dataset_stats` (mean/std only) works unchanged -- a
+deliberate simplification, not a claim that it's optimal. `VISUAL` is set
+to `IDENTITY`, MolmoAct2's own real default too -- `training/model/
+image_normalization.py`'s `apply_image_normalization` owns 100% of image
+scaling now (mean_std/unit01/unit_pm1/depth/log, selected per-camera via
+`--image-normalization`), applied in `train_loop.py` before the policy's
+own preprocessor runs, so lerobot's per-`FeatureType` normalizer never
+touches `VISUAL` for any policy -- see `training/README.md`'s "Action space
+& per-camera image normalization" section for the full `--image-normalization`
+flag reference.
 
 ## π0.5
 
@@ -268,12 +271,13 @@ MolmoAct2's DDP path uses). If a real run later shows DDP doesn't fit
 
 ### Normalization
 
-Same deliberate simplification as MolmoAct2: π0.5's own default
-(`VISUAL: IDENTITY`, `STATE`/`ACTION: QUANTILES`) is overridden to
-`MEAN_STD` for all three at construction, so `training/data/stats.py`'s
-existing mean/std-only `compute_dataset_stats` works unchanged --
-construction-succeeds (verified via a real `PI05Config(...)` call), not
-verified to be numerically optimal end-to-end.
+Same deliberate simplification as MolmoAct2: π0.5's own default `STATE`/
+`ACTION: QUANTILES` is overridden to `MEAN_STD`, so `training/data/stats.py`'s
+existing mean/std-only `compute_dataset_stats` works unchanged. `VISUAL`
+stays `IDENTITY` -- π0.5's own real default, and required for every policy
+now that `training/model/image_normalization.py` owns all image scaling
+upstream of the policy's own preprocessor (see MolmoAct2's "Normalization"
+section above).
 
 ## Policy-specific CLI flags
 

@@ -35,6 +35,24 @@ log = logging.getLogger("act_train")
 _EVAL_MAX_BATCHES = 50
 
 
+def _gather_eval_stats(loss_sum: float, n: int, metrics_sum: dict[str, float]) -> tuple[float, int, dict[str, float]]:
+    """Sums each rank's local eval loss/n/metrics so eval/* covers the whole
+    held-out set, not just rank 0's shard slice. Collective -- every rank
+    must call this."""
+    if not torch.distributed.is_initialized():
+        return loss_sum, n, metrics_sum
+    world_size = torch.distributed.get_world_size()
+    gathered = [None] * world_size
+    torch.distributed.all_gather_object(gathered, (loss_sum, n, metrics_sum))
+    total_loss = sum(g[0] for g in gathered)
+    total_n = sum(g[1] for g in gathered)
+    total_metrics: dict[str, float] = {}
+    for _, _, m in gathered:
+        for k, v in m.items():
+            total_metrics[k] = total_metrics.get(k, 0.0) + v
+    return total_loss, total_n, total_metrics
+
+
 def _sync_should_stop(should_stop: bool, device: torch.device) -> bool:
     """Broadcasts rank 0's early-stop decision to every rank -- each rank
     trains on a different data shard and could otherwise disagree, which
@@ -207,9 +225,10 @@ def train_loop_per_worker(config: dict) -> None:
     # workers writing to the same run would corrupt one events file.
     # train_cfg.tensorboard=False (--no-tensorboard) skips this entirely,
     # e.g. when only W&B is wanted.
+    # Always computed -- --profile-steps needs this dir even with --no-tensorboard.
+    tb_dir = os.path.join(run_cfg.storage_root, run_cfg.run_name, "tensorboard")
     tb_writer = None
     if rank == 0 and train_cfg.tensorboard:
-        tb_dir = os.path.join(run_cfg.storage_root, run_cfg.run_name, "tensorboard")
         os.makedirs(tb_dir, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=tb_dir, flush_secs=10)
         print(f"TensorBoard logs: {tb_dir}  (run: tensorboard --logdir {tb_dir})")
@@ -319,7 +338,12 @@ def train_loop_per_worker(config: dict) -> None:
             f"Effective batch size: {eff_bs} (batch_size={train_cfg.batch_size} x "
             f"grad_accum={train_cfg.grad_accum} x world_size={world_size})"
         )
-        gpu_poll_stop = perf_logging.start_gpu_poller(tb_writer, device, step_ref)
+        # CUDA-only -- gpu_snapshot() raises unconditionally on a CPU-only device.
+        if device.type == "cuda":
+            gpu_poll_stop = perf_logging.start_gpu_poller(
+                lambda snap, step: _log_all(tb_writer, wandb_run, "perf", snap, step, train_cfg),
+                device, step_ref,
+            )
 
     prof = None
     prof_started = False
@@ -359,6 +383,12 @@ def train_loop_per_worker(config: dict) -> None:
 
             if not adapter.needs_task:
                 batch.pop("task", None)  # language conditioning this policy doesn't use
+
+            if prof is not None and not prof_started and step + 1 == train_cfg.profile_steps[0]:
+                # Start before this iteration's compute -- `step` is still the previous count.
+                prof.start()
+                prof_started = True
+
             # If a Ray Data stage already ran the policy's full preprocessor
             # upstream (see offload_molmoact2_preprocessing), the batch is
             # already image-normalized/normalized/tokenized -- skip doing
@@ -417,14 +447,9 @@ def train_loop_per_worker(config: dict) -> None:
                 window_optimizer_step_n += 1
                 accum = 0
 
-            if prof is not None:
-                start_step, end_step = train_cfg.profile_steps
-                if step == start_step and not prof_started:
-                    prof.start()
-                    prof_started = True
-                if prof_started:
-                    prof.step()
-                if step == end_step and prof_started:
+            if prof is not None and prof_started:
+                prof.step()
+                if step == train_cfg.profile_steps[1]:
                     prof.stop()
                     prof_started = False
 
@@ -563,16 +588,23 @@ def train_loop_per_worker(config: dict) -> None:
                             if predicted:
                                 import wandb
 
-                                wandb_run.log(
-                                    {
-                                        f"eval_gif/{name}": wandb.Video(
-                                            frames.transpose(0, 3, 1, 2), format="gif", fps=data_cfg.robot.tick_fps,
-                                        )
-                                        for name, frames in predicted.items()
-                                    },
-                                    step=step,
+                                media = {
+                                    f"eval_gif/{name}": wandb.Video(
+                                        frames.transpose(0, 3, 1, 2), format="gif", fps=data_cfg.robot.tick_fps,
+                                    )
+                                    for name, frames in predicted.items()
+                                }
+                                # Apply the same allow/deny filter as every other metric.
+                                filtered = filter_metrics(
+                                    media, train_cfg.wandb_metrics, train_cfg.wandb_exclude_metrics,
                                 )
+                                if filtered:
+                                    wandb_run.log(filtered, step=step)
                     policy.train()
+                    # Collective -- every rank must call this, not just rank 0.
+                    eval_loss_sum, eval_n, eval_metrics_sum = _gather_eval_stats(
+                        eval_loss_sum, eval_n, eval_metrics_sum,
+                    )
                     if rank == 0 and eval_n > 0:
                         eval_values = {
                             "loss": eval_loss_sum / eval_n,
@@ -609,10 +641,12 @@ def train_loop_per_worker(config: dict) -> None:
                         import wandb
 
                         frames_chw = frames.transpose(0, 3, 1, 2)
-                        wandb_run.log(
-                            {f"gif/{cam}": wandb.Video(frames_chw, format="gif", fps=data_cfg.robot.tick_fps)},
-                            step=step,
-                        )
+                        media = {f"gif/{cam}": wandb.Video(frames_chw, format="gif", fps=data_cfg.robot.tick_fps)}
+                        # Same filtering as every other metric -- see the
+                        # eval_gif/* fix above for why this was missing.
+                        filtered = filter_metrics(media, train_cfg.wandb_metrics, train_cfg.wandb_exclude_metrics)
+                        if filtered:
+                            wandb_run.log(filtered, step=step)
 
             t_iter_end = time.perf_counter()
             if should_stop:

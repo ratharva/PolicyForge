@@ -24,8 +24,14 @@ train:
 
   # Allowlist: only these (plus anything matching a glob) go to W&B --
   # comment this out (or set to null) to send everything, same as
-  # TensorBoard already does.
-  wandb_metrics: [loss, l1_loss, kld_loss, "perf/*"]
+  # TensorBoard already does. Keys are always logged PREFIXED by report
+  # kind (e.g. "train/loss", "window/loss", "epoch/loss", "eval/loss" --
+  # see train_loop.py's _log_all), so a bare "loss" pattern matches
+  # nothing; "*/loss" matches all four. Also includes both GIF namespaces
+  # (gif/* for episode-preview, eval_gif/* for predict_frames), since
+  # wandb_gif_cameras below is on and media logging is filtered the same
+  # way scalar metrics are.
+  wandb_metrics: ["*/loss", "*/l1_loss", "*/kld_loss", "perf/*", "gif/*", "eval_gif/*"]
   # Denylist, applied after the allowlist above.
   wandb_exclude_metrics: [perf/checkpoint_save_s]
 

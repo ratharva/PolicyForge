@@ -72,15 +72,11 @@ def gpu_snapshot(device: torch.device) -> dict[str, float]:
     return snap
 
 
-def start_gpu_poller(tb_writer, device: torch.device, step_ref: list[int], interval_s: float = 1.5) -> threading.Event:
-    """Starts a daemon thread that calls gpu_snapshot() every interval_s
-    and writes it to tb_writer under perf/* -- nvidia-smi/NVML calls
-    aren't free, so this samples on a wall-clock interval, not every step.
-    Tagged with `step_ref[0]` (a 1-element list the caller mutates after
-    every training step) rather than its own counter, so every perf/*
-    scalar shares one step-based x-axis in TensorBoard. Returns the stop
-    Event -- call .set() on it when training ends, before closing
-    tb_writer, so the thread doesn't write to a closed writer."""
+def start_gpu_poller(log_fn, device: torch.device, step_ref: list[int], interval_s: float = 1.5) -> threading.Event:
+    """Starts a daemon thread that samples gpu_snapshot() every interval_s
+    and calls `log_fn(snapshot, step)` -- CUDA-only, caller must gate this.
+    Call .set() on the returned Event to stop, before closing whatever
+    log_fn writes to."""
     stop_event = threading.Event()
 
     def _poll():
@@ -88,8 +84,7 @@ def start_gpu_poller(tb_writer, device: torch.device, step_ref: list[int], inter
             try:
                 snap = gpu_snapshot(device)
                 step = step_ref[0]
-                for k, v in snap.items():
-                    tb_writer.add_scalar(f"perf/{k}", v, global_step=step)
+                log_fn(snap, step)
             except Exception:
                 # A daemon thread's uncaught exception silently ends the
                 # thread with no effect on the training run other than

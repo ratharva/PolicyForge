@@ -222,7 +222,13 @@ def convert_to_lerobot_v3(
             print(f"  {skipped} episode(s) skipped (decode/align/network failure -- see WARNINGs above)")
 
     reused_records = [
-        EpisodeRecord(episode_index=e["episode_index"], task=e["task"], length=e["length"]) for e in reused
+        EpisodeRecord(
+            episode_index=e["episode_index"], task=e["task"], length=e["length"],
+            # Mirrors agibot_hdf5.py's reused-record fix (mcap has no depth cameras today).
+            depth_shapes={k: tuple(v) for k, v in e.get("depth_shapes", {}).items()},
+            depth_dtypes=e.get("depth_dtypes", {}),
+        )
+        for e in reused
     ]
     all_records = reused_records + new_records
     if not all_records:
@@ -244,6 +250,8 @@ def convert_to_lerobot_v3(
             "episode_index": r.episode_index,
             "task_index": task_to_index[r.task],
             "length": r.length,
+            "depth_shapes": r.depth_shapes,
+            "depth_dtypes": r.depth_dtypes,
         }
         for r in all_records
     ])

@@ -427,6 +427,10 @@ def main() -> None:
         run_cfg.train, "wandb_predict_frames_every_steps", args, "wandb_predict_frames_every_steps", parser,
     )
     _apply_if_explicit(run_cfg.train, "eval_split_fraction", args, "eval_split_fraction", parser)
+    if run_cfg.train.eval_split_fraction is not None and not (0 < run_cfg.train.eval_split_fraction < 1):
+        parser.error(
+            f"--eval-split-fraction must be strictly between 0 and 1, got {run_cfg.train.eval_split_fraction}"
+        )
 
     if run_cfg.train.wandb_gif_cameras and not run_cfg.train.wandb:
         parser.error("--wandb-gif-cameras requires --wandb")
@@ -514,6 +518,11 @@ def main() -> None:
     _apply_if_explicit(run_cfg.data, "default_image_normalization", args, "image_normalization_default", parser)
     _apply_if_explicit(run_cfg.data, "action_space", args, "action_space", parser)
     _apply_if_explicit(run_cfg.data, "action_representation", args, "action_representation", parser)
+    # argparse choices= doesn't cover a --config-file YAML value -- validate the final result.
+    if run_cfg.data.default_image_normalization not in IMAGE_NORMALIZATION_MODES:
+        parser.error(f"default image normalization must be one of {IMAGE_NORMALIZATION_MODES}")
+    if run_cfg.data.action_representation not in ("absolute", "delta"):
+        parser.error("action representation must be 'absolute' or 'delta'")
     _apply_if_explicit(run_cfg.data, "action_delta_exclude", args, "action_delta_exclude", parser)
 
     _apply_if_explicit(run_cfg, "storage_root", args, "storage_root", parser)
@@ -554,17 +563,17 @@ def main() -> None:
     for cam, mode in run_cfg.data.image_normalization.items():
         if mode not in IMAGE_NORMALIZATION_MODES:
             raise SystemExit(f"image-normalization {cam}={mode}: unknown mode, must be one of {IMAGE_NORMALIZATION_MODES}")
-    unknown_cams = set(run_cfg.data.image_normalization) - set(original_robot.camera_keys) - set(original_robot.depth_camera_keys)
+    # Depth cameras are looked up as "depth_<key>", not the bare RobotSchema name.
+    available_cams = set(original_robot.camera_keys) | {f"depth_{k}" for k in original_robot.depth_camera_keys}
+    unknown_cams = set(run_cfg.data.image_normalization) - available_cams
     if unknown_cams:
         raise SystemExit(
             f"--image-normalization refers to unknown camera(s) {sorted(unknown_cams)} -- "
-            f"available: {sorted(original_robot.camera_keys + original_robot.depth_camera_keys)}"
+            f"available: {sorted(available_cams)}"
         )
     needs_max = {cam for cam, mode in run_cfg.data.image_normalization.items() if mode in ("depth", "log")}
     if run_cfg.data.default_image_normalization in ("depth", "log"):
-        needs_max |= (
-            set(original_robot.camera_keys) | set(original_robot.depth_camera_keys)
-        ) - set(run_cfg.data.image_normalization)
+        needs_max |= available_cams - set(run_cfg.data.image_normalization)
     missing_max = needs_max - set(run_cfg.data.image_normalization_max)
     if missing_max:
         raise SystemExit(
@@ -625,6 +634,13 @@ def main() -> None:
             idx for idx in all_episode_indices
             if _episode_in_eval({"episode_index": idx}, seed=0, eval_fraction=run_cfg.train.eval_split_fraction)
         ]
+        # A valid fraction can still hash every episode of a small dataset to one side.
+        if not eval_episode_indices or len(eval_episode_indices) == len(all_episode_indices):
+            raise SystemExit(
+                f"--eval-split-fraction {run_cfg.train.eval_split_fraction} hashed all "
+                f"{len(all_episode_indices)} episode(s) to one side (0 held out for eval) -- "
+                f"try a different fraction, or use more episodes."
+            )
         print(
             f"  eval split: {len(eval_episode_indices)}/{len(all_episode_indices)} episodes held out "
             f"of training (--eval-split-fraction {run_cfg.train.eval_split_fraction})"

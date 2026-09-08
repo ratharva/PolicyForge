@@ -117,9 +117,15 @@ vision backbone every RGB camera does -- see
 python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-type act \
     --action-space joint
 
-# Delta (relative-to-state) actions, keeping a gripper component absolute
-python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
-    --action-representation delta --action-delta-exclude gripper
+# Delta (relative-to-state) actions, keeping one component absolute --
+# needs a dataset whose action/state components are actually same-named
+# (abc130k's aren't: e.g. "/left-arm-action" vs "/left-arm-state", so
+# --action-representation delta would leave every dim absolute there --
+# see the --action-representation row above). agibot_alpha's are:
+# "effector/position" appears in both state_components and
+# action_components, so it gets a real delta unless excluded like this.
+python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-type act \
+    --action-representation delta --action-delta-exclude effector/position
 
 # Per-camera normalization: one RGB camera to [0,1], another to [-1,1],
 # a depth camera clipped/scaled by its real max range (millimeters)

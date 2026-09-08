@@ -113,8 +113,8 @@ def sample_episode_frames(
     episodes into one video file, unlike this project's own writer's
     convention. `image_size`, if given, resizes each frame the same way
     `_decode_video_bytes` (training/data_prep/strategies/agibot_hdf5.py)
-    does. Returns `(T, H, W, 3)` uint8, `T <= n_frames` (fewer if the
-    episode itself is shorter). Raises `ValueError` if `camera_key` isn't
+    does. Returns `(T, H, W, 3)` uint8, `T <= min(n_frames, episode length)`.
+    Raises `ValueError` if `camera_key` isn't
     one of this dataset's real video keys (e.g. a depth camera, which
     isn't video-encoded -- see training/data_prep/lerobot_v3_writer.py)."""
     from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
@@ -135,6 +135,8 @@ def sample_episode_frames(
     chunk = meta.episodes.column(f"videos/{camera_key}/chunk_index")[row].as_py()
     file_index = meta.episodes.column(f"videos/{camera_key}/file_index")[row].as_py()
     from_ts = meta.episodes.column(f"videos/{camera_key}/from_timestamp")[row].as_py()
+    # Bounds reading to this episode's own frames, for video files packing multiple episodes.
+    episode_length = meta.episodes.column("length")[row].as_py()
     rel_path = meta.video_path_template.format(video_key=camera_key, chunk_index=chunk, file_index=file_index)
     path = f"{meta.fs_root}/{rel_path}"
 
@@ -152,16 +154,20 @@ def sample_episode_frames(
         stream = container.streams.video[0]
         if from_ts > 0:
             container.seek(int(from_ts / stream.time_base), stream=stream)
+        max_frames = min(n_frames, episode_length)
         for packet in container.demux(video=0):
             for frame in packet.decode():
+                # Seek can land before from_ts (nearest keyframe) -- skip pre-roll frames.
+                if frame.time is not None and frame.time < from_ts:
+                    continue
                 arr = frame.to_ndarray(format="rgb24")
                 if image_size is not None and arr.shape[:2] != image_size:
                     h, w = image_size
                     arr = frame.reformat(width=w, height=h).to_ndarray(format="rgb24")
                 frames.append(arr)
-                if len(frames) >= n_frames:
+                if len(frames) >= max_frames:
                     break
-            if len(frames) >= n_frames:
+            if len(frames) >= max_frames:
                 break
     finally:
         container.close()

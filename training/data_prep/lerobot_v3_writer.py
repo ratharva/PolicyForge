@@ -348,9 +348,10 @@ EPISODE_MANIFEST_FILENAME = "episode_manifest.json"
 
 
 def read_episode_manifest(root: str) -> list[dict]:
-    """[{"rel_path", "task", "episode_index", "task_index", "length"}, ...],
-    or [] if this dataset predates the manifest (treated as "nothing to
-    reuse" by convert.py -- safe, just means a full reconvert once)."""
+    """[{"rel_path", "task", "episode_index", "task_index", "length",
+    "depth_shapes", "depth_dtypes"}, ...], or [] if this dataset predates
+    the manifest. depth_shapes/depth_dtypes may be absent on old manifests --
+    callers must .get() them with a {} default."""
     fs, fs_root = open_fs(root)
     path = f"{fs_root}/meta/{EPISODE_MANIFEST_FILENAME}"
     if not fs.exists(path):

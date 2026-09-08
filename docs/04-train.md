@@ -6,18 +6,25 @@ with the exact `prepare_data.py` command to run if nothing's prepared yet.
 
 ```bash
 python -m training.train --tasks arrange_the_flowers box_folding \
+    --dataset-source abc130k --policy-type act \
     --max-train-steps 50   # smoke run first
 ```
+
+`--policy-type` is always required (no default). Locating the dataset also
+always needs `--dataset-source` or `--v3-root` (either one, to derive/give
+the path) -- `train.py` exits immediately with a clear error naming
+whichever's missing.
 
 Drop `--max-train-steps` for a full run once the smoke run's loss is moving
 and a checkpoint lands under `training/runs/<run-name>/` (see
 [5. View results](05-view-results.md)).
 
-`train.py` resolves its dataset's `RobotSchema` (camera keys, state/action
-dims, tick rate) automatically from the prepared dataset's own
-`conversion_params.json` -- no `--dataset-source` flag needed in the common
-case. It's only needed as an override for a hand-built `--v3-root` with no
-`conversion_params.json`.
+Once the dataset is located, `train.py` resolves its `RobotSchema` (camera
+keys, state/action dims, tick rate) automatically from the prepared
+dataset's own `conversion_params.json` -- so if `--v3-root` already points
+at a real prepared dataset, `--dataset-source` isn't needed a second time
+just for this. It's only needed as an override for a hand-built `--v3-root`
+with no `conversion_params.json`.
 
 ## Choosing a policy
 
@@ -49,8 +56,8 @@ No data-prep flags here; those all live on `prepare_data.py`.
 | `--save-only-on-improvement` | off (checkpoint every report) | only write a checkpoint when the loss improves -- less write I/O, but a resume after an interruption can lose progress back to the last improvement |
 | `--checkpoint-max-to-keep` | `3` | max checkpoints kept on disk -- with the default (every report checkpointed), this is the N best-scoring PLUS the single most recent checkpoint (for resuming), even when it isn't among the N best -- native Ray Train behavior, see [5. View results](05-view-results.md) |
 | `--num-workers` | live GPU count | Ray Train DDP workers |
-| `--v3-root` | `training/lerobot_v3/<dataset-source>/<sorted tasks>` | where the already-converted dataset is read from -- must already exist |
-| `--policy-type` | `act` | `act`, `molmoact2`, or `pi05` -- see [Customizing policies](customizing-policies.md); no separate environment needed for any of them (see [1. Setup](01-setup.md)) |
+| `--v3-root` | `training/lerobot_v3/<dataset-source>/<sorted tasks>` (needs `--dataset-source` to derive this) | where the already-converted dataset is read from -- must already exist |
+| `--policy-type` (required) | -- | `act`, `molmoact2`, or `pi05` -- see [Customizing policies](customizing-policies.md); no separate environment needed for any of them (see [1. Setup](01-setup.md)) |
 
 Policy-specific flags (`--molmoact2-*`, `--pi05-*`) are documented in full in
 [Customizing policies](customizing-policies.md).
@@ -58,15 +65,18 @@ Policy-specific flags (`--molmoact2-*`, `--pi05-*`) are documented in full in
 ```bash
 # Already have a LeRobot v3 dataset (from anywhere -- hand-built, downloaded
 # pre-converted, prepare_data.py from a prior run) and just want to train on it
-python -m training.train --tasks arrange_the_flowers --v3-root /path/to/existing/dataset
+# -- --v3-root alone locates it, --policy-type is still always required
+python -m training.train --tasks arrange_the_flowers --v3-root /path/to/existing/dataset --policy-type act
 
 # Keep more checkpoints, and only write one when the loss improves (less write
 # I/O than the default, at the cost of a resume potentially losing progress
 # back to the last improvement)
-python -m training.train --tasks arrange_the_flowers --checkpoint-max-to-keep 10 --save-only-on-improvement
+python -m training.train --tasks arrange_the_flowers --dataset-source abc130k --policy-type act \
+    --checkpoint-max-to-keep 10 --save-only-on-improvement
 
 # Full run, tuned: longer patience, non-default storage location
 python -m training.train --tasks arrange_the_flowers box_folding \
+    --dataset-source abc130k --policy-type act \
     --num-epochs 3 --batch-size 16 --eval-every-steps 100 --early-stop-patience 8 \
     --storage-root /mnt/shared_storage/act_training --run-name flowers-boxes-v2
 ```

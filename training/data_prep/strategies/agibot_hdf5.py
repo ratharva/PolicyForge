@@ -621,7 +621,12 @@ def prepare(
         shutil.rmtree(out_dir, ignore_errors=True)
 
     reused_records = [
-        EpisodeRecord(episode_index=e["episode_index"], task=e["task"], length=e["length"])
+        EpisodeRecord(
+            episode_index=e["episode_index"], task=e["task"], length=e["length"],
+            # Carry forward depth metadata so it survives a run with 0 new episodes.
+            depth_shapes={k: tuple(v) for k, v in e.get("depth_shapes", {}).items()},
+            depth_dtypes=e.get("depth_dtypes", {}),
+        )
         for e in plan.reused
     ]
     all_records = reused_records + new_records
@@ -640,6 +645,8 @@ def prepare(
             "episode_index": r.episode_index,
             "task_index": plan.task_to_index[r.task],
             "length": r.length,
+            "depth_shapes": r.depth_shapes,
+            "depth_dtypes": r.depth_dtypes,
         }
         for r in all_records
     ])
