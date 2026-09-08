@@ -219,6 +219,40 @@ def write_episode(
     )
 
 
+def renumber_episode(root: str, old_index: int, new_index: int, camera_keys: tuple[str, ...]) -> None:
+    """Moves one already-written episode's data/video files from old_index
+    to new_index, patching the data parquet's own episode_index column to
+    match (video files carry no such column, just a path rename). No-op if
+    old_index == new_index. Used by convert.py to compact away index gaps
+    left by episodes that failed conversion mid-batch -- a failed episode
+    never gets this far (write_episode is only called on success), but
+    running episodes in parallel means some earlier-numbered episode can
+    still fail after a later-numbered one already succeeded and wrote its
+    files under its original (soon-to-be-gapped) index."""
+    if old_index == new_index:
+        return
+    fs, fs_root = open_fs(root)
+
+    old_data_path = f"{fs_root}/{DATA_PATH_TEMPLATE.format(chunk_index=0, file_index=old_index)}"
+    new_data_path = f"{fs_root}/{DATA_PATH_TEMPLATE.format(chunk_index=0, file_index=new_index)}"
+    with fs.open(old_data_path, "rb") as f:
+        table = pq.read_table(f)
+    table = table.set_column(
+        table.schema.get_field_index("episode_index"), "episode_index",
+        pa.array([new_index] * table.num_rows, type=pa.int64()),
+    )
+    fs.makedirs(os.path.dirname(new_data_path), exist_ok=True)
+    with fs.open(new_data_path, "wb") as f:
+        pq.write_table(table, f)
+    fs.rm(old_data_path)
+
+    for cam_key in camera_keys:
+        old_video_path = f"{fs_root}/{VIDEO_PATH_TEMPLATE.format(video_key=cam_key, chunk_index=0, file_index=old_index)}"
+        new_video_path = f"{fs_root}/{VIDEO_PATH_TEMPLATE.format(video_key=cam_key, chunk_index=0, file_index=new_index)}"
+        fs.makedirs(os.path.dirname(new_video_path), exist_ok=True)
+        fs.mv(old_video_path, new_video_path)
+
+
 def finalize_dataset(
     root: str, records: list[EpisodeRecord], robot: RobotSchema,
     image_size: tuple[int, int], task_to_index: dict[str, int],

@@ -523,26 +523,28 @@ def prepare(
 
     plan = plan_incremental_conversion(v3_root, stable_ids_by_task, exists=exists, force=force)
 
-    # Pre-assign episode_index to every to-convert entry BEFORE attempting
-    # extraction (same convention convert_to_lerobot_v3 uses) -- a failed
-    # episode just leaves its index unused, the manifest is built from this
-    # fixed mapping either way, not from a counter that only advances on success.
-    specs = []  # (task_name, task_id, episode_id, episode_index)
-    episode_index = plan.next_episode_index
+    # episode_index is assigned only on success, below -- NOT pre-assigned
+    # here. lerobot_datasource.py requires strictly contiguous 0-based
+    # indices; pre-assigning one per requested episode and then skipping
+    # failures would leave gaps (e.g. [0, 2] if episode 1 fails), which
+    # finalize_dataset would write without complaint but which then makes
+    # the ENTIRE dataset unreadable at train time.
+    specs = []  # (task_name, task_id, episode_id)
     for task_name, stable_id in plan.to_convert:
         task_id, episode_id = stable_id.split("/")
-        specs.append((task_name, task_id, episode_id, episode_index))
-        episode_index += 1
+        specs.append((task_name, task_id, episode_id))
 
     new_records: list[EpisodeRecord] = []
+    new_idx_to_stable: dict[int, str] = {}
+    next_episode_index = plan.next_episode_index
     out_dir = tempfile.mkdtemp(prefix="agibot_extract_")
     try:
         if specs:
             print(f"\n=== resolve shards + extract {len(specs)} new episode(s) ===")
             # Group by task_id (shards are downloaded per-task) then by shard path.
-            by_task_id: dict[str, list[tuple[str, str, int]]] = {}  # task_id -> [(task_name, episode_id, episode_index), ...]
-            for task_name, task_id, episode_id, ep_idx in specs:
-                by_task_id.setdefault(task_id, []).append((task_name, episode_id, ep_idx))
+            by_task_id: dict[str, list[tuple[str, str]]] = {}  # task_id -> [(task_name, episode_id), ...]
+            for task_name, task_id, episode_id in specs:
+                by_task_id.setdefault(task_id, []).append((task_name, episode_id))
 
             # proprio_stats is one archive shared across every task -- download it
             # once here, distinct from any task's observations download below, so
@@ -560,7 +562,7 @@ def prepare(
             depth_paths: dict[str, dict[str, str]] = {}
 
             for task_id, entries in by_task_id.items():
-                episode_ids = [eid for _tn, eid, _ei in entries]
+                episode_ids = [eid for _tn, eid in entries]
 
                 print(f"  task {task_id}: downloading observations shard(s) ...")
                 obs_shards = download_task_observation_shards(source_uri, task_id, agibot_cfg, token)
@@ -604,7 +606,7 @@ def prepare(
                             )
                             video_paths.setdefault(eid, {})[cam_key] = local_path
 
-            for task_name, task_id, episode_id, ep_idx in specs:
+            for task_name, task_id, episode_id in specs:
                 have_proprio = episode_id in proprio_paths
                 have_videos = len(video_paths.get(episode_id, {})) == len(robot.camera_keys)
                 if not (have_proprio and have_videos):
@@ -620,8 +622,11 @@ def prepare(
                 except (OSError, KeyError, ValueError) as e:
                     print(f"WARNING: skipping episode {episode_id} (task {task_name}): transform failure: {e}")
                     continue
+                ep_idx = next_episode_index
+                next_episode_index += 1
                 record = write_episode(v3_root, ep_idx, task_name, plan.task_to_index[task_name], aligned, robot)
                 new_records.append(record)
+                new_idx_to_stable[ep_idx] = f"{task_id}/{episode_id}"
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -641,7 +646,7 @@ def prepare(
     finalize_dataset(v3_root, all_records, robot, image_size, plan.task_to_index)
     write_conversion_params(v3_root, expected_params)
 
-    idx_to_stable = {ep_idx: f"{task_id}/{episode_id}" for _tn, task_id, episode_id, ep_idx in specs}
+    idx_to_stable = dict(new_idx_to_stable)
     idx_to_stable.update({e["episode_index"]: e["rel_path"] for e in plan.reused})
     write_episode_manifest(v3_root, [
         {

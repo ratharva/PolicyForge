@@ -40,6 +40,7 @@ from training.data_prep.lerobot_v3_writer import (
     dataset_exists,
     finalize_dataset,
     read_conversion_params,
+    renumber_episode,
     write_conversion_params,
     write_episode,
     write_episode_manifest,
@@ -219,6 +220,27 @@ def convert_to_lerobot_v3(
         if skipped:
             print(f"  {skipped} episode(s) skipped (decode/align/network failure -- see WARNINGs above)")
 
+    # rel_path lookup by each spec's ORIGINAL (pre-assigned, possibly gapped)
+    # index -- built before any compaction below.
+    old_ep_idx_to_rel_path = {ep_idx: rel_path for rel_path, _task, ep_idx, _task_idx in specs}
+
+    # A skipped episode leaves a gap in episode_index (Ray tasks run in
+    # parallel, so a later-numbered episode can finish and write its files
+    # before an earlier-numbered one fails) -- lerobot_datasource.py requires
+    # strictly contiguous 0-based indices, so compact the survivors back to a
+    # contiguous range here, renaming/repatching their already-written files
+    # to match (renumber_episode), instead of writing a dataset with holes
+    # that later fails to even open.
+    new_records.sort(key=lambda r: r.episode_index)
+    new_ep_idx_to_rel_path: dict[int, str] = {}
+    next_compact_index = plan.next_episode_index
+    for rec in new_records:
+        old_index = rec.episode_index
+        renumber_episode(out_root, old_index, next_compact_index, robot.camera_keys)
+        new_ep_idx_to_rel_path[next_compact_index] = old_ep_idx_to_rel_path[old_index]
+        rec.episode_index = next_compact_index
+        next_compact_index += 1
+
     reused_records = [
         EpisodeRecord(
             episode_index=e["episode_index"], task=e["task"], length=e["length"],
@@ -236,10 +258,8 @@ def convert_to_lerobot_v3(
     write_conversion_params(out_root, expected_params)
 
     # rel_path is only known here (not on EpisodeRecord); rebuild the manifest
-    # by joining new_records back to their spec via episode_index, which was
-    # assigned per-spec before submission and is therefore a stable join key
-    # regardless of the order Ray tasks actually complete in.
-    ep_idx_to_rel_path = {ep_idx: rel_path for rel_path, _task, ep_idx, _task_idx in specs}
+    # by joining records back to their rel_path via the (now-compacted) index.
+    ep_idx_to_rel_path = dict(new_ep_idx_to_rel_path)
     ep_idx_to_rel_path.update({e["episode_index"]: e["rel_path"] for e in reused})
     write_episode_manifest(out_root, [
         {
