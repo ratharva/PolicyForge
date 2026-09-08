@@ -37,11 +37,10 @@ def build_pi05_config(
             "--pi05-pretrained-path."
         )
 
+    from training.model.image_normalization import visual_input_features
+
     h, w = data_cfg.image_size
-    input_features = {
-        f"observation.images.{k}": PolicyFeature(type=FeatureType.VISUAL, shape=(3, h, w))
-        for k in data_cfg.robot.camera_keys
-    }
+    input_features = visual_input_features(data_cfg)
     input_features["observation.state"] = PolicyFeature(
         type=FeatureType.STATE, shape=(data_cfg.robot.state_dim,)
     )
@@ -60,11 +59,15 @@ def build_pi05_config(
         gradient_checkpointing=overrides.gradient_checkpointing,
         empty_cameras=overrides.empty_cameras,
         image_resolution=(h, w),
-        # MEAN_STD (not the real default IDENTITY/QUANTILES), same
-        # deliberate simplification as MolmoAct2, so
+        # STATE/ACTION: MEAN_STD (not the real default IDENTITY/QUANTILES),
+        # same deliberate simplification as MolmoAct2, so
         # training/data/stats.py's mean/std-only compute_dataset_stats
-        # works unchanged.
-        normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
+        # works unchanged. VISUAL: IDENTITY -- training/model/
+        # image_normalization.py now owns all image scaling instead
+        # (applied in train_loop.py before this policy's preprocessor
+        # runs), so lerobot's own per-FeatureType normalizer must not also
+        # scale images.
+        normalization_mapping={"VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
         optimizer_lr=train_cfg.lr,
         # Not consumed by this pipeline's optimizer construction (train_loop.py
         # builds AdamW directly from get_optim_params() + train_cfg, bypassing

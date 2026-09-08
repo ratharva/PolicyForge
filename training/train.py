@@ -24,13 +24,29 @@ import torch
 
 from training.common.ray_setup import build_runtime_env, connect_ray
 from training.config import MolmoAct2ConfigOverrides, Pi05ConfigOverrides, RunConfig
-from training.data.ray_dataset import build_lerobot_v3_dataset, offload_molmoact2_preprocessing, transpose_for_training
+from training.data.ray_dataset import (
+    build_lerobot_v3_dataset, offload_molmoact2_preprocessing, select_action_space,
+    to_relative_action_space, transpose_for_training,
+)
 from training.data.stats import compute_dataset_stats
 from training.data_prep.lerobot_v3_writer import read_conversion_params
 from training.data_prep.prepare import has_lerobot_v3_data, resolve_v3_root
 from training.data_prep.strategies.registry import available_dataset_sources, get_dataset_source
 from training.history import record_run
+from training.model.image_normalization import MODES as IMAGE_NORMALIZATION_MODES
 from training.train_loop import train_loop_per_worker
+
+
+def _parse_kv_pairs(pairs: list[str] | None, value_type=str) -> dict:
+    """Parses ["CAM=VALUE", ...] CLI args (--image-normalization,
+    --image-normalization-max) into {CAM: value_type(VALUE)}."""
+    out = {}
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise SystemExit(f"expected CAMERA=VALUE, got {pair!r}")
+        key, value = pair.split("=", 1)
+        out[key] = value_type(value)
+    return out
 
 
 def main() -> None:
@@ -84,6 +100,36 @@ def main() -> None:
                               "conversion_params.json (written by prepare_data.py), no flag needed "
                               "in the common case. Only needed as an override for a hand-built "
                               "--v3-root with no conversion_params.json.")
+
+    # --- action space (component selection + absolute/delta) ---
+    parser.add_argument("--action-space", default=None,
+                         help="which named subset of the dataset's action_components to train on, "
+                              "e.g. 'joint' or 'end_effector' for agibot_alpha (which records both) -- "
+                              "default: every component (current behavior). Valid names are dataset-"
+                              "specific (the schema's action_space_components keys); validated once "
+                              "--dataset-source is resolved, not here")
+    parser.add_argument("--action-representation", choices=("absolute", "delta"), default="absolute",
+                         help="'absolute' (default): action column unchanged. 'delta': action -= "
+                              "observation.state (per masked dim), using each action component's "
+                              "same-named state component as the reference point -- components with no "
+                              "same-named state component stay absolute (no reference point to use)")
+    parser.add_argument("--action-delta-exclude", nargs="+", default=[],
+                         help="action component names to keep absolute even under "
+                              "--action-representation delta (e.g. a gripper component name)")
+
+    # --- per-camera image normalization ---
+    parser.add_argument("--image-normalization", nargs="+", default=[],
+                         metavar="CAMERA=MODE",
+                         help=f"per-camera normalization mode, e.g. head=unit01 wrist=mean_std -- modes: "
+                              f"{', '.join(IMAGE_NORMALIZATION_MODES)}. A camera not listed here uses "
+                              f"--image-normalization-default")
+    parser.add_argument("--image-normalization-default", choices=IMAGE_NORMALIZATION_MODES, default="mean_std",
+                         help="mode for any camera not covered by --image-normalization -- 'mean_std' "
+                              "(default) replicates current behavior exactly")
+    parser.add_argument("--image-normalization-max", nargs="+", default=[],
+                         metavar="CAMERA=VALUE",
+                         help="required for any camera using the 'depth' or 'log' mode -- the raw-value "
+                              "ceiling to clip/scale by (e.g. max depth in millimeters); no guessed default")
 
     # --- MolmoAct2 ---
     parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05"), required=True,
@@ -178,6 +224,23 @@ def main() -> None:
     if args.policy_type == "pi05" and not args.pi05_pretrained_path:
         parser.error("--pi05-pretrained-path is required when --policy-type pi05")
 
+    image_normalization = _parse_kv_pairs(args.image_normalization)
+    image_normalization_max = _parse_kv_pairs(args.image_normalization_max, value_type=float)
+    for cam, mode in image_normalization.items():
+        if mode not in IMAGE_NORMALIZATION_MODES:
+            parser.error(f"--image-normalization {cam}={mode}: unknown mode, must be one of {IMAGE_NORMALIZATION_MODES}")
+    needs_max = {cam for cam, mode in image_normalization.items() if mode in ("depth", "log")}
+    if args.image_normalization_default in ("depth", "log"):
+        # Every camera not explicitly listed falls back to this mode too --
+        # can't know which cameras that is until --dataset-source resolves
+        # camera_keys, so this is re-checked again below.
+        needs_max_default = True
+    else:
+        needs_max_default = False
+    missing_max = needs_max - set(image_normalization_max)
+    if missing_max:
+        parser.error(f"--image-normalization-max required for camera(s) {sorted(missing_max)} (mode 'depth'/'log')")
+
     run_cfg = RunConfig(tasks=args.tasks)
     run_cfg.policy_type = args.policy_type
     run_cfg.train.num_epochs = args.num_epochs
@@ -245,7 +308,37 @@ def main() -> None:
             f"hand-built v3 root) -- pass --dataset-source explicitly."
         )
     source = get_dataset_source(dataset_source)
-    run_cfg.data.robot = source.robot
+    original_robot = source.robot
+    if args.action_space is not None and args.action_space not in original_robot.action_space_components:
+        raise SystemExit(
+            f"--action-space {args.action_space!r} isn't available for dataset_source "
+            f"{dataset_source!r} -- available: {sorted(original_robot.action_space_components) or '(none)'}"
+        )
+    run_cfg.data.robot = original_robot.select_action_space(args.action_space)
+    run_cfg.data.action_space = args.action_space
+    run_cfg.data.action_representation = args.action_representation
+    run_cfg.data.action_delta_exclude = args.action_delta_exclude
+
+    unknown_cams = set(image_normalization) - set(original_robot.camera_keys) - set(original_robot.depth_camera_keys)
+    if unknown_cams:
+        raise SystemExit(
+            f"--image-normalization refers to unknown camera(s) {sorted(unknown_cams)} -- "
+            f"available: {sorted(original_robot.camera_keys + original_robot.depth_camera_keys)}"
+        )
+    if needs_max_default:
+        default_needs_max = (
+            set(original_robot.camera_keys) | set(original_robot.depth_camera_keys)
+        ) - set(image_normalization) - set(image_normalization_max)
+        if default_needs_max:
+            raise SystemExit(
+                f"--image-normalization-default {args.image_normalization_default!r} needs "
+                f"--image-normalization-max for camera(s) {sorted(default_needs_max)} (not covered "
+                f"by --image-normalization, so they'd use the depth/log default)"
+            )
+    run_cfg.data.image_normalization = image_normalization
+    run_cfg.data.default_image_normalization = args.image_normalization_default
+    run_cfg.data.image_normalization_max = image_normalization_max
+
     run_cfg.data.source_uri = source.default_source_uri
     if conversion_params:
         run_cfg.max_episodes_per_task = conversion_params.get(
@@ -269,13 +362,28 @@ def main() -> None:
         print("WARNING: Ray reports GPUs but this driver process sees none -- check CUDA setup.")
 
     print("\n=== build Ray Data pipeline (from LeRobot v3) ===")
-    raw_ds = build_lerobot_v3_dataset(v3_root, run_cfg.model.chunk_size)
+    raw_ds = build_lerobot_v3_dataset(
+        v3_root, run_cfg.model.chunk_size, depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+    )
+    raw_ds = select_action_space(raw_ds, original_robot, run_cfg.data.robot, name=run_cfg.run_name)
+    if run_cfg.data.action_representation == "delta":
+        raw_ds = to_relative_action_space(
+            raw_ds, run_cfg.data.robot, exclude_components=run_cfg.data.action_delta_exclude,
+            name=run_cfg.run_name,
+        )
 
     print("\n=== compute normalization stats ===")
-    # Sampled from raw_ds (pre-transpose, HWC) -- see training/data/stats.py.
+    # Sampled from raw_ds (pre-transpose, HWC), AFTER action-space selection/
+    # delta-conversion above -- so stats reflect whatever's actually trained
+    # on (computing stats on absolute actions then converting to delta
+    # afterwards would normalize deltas using absolute-action mean/std,
+    # which is wrong). See training/data/stats.py.
     dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
 
-    ds = transpose_for_training(raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name)
+    ds = transpose_for_training(
+        raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name,
+        depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+    )
 
     if run_cfg.policy_type == "molmoact2" and run_cfg.model.offload_tokenization:
         print("\n=== offload MolmoAct2 preprocessing (tokenizer + image processor) to Ray Data ===")

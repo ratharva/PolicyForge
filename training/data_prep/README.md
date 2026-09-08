@@ -133,6 +133,46 @@ point `HF_HOME` or `HUGGINGFACE_HUB_CACHE` at a larger volume first if your
 default disk doesn't have room for a task's full shard set plus the shared
 48GB proprio tar.
 
+#### Depth camera
+
+`agibot_alpha`'s schema declares `depth_camera_keys: [head]` -- the head
+camera's `<episode_id>/depth/head_depth_<frame>.png` files (in the same
+observations tar as the color videos) are ingested alongside the 8 RGB
+cameras, written as a non-video `depth.head` column, and land at
+train time as `observation.images.depth_head` (see
+`training/README.md`'s image-normalization section for using it, e.g.
+`--image-normalization depth_head=depth --image-normalization-max
+depth_head=<real max depth in mm>`).
+
+**Two assumptions this relies on that were NOT independently re-verified
+against a fresh gated download** (unlike everything else in
+`agibot_alpha.yaml`, which this file's own header comment confirms was
+checked against real downloaded files):
+- the PNG bit depth (assumed 16-bit grayscale, common for depth sensors,
+  but not confirmed for this dataset specifically)
+- that every episode has exactly as many depth frames as color-video
+  frames (assumed 1:1 cadence; extraction sorts frames by the number
+  parsed out of each filename, not a guessed zero-padding width, so it's
+  at least robust to whatever the real padding turns out to be)
+
+If either assumption is wrong for a real episode, `agibot_hdf5.py` raises
+per-episode (caught and skipped with a warning, same as any other
+transform failure) rather than silently misaligning depth against
+state/action/video -- confirm both against one real downloaded episode
+before converting at scale:
+
+```bash
+python -m training.prepare_data --tasks fridge --max-episodes-per-task 1 \
+    --dataset-source agibot_alpha --v3-root /tmp/agibot_depth_smoke_test
+```
+
+Scanning a shard with depth enabled can't stop early once every requested
+video/proprio member is found (unlike the video-only path) -- depth files
+are matched by directory prefix, not exact name, since the real per-frame
+filenames aren't known upfront, so the whole shard must be scanned. This
+is a real, deliberate cost, only paid when `depth_camera_keys` is
+non-empty.
+
 ## Before converting anything -- `discover.py` and `verify_decode.py`
 
 Both also require `--dataset-source` explicitly -- no default.

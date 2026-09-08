@@ -19,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from training.vendor.util import NumpyToTorchCollate
 from training.config import RunConfig
+from training.model.image_normalization import apply_image_normalization
 from training.model.registry import PolicyAdapter, get_adapter
 
 log = logging.getLogger("act_train")
@@ -153,6 +154,7 @@ def train_loop_per_worker(config: dict) -> None:
     rank = ray.train.get_context().get_world_rank()
     shard = ray.train.get_dataset_shard("train")
     image_keys = {f"observation.images.{k}" for k in data_cfg.robot.camera_keys}
+    image_keys |= {f"observation.images.depth_{k}" for k in data_cfg.robot.depth_camera_keys}
     collate = NumpyToTorchCollate(device, image_keys=image_keys)
 
     # Only rank 0 writes -- every worker's shard is a different data slice,
@@ -187,7 +189,13 @@ def train_loop_per_worker(config: dict) -> None:
                 batch.pop("task", None)  # language conditioning this policy doesn't use
             # If a Ray Data stage already ran the policy's full preprocessor
             # upstream (see offload_molmoact2_preprocessing), the batch is
-            # already normalized/tokenized -- skip calling it again here.
+            # already image-normalized/normalized/tokenized -- skip doing
+            # any of that again here.
+            if not adapter.preprocessing_offloaded:
+                batch = apply_image_normalization(
+                    batch, data_cfg.image_normalization, data_cfg.default_image_normalization,
+                    dataset_stats, data_cfg.image_normalization_max,
+                )
             inputs = batch if adapter.preprocessing_offloaded else preprocessor(batch)
             if dist_ctx is not None and hasattr(dist_ctx, "autocast"):
                 # FSDP2/accelerate path only. Accelerator(mixed_precision="bf16")

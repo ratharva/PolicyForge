@@ -45,6 +45,43 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
     --lr 5e-5 --lr-backbone 1e-5 --grad-accum 4 --weight-decay 1e-3
 ```
 
+## Action space & per-camera image normalization
+
+General flags -- apply regardless of `--policy-type`, applied once to the
+Ray Dataset before normalization stats are computed (not a per-policy
+concern).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--action-space` | none (every action component) | which named subset of the dataset's `action_components` to train on -- e.g. `joint` or `end_effector` for `agibot_alpha`, which records both. Valid names are dataset-specific (the schema's `action_space_components` keys); most datasets declare none, so this only applies to `agibot_alpha` today |
+| `--action-representation` | `absolute` | `absolute` (unchanged) or `delta`: `action -= observation.state` per dim, using each action component's **same-named** state component as the reference point -- components with no same-named state component (e.g. `agibot_alpha`'s `robot/velocity`, which has no state counterpart) stay absolute, there's no reference point to use |
+| `--action-delta-exclude` | none | action component names to keep absolute even under `--action-representation delta` (e.g. a gripper component) |
+| `--image-normalization` | none | per-camera mode, `CAMERA=MODE` pairs, e.g. `--image-normalization top=unit01 depth_head=depth`. Modes: `mean_std` (default, dataset-computed mean/std, current behavior), `unit01` (`x/255`), `unit_pm1` (`x/127.5 - 1`), `depth` (`clip(x,0,max)/max`), `log` (`log1p(x)/log1p(max)`) |
+| `--image-normalization-default` | `mean_std` | mode for any camera not covered by `--image-normalization` |
+| `--image-normalization-max` | none | `CAMERA=VALUE` pairs -- **required** for any camera using `depth`/`log` (the raw-value ceiling to clip/scale by, e.g. max depth in millimeters); no guessed default |
+
+A single-channel camera (a depth camera, in practice) is automatically
+replicated to 3 channels after normalization, so it flows through the same
+vision backbone every RGB camera does -- see
+`training/model/image_normalization.py`.
+
+```bash
+# Train agibot_alpha on joint-space actions instead of the full 36-dim
+# action vector (which mixes joint- and end-effector-space components)
+python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-type act \
+    --action-space joint
+
+# Delta (relative-to-state) actions, keeping a gripper component absolute
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --action-representation delta --action-delta-exclude gripper
+
+# Per-camera normalization: one RGB camera to [0,1], another to [-1,1],
+# a depth camera clipped/scaled by its real max range (millimeters)
+python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-type act \
+    --image-normalization top=unit01 wrist=unit_pm1 depth_head=depth \
+    --image-normalization-max depth_head=5000
+```
+
 ## Resuming a run
 
 There's no `--resume` flag -- re-running with the **same `--run-name`**

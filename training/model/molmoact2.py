@@ -52,11 +52,9 @@ def build_molmoact2_config(
     else:
         raise ValueError(f"train_mode must be one of 'lora', 'fft', 'freeze', got {overrides.train_mode!r}")
 
-    h, w = data_cfg.image_size
-    input_features = {
-        f"observation.images.{k}": PolicyFeature(type=FeatureType.VISUAL, shape=(3, h, w))
-        for k in data_cfg.robot.camera_keys
-    }
+    from training.model.image_normalization import visual_input_features
+
+    input_features = visual_input_features(data_cfg)
     input_features["observation.state"] = PolicyFeature(
         type=FeatureType.STATE, shape=(data_cfg.robot.state_dim,)
     )
@@ -64,6 +62,14 @@ def build_molmoact2_config(
         "action": PolicyFeature(type=FeatureType.ACTION, shape=(data_cfg.robot.action_dim,))
     }
 
+    # NOT extended to include depth cameras -- image_keys' effect on
+    # MolmoAct2's own VLM prompt/vision-tower input selection (distinct
+    # from input_features, which just declares dims) hasn't been traced
+    # against the real installed MolmoAct2Config, so silently adding depth
+    # here could have unverified prompt-construction side effects. A depth
+    # camera is still declared as an input_features VISUAL entry above;
+    # confirm real MolmoAct2 behavior before deciding whether it also
+    # belongs in image_keys.
     image_keys = overrides.image_keys or [f"observation.images.{k}" for k in data_cfg.robot.camera_keys]
 
     return MolmoAct2Config(
@@ -86,10 +92,14 @@ def build_molmoact2_config(
         image_keys=image_keys,
         setup_type=overrides.setup_type,
         control_mode=overrides.control_mode,
-        # MEAN_STD (not the real default IDENTITY/QUANTILES) so
+        # STATE/ACTION: MEAN_STD (not the real default IDENTITY/QUANTILES) so
         # training/data/stats.py's mean/std-only compute_dataset_stats works
-        # unchanged.
-        normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
+        # unchanged. VISUAL: IDENTITY -- training/model/image_normalization.py
+        # now owns all image scaling instead (applied in train_loop.py/
+        # offload_molmoact2_preprocessing before this policy's preprocessor
+        # runs), so lerobot's own per-FeatureType normalizer must not also
+        # scale images.
+        normalization_mapping={"VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
         optimizer_lr=train_cfg.lr,
         optimizer_vit_lr=overrides.optimizer_vit_lr or train_cfg.lr,
         optimizer_connector_lr=overrides.optimizer_connector_lr or train_cfg.lr,
