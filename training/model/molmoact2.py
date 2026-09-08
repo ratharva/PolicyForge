@@ -62,14 +62,24 @@ def build_molmoact2_config(
         "action": PolicyFeature(type=FeatureType.ACTION, shape=(data_cfg.robot.action_dim,))
     }
 
-    # NOT extended to include depth cameras -- image_keys' effect on
-    # MolmoAct2's own VLM prompt/vision-tower input selection (distinct
-    # from input_features, which just declares dims) hasn't been traced
-    # against the real installed MolmoAct2Config, so silently adding depth
-    # here could have unverified prompt-construction side effects. A depth
-    # camera is still declared as an input_features VISUAL entry above;
-    # confirm real MolmoAct2 behavior before deciding whether it also
-    # belongs in image_keys.
+    # image_keys (distinct from input_features, which just declares dims)
+    # is the ONLY thing that controls which cameras MolmoAct2's own
+    # processor actually extracts and feeds to the vision tower/VLM prompt
+    # -- confirmed by reading processor_molmoact2.py's _resolve_image_keys
+    # directly. The default below (RGB camera_keys only) silently drops
+    # any depth camera: it's still declared as an input_features VISUAL
+    # entry, so it gets normalized/transferred for nothing. Fail fast
+    # instead of guessing this is safe -- an explicit --config-file
+    # model.image_keys (including depth) is the deliberate opt-in once
+    # someone's verified it end to end against a real checkpoint.
+    if overrides.image_keys is None and data_cfg.robot.depth_camera_keys:
+        raise ValueError(
+            f"this dataset has depth camera(s) {data_cfg.robot.depth_camera_keys} but MolmoAct2's "
+            f"image_keys would default to RGB-only cameras {data_cfg.robot.camera_keys}, silently "
+            f"never feeding depth to the model -- pass model.image_keys explicitly via --config-file "
+            f"(including observation.images.depth_<key> for each one) to opt in, or use a dataset "
+            f"without depth cameras for --policy-type molmoact2."
+        )
     image_keys = overrides.image_keys or [f"observation.images.{k}" for k in data_cfg.robot.camera_keys]
 
     return MolmoAct2Config(
