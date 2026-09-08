@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 
 import draccus
@@ -93,7 +94,23 @@ def _load_base_run_config(config_file: str | None) -> RunConfig:
 
 
 def main() -> None:
+    # Checked before parser.parse_args() (and before --tasks/--policy-type,
+    # both required=True below, would reject a bare invocation) so this
+    # works as a standalone, no-other-flags-needed discovery command --
+    # see training/wandb_logging.py's format_metrics_catalog.
+    if "--list-wandb-metrics" in sys.argv:
+        from training.wandb_logging import format_metrics_catalog
+
+        print(format_metrics_catalog())
+        return
+
     parser = argparse.ArgumentParser(description=__doc__)
+    # Registered here too (in addition to the sys.argv check above) purely
+    # so it shows up in --help -- the real check above always short-
+    # circuits before this flag would otherwise need to be parsed.
+    parser.add_argument("--list-wandb-metrics", action="store_true",
+                         help="print every W&B metric group/name this pipeline can emit and exit -- "
+                              "works standalone, no other flags needed")
     parser.add_argument("--tasks", nargs="+", required=True,
                          help="task-name substrings -- must match what training.prepare_data was run with")
     parser.add_argument("--config-file", default=None,
@@ -147,15 +164,31 @@ def main() -> None:
                               "-- off by default. Additive: everything TensorBoard already logs also "
                               "goes to W&B at the same cadences. Needs `wandb` installed "
                               "(see training/requirements.txt) and a real W&B login/API key")
-    parser.add_argument("--wandb-project", default=None, help="W&B project name")
-    parser.add_argument("--wandb-entity", default=None, help="W&B entity (team/user)")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default=None,
+                         help="default: unset -- the WANDB_MODE env var (or wandb's own 'online' "
+                              "default) decides. 'online': real syncing, needs a real login (`wandb "
+                              "login`). 'offline': no network/login needed, writes locally -- good for "
+                              "a smoke test, sync later with `wandb sync`. 'disabled': wandb's own "
+                              "no-op mode. Passing this explicitly overrides WANDB_MODE if both are set")
+    parser.add_argument("--wandb-project", default=None,
+                         help="W&B project name -- default: falls back to the WANDB_PROJECT env var "
+                              "(wandb's own behavior) if set, else wandb's own default")
+    parser.add_argument("--wandb-entity", default=None,
+                         help="W&B entity (team/user) -- default: falls back to the WANDB_ENTITY env "
+                              "var (wandb's own behavior) if set, else wandb's own default")
     parser.add_argument("--wandb-metrics", nargs="+", default=None, metavar="NAME",
                          help="allowlist of metric names to send to W&B (fnmatch globs OK, e.g. "
                               "'perf/*') -- default: everything already being computed. Doesn't "
-                              "affect TensorBoard, which always gets everything")
+                              "affect TensorBoard, which always gets everything. Merged with "
+                              "--wandb-metric-groups below if both are given. Run --list-wandb-metrics "
+                              "to see every real metric name/group")
+    parser.add_argument("--wandb-metric-groups", nargs="+", default=[], metavar="NAME",
+                         help="friendly names for common --wandb-metrics glob groups (e.g. 'core', "
+                              "'perf', 'media') -- run --list-wandb-metrics to see every real group "
+                              "and what it expands to")
     parser.add_argument("--wandb-exclude-metrics", nargs="+", default=[], metavar="NAME",
                          help="denylist of metric names to keep OUT of W&B (fnmatch globs OK), "
-                              "applied after --wandb-metrics")
+                              "applied after --wandb-metrics/--wandb-metric-groups")
     parser.add_argument("--wandb-gif-cameras", nargs="+", default=[], metavar="CAMERA",
                          help="log a short GIF from this camera every --wandb-gif-every-steps, "
                               "sampled from a real recorded episode's own consecutive frames (not a "
@@ -381,9 +414,11 @@ def main() -> None:
         run_cfg.train.profile_steps = profile_steps
     _apply_if_explicit(run_cfg.train, "tensorboard", args, "tensorboard", parser)
     _apply_if_explicit(run_cfg.train, "wandb", args, "wandb", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_mode", args, "wandb_mode", parser)
     _apply_if_explicit(run_cfg.train, "wandb_project", args, "wandb_project", parser)
     _apply_if_explicit(run_cfg.train, "wandb_entity", args, "wandb_entity", parser)
     _apply_if_explicit(run_cfg.train, "wandb_metrics", args, "wandb_metrics", parser)
+    _apply_if_explicit(run_cfg.train, "wandb_metric_groups", args, "wandb_metric_groups", parser)
     _apply_if_explicit(run_cfg.train, "wandb_exclude_metrics", args, "wandb_exclude_metrics", parser)
     _apply_if_explicit(run_cfg.train, "wandb_gif_cameras", args, "wandb_gif_cameras", parser)
     _apply_if_explicit(run_cfg.train, "wandb_gif_every_steps", args, "wandb_gif_every_steps", parser)
@@ -404,6 +439,13 @@ def main() -> None:
             f"multiple of --eval-every-steps {run_cfg.train.eval_every_steps} -- a predicted-frames GIF can "
             f"only be generated when the eval pass itself runs, so any other value would never fire"
         )
+    if run_cfg.train.wandb_metric_groups:
+        try:
+            from training.wandb_logging import expand_metric_groups
+
+            expand_metric_groups(run_cfg.train.wandb_metric_groups)
+        except ValueError as e:
+            parser.error(f"{e} (see --list-wandb-metrics)")
 
     # --- model: make sure run_cfg.model's concrete type actually matches
     # the resolved policy_type before layering any --molmoact2-*/--pi05-*

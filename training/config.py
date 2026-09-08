@@ -151,14 +151,29 @@ class TrainConfig:
     # setup_wandb() -- off by default, additive: everything TensorBoard
     # already logs also goes to W&B at the same cadences when enabled.
     wandb: bool = False
+    # None (default): don't pass a `mode` to wandb.init() at all -- the
+    # WANDB_MODE env var (or wandb's own "online" default) decides, same
+    # as before this flag existed. A real value ("online" | "offline" |
+    # "disabled") passed explicitly OVERRIDES the env var (wandb's own
+    # kwarg-beats-env-var behavior) -- confirmed directly that defaulting
+    # this to "online" instead of None broke WANDB_MODE=offline entirely,
+    # since an explicit kwarg always wins.
+    wandb_mode: str | None = None
     wandb_project: str | None = None
     wandb_entity: str | None = None
     # Allowlist (fnmatch globs OK, e.g. "perf/*") -- None (default) logs
     # every metric already being computed, so turning on --wandb doesn't
-    # silently hide anything unless explicitly filtered.
+    # silently hide anything unless explicitly filtered. Named groups
+    # below expand into and merge with this at setup time -- see
+    # training/wandb_logging.py's METRIC_GROUPS/expand_metric_groups.
     wandb_metrics: list[str] | None = None
     # Denylist (fnmatch globs OK), applied after the allowlist.
     wandb_exclude_metrics: list[str] = field(default_factory=list)
+    # Friendly names for common wandb_metrics glob groups (e.g. "core",
+    # "perf", "media") -- see training/wandb_logging.py's METRIC_GROUPS.
+    # Use --list-wandb-metrics to see every real group/metric name without
+    # reading source or running a training job.
+    wandb_metric_groups: list[str] = field(default_factory=list)
     # Episode-preview GIFs -- which cameras to sample (empty = off, opt-in
     # per camera), how often (None -> reuse eval_every_steps), how many
     # frames per GIF.

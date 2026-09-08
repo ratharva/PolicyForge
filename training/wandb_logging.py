@@ -33,6 +33,69 @@ def filter_metrics(d: dict, include: list[str] | None, exclude: list[str]) -> di
     return out
 
 
+# --- Named metric groups (--wandb-metric-groups) -- friendly names for the
+# glob patterns a user would otherwise have to already know exist. Purely
+# a convenience layer over filter_metrics above: a group name expands to
+# its glob list, which gets merged into the SAME --wandb-metrics allowlist
+# --wandb-exclude-metrics still applies on top of, unchanged.
+METRIC_GROUPS: dict[str, tuple[str, list[str]]] = {
+    "core": ("loss curves at every cadence (train/window/epoch/eval)", ["train/*", "window/*", "epoch/*", "eval/*"]),
+    "perf": ("training/perf_logging.py's --log-perf-metrics output", ["perf/*"]),
+    "media": ("episode-preview + predicted-frames GIFs", ["gif/*", "eval_gif/*"]),
+}
+
+
+def expand_metric_groups(names: list[str]) -> list[str]:
+    """Expands group names (e.g. ["core", "perf"]) into their real glob
+    patterns, deduped. Raises ValueError naming the real available groups
+    on an unknown name -- never silently ignored."""
+    unknown = [n for n in names if n not in METRIC_GROUPS]
+    if unknown:
+        raise ValueError(f"unknown metric group(s) {unknown} -- available: {sorted(METRIC_GROUPS)}")
+    patterns: list[str] = []
+    for name in names:
+        patterns.extend(METRIC_GROUPS[name][1])
+    return list(dict.fromkeys(patterns))
+
+
+# Every concrete metric name/prefix this pipeline actually emits today --
+# one documented place to look instead of grepping train_loop.py/
+# perf_logging.py. Kept in sync by hand (these are real, hardcoded keys at
+# their call sites, not derived) -- see --list-wandb-metrics in train.py.
+# A custom/future PolicyAdapter.extra_metrics or .predict_frames
+# implementation adds MORE keys under train/window/epoch/eval or
+# eval_gif/ respectively that can't be listed here in advance -- see
+# training/model/registry.py.
+KNOWN_METRICS: list[str] = [
+    *(f"{prefix}/{name}" for prefix in ("train", "window", "epoch", "eval") for name in ("loss", "l1_loss", "kld_loss")),
+    "train/lr_group0", "train/lr_group1  (per optimizer param group -- ACT has 2, MolmoAct2 has 4, PI05 is flat)",
+    "perf/data_wait_s", "perf/preprocess_s", "perf/compute_s", "perf/optimizer_step_s",
+    "perf/optimizer_step_s_avg", "perf/io_bound_fraction", "perf/samples_per_sec",
+    "perf/checkpoint_save_s", "perf/effective_batch_size",
+    "perf/gpu_util_pct", "perf/gpu_mem_util_pct  (need nvidia-ml-py installed)",
+    "perf/vram_allocated_mb", "perf/vram_reserved_mb", "perf/vram_peak_mb",
+    "gif/<camera>  (one per --wandb-gif-cameras entry)",
+    "eval_gif/<name>  (only if a policy implements PolicyAdapter.predict_frames)",
+]
+
+
+def format_metrics_catalog() -> str:
+    """Human-readable listing for --list-wandb-metrics -- every named
+    group (with its real glob patterns) plus every concrete metric name
+    this pipeline can emit today."""
+    lines = ["Metric groups (--wandb-metric-groups NAME [NAME ...]):", ""]
+    for name, (description, patterns) in METRIC_GROUPS.items():
+        lines.append(f"  {name:8s} {description}")
+        lines.append(f"           -> {', '.join(patterns)}")
+    lines += [
+        "",
+        "Known metric names/prefixes (--wandb-metrics / --wandb-exclude-metrics, fnmatch globs OK):",
+        "",
+    ]
+    lines += [f"  {m}" for m in KNOWN_METRICS]
+    return "\n".join(lines)
+
+
 def sample_episode_frames(
     v3_root: str, episode_index: int, camera_key: str, n_frames: int,
     image_size: tuple[int, int] | None = None,

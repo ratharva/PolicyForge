@@ -52,6 +52,15 @@ class PolicyAdapter:
     # so W&B's own per-step media history is what shows the improvement
     # over time, no extra "compare across steps" mechanism needed.
     predict_frames: Callable[[Any, dict], dict[str, Any] | None] | None = None
+    # (policy, inputs) -> {metric_name: value}. None (every policy today)
+    # -- train_loop.py skips this entirely. A custom/future adapter that
+    # computes something beyond forward_loss's own metrics dict sets this;
+    # its keys get merged into the SAME step_metrics/eval_step_metrics
+    # dict forward_loss's own metrics already flow through, so they
+    # automatically show up under train/*, window/*, epoch/*, AND eval/*
+    # (both TensorBoard and W&B, subject to the same --wandb-metrics/
+    # --wandb-metric-groups filtering) -- no new plumbing needed.
+    extra_metrics: Callable[[Any, dict], dict[str, float]] | None = None
 
 
 def _act_adapter() -> PolicyAdapter:

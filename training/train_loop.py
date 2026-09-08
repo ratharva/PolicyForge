@@ -223,12 +223,53 @@ def train_loop_per_worker(config: dict) -> None:
     # installed unless --wandb is actually passed.
     wandb_run = None
     if train_cfg.wandb:
-        from ray.air.integrations.wandb import setup_wandb
+        try:
+            from ray.air.integrations.wandb import setup_wandb
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                "--wandb needs the `wandb` package -- it's commented out in training/requirements.txt "
+                "(optional) since most runs don't use it. Run `pip install wandb`, then `wandb login` "
+                "(or pass --wandb-mode offline to skip login for a smoke test)."
+            ) from e
+        # --wandb-mode sets the WANDB_MODE env var itself, rather than
+        # passing mode= as a kwarg to setup_wandb() -- confirmed by reading
+        # ray.air.integrations.wandb._set_api_key's real source that Ray's
+        # OWN pre-check for "should this run require a real API key" only
+        # ever looks at the WANDB_MODE env var, never at a `mode` kwarg
+        # forwarded to wandb.init() -- passing mode="offline" as a kwarg
+        # alone still hit "No WandB API key found" in a real test, because
+        # that pre-check runs BEFORE wandb.init() ever sees the kwarg. Only
+        # set when explicit, so an unset --wandb-mode leaves any
+        # externally-set WANDB_MODE (e.g. from the shell) untouched.
+        if train_cfg.wandb_mode is not None:
+            os.environ["WANDB_MODE"] = train_cfg.wandb_mode
+        try:
+            wandb_run = setup_wandb(
+                config={"run_name": run_cfg.run_name, "policy_type": run_cfg.policy_type},
+                project=train_cfg.wandb_project, entity=train_cfg.wandb_entity, name=run_cfg.run_name,
+            )
+        except Exception as e:
+            # wandb's own exceptions (e.g. wandb.errors.UsageError for "not
+            # logged in") already have a clear message -- just make sure it
+            # isn't buried in Ray's own WorkerGroupError traceback noise,
+            # and point at the no-login escape hatch.
+            raise RuntimeError(
+                f"--wandb failed to start a W&B run: {e} -- pass --wandb-mode offline for a smoke test "
+                f"that needs no login, or run `wandb login` first."
+            ) from e
 
-        wandb_run = setup_wandb(
-            config={"run_name": run_cfg.run_name, "policy_type": run_cfg.policy_type},
-            project=train_cfg.wandb_project, entity=train_cfg.wandb_entity, name=run_cfg.run_name,
-        )
+        # Named metric groups (--wandb-metric-groups) are a convenience
+        # layer over the same allowlist filter_metrics already applies --
+        # expand and merge into wandb_metrics ONCE here, in place. train_cfg
+        # is already a per-worker-local object (Ray re-serializes
+        # train_loop_config per worker), so mutating it is safe and needs
+        # no changes to _log_all/filter_metrics below, which keep reading
+        # train_cfg.wandb_metrics exactly as they already do.
+        if train_cfg.wandb_metric_groups:
+            from training.wandb_logging import expand_metric_groups
+
+            group_patterns = expand_metric_groups(train_cfg.wandb_metric_groups)
+            train_cfg.wandb_metrics = list(dict.fromkeys(group_patterns + (train_cfg.wandb_metrics or [])))
 
     # Episode-preview GIFs (training/wandb_logging.py's sample_episode_frames)
     # -- opt-in per camera. Reads directly from the converted v3 root's own
@@ -341,6 +382,16 @@ def train_loop_per_worker(config: dict) -> None:
                     loss, step_metrics = adapter.forward_loss(policy, inputs)
 
                 (loss / train_cfg.grad_accum).backward()
+
+            # Brand-new metrics a custom/future adapter computes beyond its
+            # own forward_loss (e.g. something a world model wants to
+            # track) -- None for every policy today. Merged into
+            # step_metrics so it automatically flows into train/*/window/*/
+            # epoch/* below, no separate logging path needed. Kept outside
+            # the t_compute timer above -- perf/compute_s should reflect
+            # real forward+backward cost, not an arbitrary extra metric.
+            if adapter.extra_metrics is not None:
+                step_metrics = {**step_metrics, **adapter.extra_metrics(policy, inputs)}
 
             step += 1
             step_ref[0] = step
@@ -481,6 +532,8 @@ def train_loop_per_worker(config: dict) -> None:
                             eval_inputs = eval_batch if adapter.preprocessing_offloaded else preprocessor(eval_batch)
                             last_eval_inputs = eval_inputs
                             eval_loss, eval_step_metrics = adapter.forward_loss(policy, eval_inputs)
+                            if adapter.extra_metrics is not None:
+                                eval_step_metrics = {**eval_step_metrics, **adapter.extra_metrics(policy, eval_inputs)}
                             eval_loss_sum += eval_loss.item()
                             eval_n += 1
                             for k, v in eval_step_metrics.items():
