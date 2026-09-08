@@ -117,6 +117,16 @@ class TrainConfig:
     save_only_on_improvement: bool = False
     checkpoint_max_to_keep: int = 3
 
+    # Opt-in perf instrumentation (training/perf_logging.py) -- off by
+    # default so a normal run pays zero cost: accurate step-timing needs
+    # torch.cuda.synchronize() calls, which serialize async CUDA work and
+    # cost real throughput whenever they're on. See train_loop.py.
+    log_perf_metrics: bool = False
+    # (start_step, end_step) inclusive range to capture a real
+    # torch.profiler trace for -- only meaningful when log_perf_metrics is
+    # also True. None disables profiling entirely.
+    profile_steps: tuple[int, int] | None = None
+
 
 @dataclass
 class RunConfig:

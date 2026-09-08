@@ -88,6 +88,21 @@ def main() -> None:
                               "behavior, not custom logic here")
     parser.add_argument("--num-workers", type=int, default=None,
                          help="Ray Train DDP workers; default = live GPU count")
+
+    # --- perf instrumentation (training/perf_logging.py) ---
+    parser.add_argument("--log-perf-metrics", action="store_true",
+                         help="log GPU utilization/VRAM, per-step timing (data-wait/preprocess/"
+                              "compute/optimizer-step), effective batch size, throughput, and an "
+                              "IO-bound-vs-compute-bound ratio to TensorBoard under perf/* -- off by "
+                              "default since accurate timing needs torch.cuda.synchronize() calls, "
+                              "which cost real throughput whenever they're on. Needs `nvidia-ml-py` "
+                              "installed for GPU compute-utilization %% (perf/gpu_util_pct, "
+                              "perf/gpu_mem_util_pct) -- VRAM stats work without it")
+    parser.add_argument("--profile-steps", default=None, metavar="START:END",
+                         help="capture a real torch.profiler trace for steps START..END (inclusive) "
+                              "into the run's tensorboard/ dir, viewable in TensorBoard's PyTorch "
+                              "Profiler tab -- requires --log-perf-metrics. Keep the range small "
+                              "(rank 0 only, but traces still get large fast)")
     parser.add_argument("--v3-root", default=None,
                          help="where the already-converted LeRobot v3 dataset lives -- local path, "
                               "s3://<bucket>/<prefix>, or gs://<bucket>/<prefix> (default: "
@@ -241,6 +256,24 @@ def main() -> None:
     if missing_max:
         parser.error(f"--image-normalization-max required for camera(s) {sorted(missing_max)} (mode 'depth'/'log')")
 
+    profile_steps = None
+    if args.profile_steps is not None:
+        if not args.log_perf_metrics:
+            parser.error("--profile-steps requires --log-perf-metrics")
+        try:
+            start_str, end_str = args.profile_steps.split(":")
+            profile_steps = (int(start_str), int(end_str))
+        except ValueError:
+            parser.error(f"--profile-steps must look like START:END, got {args.profile_steps!r}")
+        if profile_steps[0] >= profile_steps[1]:
+            parser.error(f"--profile-steps START must be < END, got {args.profile_steps!r}")
+        if profile_steps[1] - profile_steps[0] > 50:
+            print(
+                f"WARNING: --profile-steps {args.profile_steps} covers "
+                f"{profile_steps[1] - profile_steps[0]} steps -- torch.profiler traces get large "
+                f"fast, consider a smaller range (10-20 steps is usually plenty)."
+            )
+
     run_cfg = RunConfig(tasks=args.tasks)
     run_cfg.policy_type = args.policy_type
     run_cfg.train.num_epochs = args.num_epochs
@@ -254,6 +287,8 @@ def main() -> None:
     run_cfg.train.early_stop_patience = args.early_stop_patience if args.early_stop_patience > 0 else None
     run_cfg.train.save_only_on_improvement = args.save_only_on_improvement
     run_cfg.train.checkpoint_max_to_keep = args.checkpoint_max_to_keep
+    run_cfg.train.log_perf_metrics = args.log_perf_metrics
+    run_cfg.train.profile_steps = profile_steps
     if args.policy_type == "molmoact2":
         # RunConfig()'s default `model` is ACTConfigOverrides -- overwritten
         # here now that --policy-type is known.

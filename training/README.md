@@ -82,6 +82,37 @@ python -m training.train --tasks fridge --dataset-source agibot_alpha --policy-t
     --image-normalization-max depth_head=5000
 ```
 
+## Performance instrumentation
+
+General flags -- apply regardless of `--policy-type`. Off by default:
+accurate step timing needs `torch.cuda.synchronize()` calls, which
+serialize async CUDA work and cost real throughput whenever they're on, so
+this is opt-in rather than always-on.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--log-perf-metrics` | off | logs GPU utilization/VRAM, per-step timing (`perf/data_wait_s`/`preprocess_s`/`compute_s`/`optimizer_step_s`), effective batch size, throughput (`perf/samples_per_sec`), and an IO-bound-vs-compute-bound ratio (`perf/io_bound_fraction`) to TensorBoard under `perf/*`. Needs `nvidia-ml-py` installed for GPU compute-utilization % (`perf/gpu_util_pct`, `perf/gpu_mem_util_pct`) -- VRAM stats (`perf/vram_*`) work without it; missing `nvidia-ml-py` just skips those two, logged once as a warning, not a crash |
+| `--profile-steps START:END` | none | requires `--log-perf-metrics`. Captures a real `torch.profiler` trace for steps `START..END` (inclusive) into the run's `tensorboard/` dir -- viewable in TensorBoard's PyTorch Profiler tab, same `tensorboard --logdir` command as everything else. Rank 0 only. Keep the range small (10-20 steps is usually plenty) -- traces get large fast; a range over 50 steps prints a warning |
+
+`perf/io_bound_fraction` is `data_wait_s / (data_wait_s + preprocess_s +
+compute_s)` per window -- loosely, high (>0.3-0.5) + low `gpu_util_pct`
+means IO-bound (more Ray Data actors/CPU, bigger prefetch buffer, faster
+decode is the fix); low + high `gpu_util_pct` means compute-bound (bigger
+batch, mixed precision, model-side work is the fix). `perf/checkpoint_save_s`
+is logged whenever a checkpoint actually writes -- without it, a periodic
+step-time spike every `--eval-every-steps` looks like unexplained noise
+instead of "checkpointing is slow."
+
+```bash
+# Find out whether a run is IO- or compute-bound
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --log-perf-metrics --max-train-steps 200
+
+# Same, plus a kernel-level trace of steps 50-65 for a deeper look
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --log-perf-metrics --profile-steps 50:65 --max-train-steps 200
+```
+
 ## Resuming a run
 
 There's no `--resume` flag -- re-running with the **same `--run-name`**
