@@ -411,7 +411,7 @@ def wipe_dataset(root: str) -> None:
 
     Refuses to wipe root/home-shaped paths or anything missing
     meta/conversion_params.json -- that file (not meta/info.json, which any
-    LeRobot v3 dataset has regardless of who wrote it) is OpenPolicyKernel's
+    LeRobot v3 dataset has regardless of who wrote it) is RoboPolicyKernel's
     own marker."""
     fs, fs_root = open_fs(root)
     if "://" not in root:

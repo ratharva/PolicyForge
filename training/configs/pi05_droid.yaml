@@ -18,7 +18,7 @@
 train:
   num_epochs: 5
   batch_size: 8
-  eval_every_steps: 200
+  window_every_steps: 200
 
 model:
   type: pi05

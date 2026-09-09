@@ -51,9 +51,11 @@ No data-prep flags here; those all live on `prepare_data.py`.
 | `--num-epochs` | `1` | full passes over the dataset |
 | `--batch-size` | `8` | |
 | `--max-train-steps` | none (full run) | cap total steps -- use for a smoke run |
-| `--eval-every-steps` | `200` | report/checkpoint/early-stop-check granularity, in steps |
-| `--early-stop-patience` | `5` | stop after this many eval windows with no loss improvement; `0` or negative disables it |
-| `--save-only-on-improvement` | off (checkpoint every report) | only write a checkpoint when the loss improves -- less write I/O, but a resume after an interruption can lose progress back to the last improvement |
+| `--window-every-steps` | `200` | TRAINING-loss report/early-stop-check granularity, in steps -- unrelated to val/test, which have their own cadence |
+| `--early-stop-patience` | `5` | stop after this many windows with no TRAINING-loss improvement; `0` or negative disables it |
+| `--val-split-fraction` | `0.1` | hold out this fraction of episodes for a periodic val pass that DRIVES CHECKPOINT RETENTION -- on by default; `0` disables it. Mutually exclusive with `--val-v3-root` (a wholly separate, already-prepared v3 root, used in full instead of a slice) |
+| `--test-split-fraction` | none (disabled) | fully opt-in -- a one-time test pass after training completes, logged under `test/*`, never attaches a checkpoint. Mutually exclusive with `--test-v3-root` |
+| `--save-only-on-improvement` | off (checkpoint every report) | only write a checkpoint when the loss improves (val loss, once val is active) -- less write I/O, but a resume after an interruption can lose progress back to the last improvement |
 | `--checkpoint-max-to-keep` | `3` | max checkpoints kept on disk -- with the default (every report checkpointed), this is the N best-scoring PLUS the single most recent checkpoint (for resuming), even when it isn't among the N best -- native Ray Train behavior, see [5. View results](05-view-results.md) |
 | `--num-workers` | live GPU count | Ray Train DDP workers |
 | `--v3-root` | `training/lerobot_v3/<dataset-source>/<sorted tasks>` (needs `--dataset-source` to derive this) | where the already-converted dataset is read from -- must already exist |
@@ -77,7 +79,7 @@ python -m training.train --tasks arrange_the_flowers --dataset-source abc130k --
 # Full run, tuned: longer patience, non-default storage location
 python -m training.train --tasks arrange_the_flowers box_folding \
     --dataset-source abc130k --policy-type act \
-    --num-epochs 3 --batch-size 16 --eval-every-steps 100 --early-stop-patience 8 \
+    --num-epochs 3 --batch-size 16 --window-every-steps 100 --early-stop-patience 8 \
     --storage-root /mnt/shared_storage/act_training --run-name flowers-boxes-v2
 ```
 

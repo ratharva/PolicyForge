@@ -134,18 +134,24 @@ class TrainConfig:
     lr_backbone: float = 1e-5
     weight_decay: float = 1e-4
     max_train_steps: int | None = None
-    # Step-windowed reporting: finer-grained than per-epoch, so early
-    # stopping/best-checkpoint scoring get more than one data point even
-    # with num_epochs=1.
-    eval_every_steps: int = 200
-    # Stop once the windowed loss hasn't improved for this many windows in a
-    # row. None disables early stopping.
+    # Step-windowed reporting of TRAINING loss: finer-grained than
+    # per-epoch, so early stopping gets more than one data point even with
+    # num_epochs=1. Unrelated to the val/test split below -- this is
+    # purely a training-loss cadence.
+    window_every_steps: int = 200
+    # Stop once the windowed TRAINING loss hasn't improved for this many
+    # windows in a row. None disables early stopping. Deliberately stays
+    # training-loss-based even when a val split is active.
     early_stop_patience: int | None = 5
     # False (default): a checkpoint is written on every report, scored by
     # loss. Ray Train's checkpoint manager keeps the best N by score PLUS
     # the single most recently written one, which is what a resume picks up
     # from. True: only checkpoint when the loss improves -- less write I/O,
     # but a resume can lose progress back to the last improvement.
+    # NOTE: whenever a val split is active, checkpoint attachment moves to
+    # the val pass (see train_loop.py) -- this flag then gates val's OWN
+    # improvement (val loss, not training loss); the windowed block stops
+    # attaching checkpoints at all in that case (val owns retention).
     save_only_on_improvement: bool = False
     checkpoint_max_to_keep: int = 3
 
@@ -192,32 +198,55 @@ class TrainConfig:
     # reading source or running a training job.
     wandb_metric_groups: list[str] = field(default_factory=list)
     # Episode-preview GIFs -- which cameras to sample (empty = off, opt-in
-    # per camera), how often (None -> reuse eval_every_steps), how many
-    # frames per GIF.
+    # per camera), how often (None -> reuse the effective val cadence,
+    # val_every_steps or window_every_steps), how many frames per GIF.
+    # Sampling pool is VAL's episodes (never test's) whenever a val split
+    # is active; anywhere in the dataset otherwise.
     wandb_gif_cameras: list[str] = field(default_factory=list)
     wandb_gif_every_steps: int | None = None
     wandb_gif_frames: int = 30
     # Predicted-frames GIFs (PolicyAdapter.predict_frames -- see
     # training/model/registry.py; inert for every policy today, groundwork
     # for a future world-model-style policy) -- how often to log them,
-    # relative to the eval pass they're generated inside (see
-    # train_loop.py): None (default) logs one every eval pass; a real
-    # value only logs one every Nth eval pass at that step multiple, e.g.
-    # eval_every_steps=200 + this=1000 logs one every 5th eval pass. Can
-    # only ever be a multiple of eval_every_steps -- generating these
-    # needs a real eval batch, which only exists when the eval pass itself
-    # runs, unlike wandb_gif_every_steps above (real recorded episodes,
-    # no eval batch needed, so that one can use any cadence).
+    # relative to the VAL pass they're generated inside (see
+    # train_loop.py): None (default) logs one every val pass; a real value
+    # only logs one every Nth val pass at that step multiple. Can only
+    # ever be a multiple of the EFFECTIVE val cadence (val_every_steps or,
+    # when unset, window_every_steps) -- generating these needs a real val
+    # batch, which only exists when the val pass itself runs, unlike
+    # wandb_gif_every_steps above (real recorded episodes, no val batch
+    # needed, so that one can use any cadence).
     wandb_predict_frames_every_steps: int | None = None
 
-    # None (default): no held-out split, no real eval/inference pass --
-    # episode-preview GIFs sample from anywhere in the dataset. A real
-    # fraction (0 < x < 1): that fraction of episodes is held out of
-    # TRAINING entirely and used for a real eval pass (reusing
-    # adapter.forward_loss under torch.no_grad()) at the eval_every_steps
-    # cadence, and GIFs sample specifically from the held-out set. See
-    # training/data/ray_dataset.py's split_by_episode.
-    eval_split_fraction: float | None = None
+    # Val: on by default (0.1 = 10% of episodes held out of TRAINING
+    # entirely, used for a real periodic eval pass that drives checkpoint
+    # retention -- see train_loop.py). 0/None disables it: falls back to
+    # byte-for-byte today's behavior (no held-out split, windowed/epoch-end
+    # blocks keep attaching checkpoints from training loss, GIFs sample
+    # from anywhere). Ignored (must be left at 0/None) when val_v3_root is
+    # set instead -- see train.py's CLI validation.
+    val_split_fraction: float | None = 0.1
+    # Val's own report/checkpoint cadence; None (default) reuses
+    # window_every_steps so the common case needs no extra flag.
+    val_every_steps: int | None = None
+    # Caps the periodic val pass to this many batches per rank per window
+    # (tune down if val is taking too long relative to window_every_steps;
+    # tune up -- or leave -- for a more thorough val loss estimate). The
+    # one-time end-of-training test pass (below) is deliberately NOT
+    # capped by this -- it evaluates its whole split exactly once.
+    val_max_batches: int = 50
+    # None (default): reuse batch_size. Eval has no optimizer-state/
+    # gradient memory overhead, so a larger batch is often safe here and
+    # reduces per-batch Python/dispatch overhead -- used for both the
+    # periodic val pass and the one-time test pass.
+    val_batch_size: int | None = None
+
+    # Test: fully opt-in (None/0 = disabled, same shape as val_split_fraction).
+    # Evaluated exactly once, after training completes, against episodes
+    # NEVER touched during training or val -- never influences checkpoint
+    # retention (see train_loop.py's one-time test block). Ignored (must be
+    # left at 0/None) when test_v3_root is set instead.
+    test_split_fraction: float | None = None
 
 
 @dataclass

@@ -44,11 +44,11 @@ class PolicyAdapter:
     # visual frames (e.g. a world model) -- ACT/MolmoAct2/PI05 all only
     # ever predict actions (confirmed: every one of their output_features
     # dicts declares "action" and nothing visual), so this is None for all
-    # three today and train_loop.py's eval pass silently skips the
+    # three today and train_loop.py's val pass silently skips the
     # predicted-frames GIF entirely when it's unset. A future adapter that
     # DOES predict frames sets this and gets "watch the generated frames
-    # improve across training" for free -- see train_loop.py's eval-pass
-    # block, logged under eval_gif/<key> at the same step as the eval pass,
+    # improve across training" for free -- see train_loop.py's val-pass
+    # block, logged under val_gif/<key> at the same step as the val pass,
     # so W&B's own per-step media history is what shows the improvement
     # over time, no extra "compare across steps" mechanism needed.
     predict_frames: Callable[[Any, dict], dict[str, Any] | None] | None = None
@@ -57,9 +57,9 @@ class PolicyAdapter:
     # computes something beyond forward_loss's own metrics dict sets this;
     # its keys get merged into the SAME step_metrics/eval_step_metrics
     # dict forward_loss's own metrics already flow through, so they
-    # automatically show up under train/*, window/*, epoch/*, AND eval/*
-    # (both TensorBoard and W&B, subject to the same --wandb-metrics/
-    # --wandb-metric-groups filtering) -- no new plumbing needed.
+    # automatically show up under train/*, window/*, epoch/*, val/*, AND
+    # test/* (both TensorBoard and W&B, subject to the same
+    # --wandb-metrics/--wandb-metric-groups filtering) -- no new plumbing needed.
     extra_metrics: Callable[[Any, dict], dict[str, float]] | None = None
 
 

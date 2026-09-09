@@ -39,9 +39,12 @@ def filter_metrics(d: dict, include: list[str] | None, exclude: list[str]) -> di
 # its glob list, which gets merged into the SAME --wandb-metrics allowlist
 # --wandb-exclude-metrics still applies on top of, unchanged.
 METRIC_GROUPS: dict[str, tuple[str, list[str]]] = {
-    "core": ("loss curves at every cadence (train/window/epoch/eval)", ["train/*", "window/*", "epoch/*", "eval/*"]),
+    "core": (
+        "loss curves at every cadence (train/window/epoch/val/test)",
+        ["train/*", "window/*", "epoch/*", "val/*", "test/*"],
+    ),
     "perf": ("training/perf_logging.py's --log-perf-metrics output", ["perf/*"]),
-    "media": ("episode-preview + predicted-frames GIFs", ["gif/*", "eval_gif/*"]),
+    "media": ("episode-preview + predicted-frames GIFs", ["gif/*", "val_gif/*"]),
 }
 
 
@@ -63,11 +66,15 @@ def expand_metric_groups(names: list[str]) -> list[str]:
 # perf_logging.py. Kept in sync by hand (these are real, hardcoded keys at
 # their call sites, not derived) -- see --list-wandb-metrics in train.py.
 # A custom/future PolicyAdapter.extra_metrics or .predict_frames
-# implementation adds MORE keys under train/window/epoch/eval or
-# eval_gif/ respectively that can't be listed here in advance -- see
+# implementation adds MORE keys under train/window/epoch/val/test or
+# val_gif/ respectively that can't be listed here in advance -- see
 # training/model/registry.py.
 KNOWN_METRICS: list[str] = [
-    *(f"{prefix}/{name}" for prefix in ("train", "window", "epoch", "eval") for name in ("loss", "l1_loss", "kld_loss")),
+    *(
+        f"{prefix}/{name}"
+        for prefix in ("train", "window", "epoch", "val", "test")
+        for name in ("loss", "l1_loss", "kld_loss")
+    ),
     "train/lr_group0", "train/lr_group1  (per optimizer param group -- ACT has 2, MolmoAct2 has 4, PI05 is flat)",
     "perf/data_wait_s", "perf/preprocess_s", "perf/compute_s", "perf/optimizer_step_s",
     "perf/optimizer_step_s_avg", "perf/io_bound_fraction", "perf/samples_per_sec",
@@ -75,7 +82,7 @@ KNOWN_METRICS: list[str] = [
     "perf/gpu_util_pct", "perf/gpu_mem_util_pct  (need nvidia-ml-py installed)",
     "perf/vram_allocated_mb", "perf/vram_reserved_mb", "perf/vram_peak_mb",
     "gif/<camera>  (one per --wandb-gif-cameras entry)",
-    "eval_gif/<name>  (only if a policy implements PolicyAdapter.predict_frames)",
+    "val_gif/<name>  (only if a policy implements PolicyAdapter.predict_frames)",
 ]
 
 

@@ -19,7 +19,7 @@ train:
   lr_backbone: 1.0e-5
   grad_accum: 1
   weight_decay: 1.0e-4
-  eval_every_steps: 200
+  window_every_steps: 200
   early_stop_patience: 5
   checkpoint_max_to_keep: 3
 

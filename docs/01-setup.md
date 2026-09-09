@@ -41,7 +41,7 @@ may honor additional variables not listed. Not every run needs all of these.
 | `WANDB_MODE` | wandb's own default (`online`) | same effect as `--wandb-mode`; the CLI flag wins if both are set |
 | `WANDB_PROJECT` / `WANDB_ENTITY` | none | fallback for `--wandb-project`/`--wandb-entity` when those flags aren't passed -- wandb's own env-var convention, not this project's |
 | `LEROBOT_S3_ANON` | unset (real credentials expected) | set to `1`/`true`/`yes` for anonymous, no-credential access to a public `s3://` dataset source (read in `training/vendor/lerobot_datasource.py`) |
-| `OPENPOLICYKERNEL_DASHBOARD_HOST` (or the deprecated `POLICYFORGE_DASHBOARD_HOST`, still honored as a fallback) | `127.0.0.1` (loopback-only) | exposes Ray's dashboard beyond localhost -- it has no built-in auth, so this prints a warning; SSH-tunnel instead (`ssh -L 8265:localhost:8265 <host>`) unless you specifically need this |
+| `ROBOPOLICYKERNEL_DASHBOARD_HOST` (or the deprecated `POLICYFORGE_DASHBOARD_HOST`, still honored as a fallback) | `127.0.0.1` (loopback-only) | exposes Ray's dashboard beyond localhost -- it has no built-in auth, so this prints a warning; SSH-tunnel instead (`ssh -L 8265:localhost:8265 <host>`) unless you specifically need this |
 | `RAY_DEDUP_LOGS` | `1` (Ray's own default -- dedupes identical log lines across workers) | set to `0` if you want every worker's identical log line printed separately instead of collapsed -- a real Ray feature, not something this project adds |
 
 ## One environment covers every policy and every dataset
