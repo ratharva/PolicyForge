@@ -10,15 +10,20 @@ Run everything from the repo root (parent of `training/`), as
 import ...`, `from training.vendor.lerobot_datasource import ...`) need it
 on the path.
 
-`HF_TOKEN` is only needed by `training/prepare_data.py` (and
-`training/data_prep/verify_decode.py`) -- `train.py` never talks to a raw
-dataset source, only an already-converted local/cloud LeRobot v3 root, so it
-never needs a token.
+`HF_TOKEN` is needed by `training/prepare_data.py` (and
+`training/data_prep/verify_decode.py`) for a gated raw dataset source --
+`train.py` never talks to a raw dataset source itself, only an already-
+converted local/cloud LeRobot v3 root, so it never needs a token *for the
+dataset*. `--policy-type pi05` is a real exception: `train.py` still needs
+`HF_TOKEN` in that case, for a *different* reason -- see the Environment
+variables table below.
 
 ## Environment variables
 
-Every real env var this pipeline (or a library it calls) reads, in one
-place -- not every run needs all of these.
+Project-specific and commonly needed environment variables are summarized
+here; third-party libraries (e.g. boto3/gcloud's own ambient credential
+chains for `s3://`/`gs://` sources -- see `training/data_prep/source.py`)
+may honor additional variables not listed. Not every run needs all of these.
 
 **Required, situationally:**
 
