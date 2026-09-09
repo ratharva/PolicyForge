@@ -1,4 +1,4 @@
-# PolicyForge
+# OpenPolicyKernel
 
 A Ray Data + Ray Train pipeline for finetuning robot-learning policies on
 robot teleop data. Multi-policy and multi-dataset by design -- ACT,

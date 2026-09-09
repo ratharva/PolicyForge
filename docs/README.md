@@ -1,4 +1,4 @@
-# PolicyForge docs
+# OpenPolicyKernel docs
 
 Ray Data + Ray Train pipeline, split into two independent halves: **data
 prep** (`training/data_prep/` + `training/prepare_data.py`) discovers/

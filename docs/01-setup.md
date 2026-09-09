@@ -10,10 +10,39 @@ Run everything from the repo root (parent of `training/`), as
 import ...`, `from training.vendor.lerobot_datasource import ...`) need it
 on the path.
 
-`HF_TOKEN` is only needed by `training/prepare_data.py` (and
-`training/data_prep/verify_decode.py`) -- `train.py` never talks to a raw
-dataset source, only an already-converted local/cloud LeRobot v3 root, so it
-never needs a token.
+`HF_TOKEN` is needed by `training/prepare_data.py` (and
+`training/data_prep/verify_decode.py`) for a gated raw dataset source --
+`train.py` never talks to a raw dataset source itself, only an already-
+converted local/cloud LeRobot v3 root, so it never needs a token *for the
+dataset*. `--policy-type pi05` is a real exception: `train.py` still needs
+`HF_TOKEN` in that case, for a *different* reason -- see the Environment
+variables table below.
+
+## Environment variables
+
+Project-specific and commonly needed environment variables are summarized
+here; third-party libraries (e.g. boto3/gcloud's own ambient credential
+chains for `s3://`/`gs://` sources -- see `training/data_prep/source.py`)
+may honor additional variables not listed. Not every run needs all of these.
+
+**Required, situationally:**
+
+| Variable | When | Notes |
+|---|---|---|
+| `HF_TOKEN` | `prepare_data.py`/`verify_decode.py` against a gated `hf://` source | see above -- `train.py` never needs it for the dataset itself |
+| `HF_TOKEN` | `--policy-type pi05` at train time, regardless of dataset | π0.5's tokenizer loads from `google/paligemma-3b-pt-224`, a *separate* gated repo from whatever `--pi05-pretrained-path` checkpoint you use -- accept its license on huggingface.co too, or the run fails with a real `GatedRepoError` deep inside the first training step |
+| `WANDB_API_KEY` (or run `wandb login` once) | `--wandb` with the default `--wandb-mode online` | not read by this project's own code -- the `wandb` library itself requires it. Skip with `--wandb-mode offline` for a no-login smoke test |
+
+**Optional:**
+
+| Variable | Default if unset | Notes |
+|---|---|---|
+| `HF_HOME` / `HUGGINGFACE_HUB_CACHE` | `~/.cache/huggingface` | redirect the HF download cache to a bigger volume before a large `prepare_data.py` run |
+| `WANDB_MODE` | wandb's own default (`online`) | same effect as `--wandb-mode`; the CLI flag wins if both are set |
+| `WANDB_PROJECT` / `WANDB_ENTITY` | none | fallback for `--wandb-project`/`--wandb-entity` when those flags aren't passed -- wandb's own env-var convention, not this project's |
+| `LEROBOT_S3_ANON` | unset (real credentials expected) | set to `1`/`true`/`yes` for anonymous, no-credential access to a public `s3://` dataset source (read in `training/vendor/lerobot_datasource.py`) |
+| `OPENPOLICYKERNEL_DASHBOARD_HOST` (or the deprecated `POLICYFORGE_DASHBOARD_HOST`, still honored as a fallback) | `127.0.0.1` (loopback-only) | exposes Ray's dashboard beyond localhost -- it has no built-in auth, so this prints a warning; SSH-tunnel instead (`ssh -L 8265:localhost:8265 <host>`) unless you specifically need this |
+| `RAY_DEDUP_LOGS` | `1` (Ray's own default -- dedupes identical log lines across workers) | set to `0` if you want every worker's identical log line printed separately instead of collapsed -- a real Ray feature, not something this project adds |
 
 ## One environment covers every policy and every dataset
 
