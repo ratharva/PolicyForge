@@ -1,0 +1,31 @@
+# Sample --config-file for --policy-type pi05 using the official
+# lerobot/pi05_droid checkpoint (a real, verified, ungated HF Hub repo --
+# confirmed directly: real config.json + model.safetensors, type "pi05").
+#
+#   python -m training.train --tasks droid_100_test --dataset-source droid_100 \
+#       --policy-type pi05 --config-file training/configs/pi05_droid.yaml
+#
+# chunk_size/n_action_steps=15 matches this checkpoint's OWN real config.json
+# (confirmed via hf_hub_download) -- training/model/pi05.py passes our own
+# built config into PI05Policy.from_pretrained(..., config=cfg), which
+# overrides whatever chunk_size the checkpoint itself was trained with, so
+# this must be set explicitly to match rather than left at this pipeline's
+# own default (50).
+#
+# --tasks/--policy-type are still required on the command line -- see
+# training/README.md's "Config files" section.
+
+train:
+  num_epochs: 5
+  batch_size: 8
+  eval_every_steps: 200
+
+model:
+  type: pi05
+  pretrained_path: lerobot/pi05_droid
+  chunk_size: 15
+  n_action_steps: 15
+  freeze_vision_encoder: false
+  train_expert_only: false
+  gradient_checkpointing: true
+  empty_cameras: 0
