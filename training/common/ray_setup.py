@@ -6,6 +6,22 @@ import os
 import ray
 
 
+def _quiet_placement_group_cleaner() -> None:
+    """worker_process_setup_hook -- runs once per Ray worker process at
+    startup. Silences PlacementGroupCleaner's own benign, high-frequency
+    "State API may be temporarily unavailable" warning (it just means its
+    periodic health-check query failed and it's retrying -- see
+    ray/train/v2/_internal/execution/controller/placement_group_cleaner.py)
+    without touching any other Ray-internal logger's level, unlike a
+    blanket ray.LoggingConfig(log_level=...) which would hide every Ray
+    WARNING everywhere."""
+    import logging
+
+    logging.getLogger(
+        "ray.train.v2._internal.execution.controller.placement_group_cleaner"
+    ).setLevel(logging.ERROR)
+
+
 def build_runtime_env(storage_root: str | None = None) -> dict:
     """working_dir="." ships the repo root so `training.*` imports resolve
     identically on Ray workers. excludes keeps secrets, caches, converted
@@ -27,7 +43,10 @@ def build_runtime_env(storage_root: str | None = None) -> dict:
             rel = None  # e.g. different drive on Windows
         if rel and not rel.startswith(".."):
             excludes.append(f"{rel}/**")
-    return {"working_dir": ".", "excludes": excludes}
+    return {
+        "working_dir": ".", "excludes": excludes,
+        "worker_process_setup_hook": _quiet_placement_group_cleaner,
+    }
 
 
 def connect_ray(runtime_env: dict) -> "ray.runtime_context.RuntimeContext":
