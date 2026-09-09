@@ -63,6 +63,13 @@ class MolmoAct2ConfigOverrides(PolicyOverrides):
     lora_dropout: float = 0.05
     lora_bias: str = "none"
     gradient_checkpointing: bool = True   # our own default; real MolmoAct2Config default is False
+    # "bfloat16" (real MolmoAct2Config default already) or "float32"/"float16".
+    # Unlike PI05, MolmoAct2Config.model_dtype already defaults to bfloat16
+    # upstream and drives a real torch.autocast(dtype=model_dtype) context
+    # (confirmed in modeling_molmoact2.py) -- this pipeline was already
+    # getting that benefit by not touching the field; this just makes it a
+    # real, user-selectable override (e.g. float32 to debug a numerics issue).
+    dtype: str = "bfloat16"
     image_keys: list[str] | None = None   # None -> derived from data_cfg.robot.camera_keys at build time
     setup_type: str = ""     # REQUIRED free-text embodiment prompt, validated non-empty at build time
     control_mode: str = ""   # REQUIRED free-text control-mode prompt, validated non-empty at build time

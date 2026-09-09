@@ -328,6 +328,11 @@ def main() -> None:
                          help="Ray Data actor-pool size for --molmoact2-offload-tokenization -- "
                               "default: derived from live CPU count, same convention as "
                               "--max-concurrent for conversion")
+    parser.add_argument("--molmoact2-dtype", choices=("bfloat16", "float32", "float16"), default="bfloat16",
+                         help="drives a real torch.autocast(dtype=...) context (confirmed in "
+                              "modeling_molmoact2.py) -- bfloat16 is MolmoAct2Config's own real default "
+                              "already, so this pipeline was already getting that benefit; exposed here "
+                              "as a real override (e.g. float32 to debug a numerics issue)")
 
     # --- pi05 ---
     parser.add_argument("--pi05-pretrained-path", default="",
@@ -495,6 +500,7 @@ def main() -> None:
         _apply_if_explicit(m, "distributed_strategy", args, "molmoact2_distributed_strategy", parser)
         _apply_if_explicit(m, "fsdp_cpu_offload", args, "molmoact2_fsdp_cpu_offload", parser)
         _apply_if_explicit(m, "offload_tokenization", args, "molmoact2_offload_tokenization", parser)
+        _apply_if_explicit(m, "dtype", args, "molmoact2_dtype", parser)
         if not m.setup_type or not m.control_mode:
             parser.error(
                 "--molmoact2-setup-type and --molmoact2-control-mode are required when --policy-type "

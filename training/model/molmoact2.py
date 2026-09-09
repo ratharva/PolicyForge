@@ -99,6 +99,7 @@ def build_molmoact2_config(
         lora_dropout=overrides.lora_dropout,
         lora_bias=overrides.lora_bias,
         gradient_checkpointing=overrides.gradient_checkpointing,
+        model_dtype=overrides.dtype,
         image_keys=image_keys,
         setup_type=overrides.setup_type,
         control_mode=overrides.control_mode,
