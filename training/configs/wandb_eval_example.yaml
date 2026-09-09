@@ -1,6 +1,7 @@
 # Sample --config-file showing W&B logging, metric filtering, episode-
-# preview GIFs, and a real held-out eval split -- see training/README.md's
-# "W&B" section for what each field means.
+# preview GIFs, and the val/test split -- see training/README.md's
+# "General flags" table and "Checkpoint retention" section for what each
+# field means.
 #
 #   WANDB_MODE=offline python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \
 #       --policy-type act --config-file training/configs/wandb_eval_example.yaml
@@ -12,43 +13,53 @@
 
 train:
   batch_size: 8
-  eval_every_steps: 200
+  window_every_steps: 200
 
   # TensorBoard/W&B are independently toggleable -- this keeps both on
   # (tensorboard defaults to true; set it to false here to drop it and
   # keep only W&B).
   tensorboard: true
   wandb: true
-  wandb_project: openpolicykernel
+  wandb_project: robopolicykernel
   # wandb_entity: your-team-or-username
 
   # Allowlist: only these (plus anything matching a glob) go to W&B --
   # comment this out (or set to null) to send everything, same as
   # TensorBoard already does. Keys are always logged PREFIXED by report
-  # kind (e.g. "train/loss", "window/loss", "epoch/loss", "eval/loss" --
-  # see train_loop.py's _log_all), so a bare "loss" pattern matches
-  # nothing; "*/loss" matches all four. Also includes both GIF namespaces
-  # (gif/* for episode-preview, eval_gif/* for predict_frames), since
-  # wandb_gif_cameras below is on and media logging is filtered the same
-  # way scalar metrics are.
-  wandb_metrics: ["*/loss", "*/l1_loss", "*/kld_loss", "perf/*", "gif/*", "eval_gif/*"]
+  # kind (e.g. "train/loss", "window/loss", "epoch/loss", "val/loss",
+  # "test/loss" -- see train_loop.py's _log_all), so a bare "loss" pattern
+  # matches nothing; "*/loss" matches all five. Also includes both GIF
+  # namespaces (gif/* for episode-preview, val_gif/* for predict_frames),
+  # since wandb_gif_cameras below is on and media logging is filtered the
+  # same way scalar metrics are.
+  wandb_metrics: ["*/loss", "*/l1_loss", "*/kld_loss", "perf/*", "gif/*", "val_gif/*"]
   # Denylist, applied after the allowlist above.
   wandb_exclude_metrics: [perf/checkpoint_save_s]
 
   # Episode-preview GIFs: a real recorded episode's own consecutive
   # frames (not a shuffled training batch), logged to W&B every
-  # wandb_gif_every_steps (here, same as eval_every_steps since it's
-  # unset -- set it to a different value to decouple the two cadences).
+  # wandb_gif_every_steps (here, same as the effective val cadence since
+  # it's unset -- set it to a different value to decouple the two
+  # cadences). Sampled from val's held-out episodes whenever val is
+  # active (it is here, by default), else anywhere in the dataset.
   wandb_gif_cameras: [top]
   wandb_gif_frames: 30
 
-  # Real held-out eval split -- 20% of episodes never appear in training
-  # at all; a real policy.eval()/no_grad() pass runs on them every
-  # eval_every_steps, logged under eval/*, and the GIFs above sample
-  # specifically from this held-out set instead of anywhere in the
-  # dataset. Omit/null this field for the default (no split, no eval
-  # pass, GIFs from anywhere) -- see training/README.md.
-  eval_split_fraction: 0.2
+  # Val: on by default (see training/config.py's TrainConfig) -- 20% of
+  # episodes here never appear in training at all; a real
+  # policy.eval()/inference_mode() pass runs on them every val_every_steps
+  # (unset here -> reuses window_every_steps), logged under val/*, and
+  # DRIVES CHECKPOINT RETENTION (checkpoint_score_attribute reads val
+  # loss, not training loss, whenever val is active) -- see
+  # training/README.md. Pass 0 to disable (byte-for-byte pre-val-split
+  # behavior: windowed/epoch-end checkpoints scored by training loss).
+  val_split_fraction: 0.2
+
+  # Test: fully opt-in -- a separate 10% of episodes NEVER touched during
+  # training or val, evaluated exactly once after training completes,
+  # logged under test/*. Never attaches a checkpoint (can't influence
+  # retention by construction). Omit/null to skip the test pass entirely.
+  test_split_fraction: 0.1
 
 model:
   type: act

@@ -16,7 +16,7 @@ even when a file sets them too (see each file's own header comment).
 | `molmoact2_fft_example.yaml` | MolmoAct2, full fine-tune under FSDP2 -- per-group learning rates |
 | `pi05_example.yaml` | pi05 -- the required `pretrained_path` |
 | `agibot_action_space_example.yaml` | The `data:` section -- action-space selection, delta actions, per-camera image normalization (including a depth camera) |
-| `wandb_eval_example.yaml` | W&B logging, metric allow/deny-listing, episode-preview GIFs, and a real held-out eval split |
+| `wandb_eval_example.yaml` | W&B logging, metric allow/deny-listing, episode-preview GIFs, and the val/test split |
 
 ```bash
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k \

@@ -288,40 +288,76 @@ def transpose_for_training(
 
 
 # ---------------------------------------------------------------------------
-# Held-out eval split (opt-in -- --eval-split-fraction, see training/train_loop.py)
+# Held-out val/test split (val on by default, test opt-in -- see
+# training/train_loop.py and TrainConfig.val_split_fraction/test_split_fraction)
 # ---------------------------------------------------------------------------
 
 
-def _episode_in_eval(row: dict, seed: int, eval_fraction: float) -> bool:
-    """Deterministic hash of (seed, episode_index) -> True/False, NOT
-    `episode_index % N`, which biases unevenly at odd fractions (e.g. 0.3
-    would systematically favor certain residues depending on how episode
-    ids are distributed) -- a hash spreads membership uniformly regardless
-    of eval_fraction's value, and is reproducible across a run (same seed
-    -> same split) without persisting anything."""
+def _episode_frac(row: dict, seed: int) -> float:
+    """Deterministic hash of (seed, episode_index) -> a value in [0, 1),
+    NOT `episode_index % N`, which biases unevenly at odd fractions (e.g.
+    0.3 would systematically favor certain residues depending on how
+    episode ids are distributed) -- a hash spreads membership uniformly
+    regardless of the fraction's value, and is reproducible across a run
+    (same seed -> same split) without persisting anything."""
     import hashlib
 
     h = hashlib.sha256(f"{seed}:{row['episode_index']}".encode()).digest()
-    frac = int.from_bytes(h[:8], "big") / 2**64
-    return frac < eval_fraction
+    return int.from_bytes(h[:8], "big") / 2**64
+
+
+def _episode_bucket(row: dict, seed: int, val_fraction: float, test_fraction: float) -> str:
+    frac = _episode_frac(row, seed)
+    if frac < val_fraction:
+        return "val"
+    if frac < val_fraction + test_fraction:
+        return "test"
+    return "train"
+
+
+def bucket_episodes(
+    episode_indices: list[int], seed: int, val_fraction: float, test_fraction: float,
+) -> dict[str, list[int]]:
+    """Pure-Python bucketing of a plain episode_index list (no Ray Data) --
+    train.py uses this directly for its degenerate-split check and for
+    picking the GIF-sampling pool, using the same hash `split_by_episode`
+    uses internally so the two never disagree."""
+    buckets: dict[str, list[int]] = {"train": [], "val": [], "test": []}
+    for idx in episode_indices:
+        bucket = _episode_bucket({"episode_index": idx}, seed, val_fraction, test_fraction)
+        buckets[bucket].append(idx)
+    return buckets
 
 
 def split_by_episode(
-    ds: "ray.data.Dataset", eval_fraction: float, seed: int = 0,
-) -> tuple["ray.data.Dataset", "ray.data.Dataset"]:
-    """Splits `ds` into (train_ds, eval_ds) by `episode_index` -- a whole
-    episode goes entirely to one side, never split within an episode.
-    KNOWN COST: implemented as two separate `.filter()` calls over the same
+    ds: "ray.data.Dataset", val_fraction: float, test_fraction: float, seed: int = 0,
+) -> tuple["ray.data.Dataset", "ray.data.Dataset | None", "ray.data.Dataset | None"]:
+    """Splits `ds` into (train_ds, val_ds, test_ds) by `episode_index` -- a
+    whole episode goes entirely to one side, never split within an
+    episode. val_ds/test_ds are None (not an empty-but-real Dataset) when
+    their fraction is falsy, so callers can use `if val_ds is not None:`.
+    KNOWN COST: implemented as separate `.filter()` calls over the same
     upstream `ds`, so Ray Data's lazy execution re-runs the full upstream
-    pipeline (including video decode, the expensive part) TWICE, once per
-    side -- acceptable for `--eval-split-fraction`'s opt-in, dev/moderate-
-    scale use case, but a real cost worth knowing about before reaching for
-    this on a very large dataset. Call on `raw_ds` (before
-    transpose_for_training/action-space stages), same as
-    `select_action_space`/`to_relative_action_space`."""
-    eval_ds = ds.filter(lambda row: _episode_in_eval(row, seed, eval_fraction))
-    train_ds = ds.filter(lambda row: not _episode_in_eval(row, seed, eval_fraction))
-    return train_ds, eval_ds
+    pipeline (including video decode, the expensive part) once per side
+    requested -- acceptable for dev/moderate-scale use, but a real cost
+    worth knowing about before reaching for this on a very large dataset;
+    this is why val_fraction=0 is a real escape hatch, not just a default.
+    Call on `raw_ds` (before transpose_for_training/action-space stages),
+    same as `select_action_space`/`to_relative_action_space`."""
+    train_ds = ds.filter(
+        lambda row: _episode_bucket(row, seed, val_fraction, test_fraction) == "train"
+    )
+    val_ds = None
+    if val_fraction:
+        val_ds = ds.filter(
+            lambda row: _episode_bucket(row, seed, val_fraction, test_fraction) == "val"
+        )
+    test_ds = None
+    if test_fraction:
+        test_ds = ds.filter(
+            lambda row: _episode_bucket(row, seed, val_fraction, test_fraction) == "test"
+        )
+    return train_ds, val_ds, test_ds
 
 
 # ---------------------------------------------------------------------------

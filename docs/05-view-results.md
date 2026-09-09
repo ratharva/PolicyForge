@@ -27,15 +27,24 @@ it directly if you want something custom.
   most recently written checkpoint even when it isn't among those N -- that
   extra one is what a resumed run (`ray.train.get_checkpoint()`, triggered
   automatically on a worker failure/restart within the same run) picks up
-  from, so it's never more than one `--eval-every-steps` window stale
-  relative to wherever training actually stopped. Confirmed by reading the
+  from, so it's never more than one checkpoint-attaching report stale
+  relative to wherever training actually stopped -- `--val-every-steps` (or
+  `--window-every-steps` if that's unset) once val is active (the
+  default), else `--window-every-steps` directly. Confirmed by reading the
   installed `ray.train.v2` checkpoint manager's pruning logic (it excludes
   `self._latest_checkpoint_result` from its deletion set), not assumed.
-  `--save-only-on-improvement` switches to the old behavior instead: a
-  checkpoint only written when the loss improves (both window- and
-  epoch-level reports share one running best) -- less write I/O, but no
-  separate always-fresh checkpoint, so a resume falls back to whichever
-  improving checkpoint happened most recently.
+  **"Lowest-loss" means held-out VAL loss whenever val is active**
+  (`--val-split-fraction`/`--val-v3-root`, on by default) -- training-loss
+  reports (window/epoch-end) stop attaching checkpoints at all in that
+  case, so a good-looking training loss that masks real overfitting no
+  longer wins retention. With val disabled, scoring falls back to training
+  loss exactly as before this existed -- see
+  [`training/README.md`](../training/README.md)'s "Checkpoint retention"
+  section. `--save-only-on-improvement` switches to
+  the old behavior instead: a checkpoint only written when that same score
+  improves -- less write I/O, but no separate always-fresh checkpoint, so
+  a resume falls back to whichever improving checkpoint happened most
+  recently.
 
 ## Resuming after an interruption
 

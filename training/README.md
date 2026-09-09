@@ -31,10 +31,17 @@ is given explicitly (`--dataset-source`, see the table row below).
 | `--grad-accum` | `1` | gradient accumulation steps |
 | `--weight-decay` | `1e-4` | AdamW weight decay |
 | `--max-train-steps` | none (full epoch) | cap total steps -- for a smoke run |
-| `--eval-every-steps` | `200` | report/checkpoint/early-stop-check granularity |
-| `--early-stop-patience` | `5` | stop after this many eval windows with no loss improvement; `0` or negative disables it |
-| `--save-only-on-improvement` | off | only checkpoint when loss improves (less write I/O, but a resume can lose progress back to the last improvement) |
+| `--window-every-steps` | `200` | TRAINING-loss report/early-stop-check granularity -- unrelated to val/test, which have their own cadence below |
+| `--early-stop-patience` | `5` | stop after this many windows with no TRAINING-loss improvement; `0` or negative disables it |
+| `--save-only-on-improvement` | off | only checkpoint when loss improves (less write I/O, but a resume can lose progress back to the last improvement) -- see "Checkpoint retention" below for what "improves" means once val is active |
 | `--checkpoint-max-to-keep` | `3` | keeps the N best-scoring checkpoints plus the single most recent one (native Ray Train `CheckpointConfig` behavior) |
+| `--val-split-fraction` | `0.1` | hold out this fraction of episodes for a periodic val pass that DRIVES CHECKPOINT RETENTION -- on by default; `0` disables it (byte-for-byte pre-val-split behavior). Mutually exclusive with `--val-v3-root` |
+| `--val-every-steps` | none -> reuses `--window-every-steps` | val's own report/checkpoint cadence |
+| `--val-max-batches` | `50` | caps the periodic val pass to this many batches per rank per window -- tune down if val is slow relative to `--window-every-steps` |
+| `--val-batch-size` | none -> reuses `--batch-size` | val/test have no optimizer-state/gradient overhead, so a larger batch is often safe |
+| `--val-v3-root` | none | use a wholly separate, already-prepared v3 root for val instead of a slice of the main `--v3-root` -- ALL of its episodes are used. Schema must match (camera/state/action components); mutually exclusive with `--val-split-fraction` |
+| `--test-split-fraction` | none (disabled) | fully opt-in -- hold out this fraction for a ONE-TIME test pass after training completes, logged under `test/*`, never attaches a checkpoint. Mutually exclusive with `--test-v3-root` |
+| `--test-v3-root` | none | same shape as `--val-v3-root`, for the one-time test pass |
 | `--num-workers` | live GPU count | Ray Train DDP worker count |
 | `--v3-root` | derived from `--dataset-source` + `--tasks` (prepare_data.py's own default path) | must already exist. If omitted, `--dataset-source` is required so the default path can be derived at all |
 | `--dataset-source` (required unless `--v3-root` given) | read from the prepared dataset's own `conversion_params.json` if `--v3-root` is given and omits it | which schema to resolve camera_keys/state_dim/action_dim/tick_fps from |
@@ -152,8 +159,9 @@ means IO-bound (more Ray Data actors/CPU, bigger prefetch buffer, faster
 decode is the fix); low + high `gpu_util_pct` means compute-bound (bigger
 batch, mixed precision, model-side work is the fix). `perf/checkpoint_save_s`
 is logged whenever a checkpoint actually writes -- without it, a periodic
-step-time spike every `--eval-every-steps` looks like unexplained noise
-instead of "checkpointing is slow."
+step-time spike every checkpoint-attaching report (`--val-every-steps` by
+default once val is active, else `--window-every-steps`) looks like
+unexplained noise instead of "checkpointing is slow."
 
 ```bash
 # Find out whether a run is IO- or compute-bound
@@ -299,9 +307,43 @@ python -m training.train --tasks my_tasks --v3-root /data/hand_built_v3 --datase
 
 ## Checkpoint retention
 
+`--checkpoint-max-to-keep` keeps the N best-scoring checkpoints plus the
+single most recent one (native Ray Train `CheckpointConfig` behavior,
+`checkpoint_score_attribute="loss"`). **What "loss" means for that scoring
+depends on whether val is active** (it is by default): with val active,
+only the periodic VAL pass (`val/*`) attaches checkpoints -- the windowed/
+epoch-end training-loss reports become pure logging, so a good-looking
+training loss that masks real overfitting no longer wins retention. With
+val disabled (`--val-split-fraction 0`), scoring falls back to training
+loss from the windowed/epoch-end reports, exactly as before this feature
+existed. Early stopping (`--early-stop-patience`) always stays
+training-loss-based, regardless of val.
+
+The one-time test pass (`--test-split-fraction`/`--test-v3-root`, opt-in)
+never attaches a checkpoint at all -- it's recorded once, into `test/*`
+and the final `history.jsonl` entry, purely for a final, uncontaminated
+read on generalization.
+
 ```bash
-# Keep only checkpoints where loss improved (fewer writes, but a resume can
-# lose progress back to the last improvement -- see the flag table above)
+# Val on by default -- checkpoints are scored by held-out val loss
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act
+
+# Disable val -- back to training-loss-scored checkpoints (pre-val-split behavior)
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --val-split-fraction 0
+
+# Val from a separate, already-prepared v3 root instead of a slice of this one
+# (--val-split-fraction defaults to 0.1 -- disable it explicitly, since the
+# two are mutually exclusive)
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --val-split-fraction 0 --val-v3-root /data/curated_val_v3
+
+# One-time test pass at the end, in addition to the default val split
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
+    --test-split-fraction 0.1
+
+# Keep only checkpoints where the (val, by default) loss improved (fewer
+# writes, but a resume can lose progress back to the last improvement --
+# see the flag table above)
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --save-only-on-improvement
 
 # Keep more/fewer checkpoints on disk

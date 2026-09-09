@@ -28,17 +28,11 @@ from training.wandb_logging import filter_metrics, sample_episode_frames
 
 log = logging.getLogger("act_train")
 
-# Caps the held-out eval pass (--eval-split-fraction) to a bounded number of
-# batches per eval_every_steps window, regardless of how large the eval
-# split is -- an unbounded full pass every window would defeat the point
-# of frequent windowed reporting.
-_EVAL_MAX_BATCHES = 50
-
 
 def _gather_eval_stats(loss_sum: float, n: int, metrics_sum: dict[str, float]) -> tuple[float, int, dict[str, float]]:
-    """Sums each rank's local eval loss/n/metrics so eval/* covers the whole
-    held-out set, not just rank 0's shard slice. Collective -- every rank
-    must call this."""
+    """Sums each rank's local val/test loss/n/metrics so val/*//test/* cover
+    the whole held-out split, not just rank 0's shard slice. Collective --
+    every rank must call this."""
     if not torch.distributed.is_initialized():
         return loss_sum, n, metrics_sum
     world_size = torch.distributed.get_world_size()
@@ -138,6 +132,117 @@ def _report_with_checkpoint(
         ray.train.report(metrics)
 
 
+def _run_eval_pass(
+    shard, adapter: PolicyAdapter, policy, preprocessor, data_cfg, dataset_stats: dict,
+    dist_ctx, collate, batch_size: int, max_batches: int | None, device: torch.device,
+) -> tuple[float, int, dict[str, float], dict | None]:
+    """Read-only forward+loss pass over `shard`, capped at `max_batches` per
+    rank (None = unbounded -- the one-time TEST pass). Shared by the
+    periodic VAL pass and the one-time TEST pass; caller wraps this in
+    policy.eval()/policy.train() and reduces the result across ranks via
+    _gather_eval_stats (this function only returns THIS rank's local
+    contribution). torch.inference_mode() is strictly stronger than
+    torch.no_grad() for a read-only pass like this (skips autograd
+    version-counter bookkeeping no_grad still does).
+
+    Each rank's own shard (ray.train.get_dataset_shard) isn't guaranteed to
+    have the same row count as every other rank's -- so without the
+    cross-rank sync below, a rank that runs out of local batches first
+    would exit into the collective _gather_eval_stats/all_gather_object
+    while another rank is still inside adapter.forward_loss, itself a
+    collective for DDP (buffer broadcast, on by default) or FSDP2 (param
+    all-gather) -- two different ranks stuck in two different collective
+    ops is a real deadlock, not a theoretical one. Every rank all_reduces
+    (MIN) a "do I still have a batch" flag before each forward call, so
+    all ranks agree to stop together and call forward() the exact same
+    number of times. Trade-off: the pass stops as soon as the SMALLEST
+    rank's shard (or max_batches) is exhausted -- it may not process every
+    row of an unevenly-split shard, which is preferable to hanging."""
+    loss_sum, n = 0.0, 0
+    metrics_sum: dict[str, float] = {}
+    last_inputs = None
+    distributed = torch.distributed.is_initialized()
+    it = iter(shard.iter_torch_batches(batch_size=batch_size, collate_fn=collate))
+    i = 0
+    with torch.inference_mode():
+        while max_batches is None or i < max_batches:
+            batch = next(it, None)
+            has_batch = batch is not None
+            if distributed:
+                flag = torch.tensor([1.0 if has_batch else 0.0], device=device)
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+                has_batch = bool(flag.item())
+            if not has_batch:
+                break
+            if not adapter.needs_task:
+                batch.pop("task", None)
+            if not adapter.preprocessing_offloaded:
+                batch = apply_image_normalization(
+                    batch, data_cfg.image_normalization, data_cfg.default_image_normalization,
+                    dataset_stats, data_cfg.image_normalization_max,
+                )
+            inputs = batch if adapter.preprocessing_offloaded else preprocessor(batch)
+            last_inputs = inputs
+            if dist_ctx is not None and hasattr(dist_ctx, "autocast"):
+                with dist_ctx.autocast():
+                    loss, step_metrics = adapter.forward_loss(policy, inputs)
+            else:
+                loss, step_metrics = adapter.forward_loss(policy, inputs)
+            if adapter.extra_metrics is not None:
+                step_metrics = {**step_metrics, **adapter.extra_metrics(policy, inputs)}
+            loss_sum += loss.item()
+            n += 1
+            for k, v in step_metrics.items():
+                metrics_sum[k] = metrics_sum.get(k, 0.0) + v
+            i += 1
+    return loss_sum, n, metrics_sum, last_inputs
+
+
+def _finish_val_pass(
+    loss_sum: float, n: int, metrics_sum: dict[str, float], adapter: PolicyAdapter,
+    unwrapped_policy, optimizer, dist_ctx, run_cfg: RunConfig, train_cfg: TrainConfig,
+    epoch: int, step: int, epoch_complete: bool, rank: int, tb_writer, wandb_run,
+    best_val_loss_seen: float,
+) -> float:
+    """Shared tail of a val pass -- gather this rank's _run_eval_pass output
+    across ranks, log under val/*, and attach a checkpoint scored by THIS
+    pass's loss (never training loss) when it improves best_val_loss_seen
+    (or unconditionally, per save_only_on_improvement). Returns the updated
+    best_val_loss_seen. Used by both the periodic VAL block and the
+    epoch-end safety-net val pass in train_loop_per_worker -- a short run
+    (fewer steps than the val cadence) would otherwise end with NO
+    checkpoint at all, now that neither the windowed nor epoch-end
+    training-loss reports attach one while val is active."""
+    loss_sum, n, metrics_sum = _gather_eval_stats(loss_sum, n, metrics_sum)
+    val_report_metrics = {
+        "epoch": epoch, "steps": step, "report_kind": "val",
+        "loss": loss_sum / max(n, 1),
+        **{k: v / max(n, 1) for k, v in metrics_sum.items()},
+    }
+    if rank == 0 and n > 0:
+        _log_all(
+            tb_writer, wandb_run, "val",
+            {k: v for k, v in val_report_metrics.items() if k not in ("epoch", "steps", "report_kind")},
+            step, train_cfg,
+        )
+        if tb_writer is not None:
+            tb_writer.flush()
+
+    val_improved = val_report_metrics["loss"] < best_val_loss_seen
+    if val_improved:
+        best_val_loss_seen = val_report_metrics["loss"]
+
+    save_checkpoint = val_improved if train_cfg.save_only_on_improvement else True
+    with perf_logging.Timer() as t_ckpt:
+        _report_with_checkpoint(
+            val_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
+            run_cfg, epoch, step, epoch_complete=epoch_complete, rank=rank, save_checkpoint=save_checkpoint,
+        )
+    if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
+        _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
+    return best_val_loss_seen
+
+
 def train_loop_per_worker(config: dict) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_cfg: RunConfig = config["run_cfg"]
@@ -214,11 +319,20 @@ def train_loop_per_worker(config: dict) -> None:
     image_keys |= {f"observation.images.depth_{k}" for k in data_cfg.robot.depth_camera_keys}
     collate = NumpyToTorchCollate(device, image_keys=image_keys)
 
-    # Held-out eval split (opt-in -- --eval-split-fraction): a second named
-    # dataset registered by train.py alongside "train" when set, absent
-    # otherwise. Real held-out inference pass; see the eval_every_steps
-    # block below.
-    eval_shard = ray.train.get_dataset_shard("eval") if train_cfg.eval_split_fraction else None
+    # Held-out val split (on by default -- --val-split-fraction/--val-v3-root)
+    # and test split (opt-in -- --test-split-fraction/--test-v3-root):
+    # second/third named datasets registered by train.py alongside "train"
+    # when active, absent otherwise. "val_active"/"test_active" (not part
+    # of RunConfig's own schema, threaded through train_loop_config the
+    # same way v3_root already is) cover BOTH ways a split can be active --
+    # a hash-based fraction slice of train's own root, or a wholly separate
+    # --val-v3-root/--test-v3-root -- train_loop.py doesn't need to know
+    # which. Val drives checkpoint retention (see the VAL block below);
+    # test is evaluated exactly once, after training completes, and never
+    # attaches a checkpoint.
+    val_shard = ray.train.get_dataset_shard("val") if config.get("val_active") else None
+    test_shard = ray.train.get_dataset_shard("test") if config.get("test_active") else None
+    effective_val_every_steps = train_cfg.val_every_steps or train_cfg.window_every_steps
 
     # Only rank 0 writes TensorBoard -- every worker's shard is a different
     # data slice, so only rank 0's loss curve is coherent, and multiple
@@ -294,20 +408,21 @@ def train_loop_per_worker(config: dict) -> None:
     # -- opt-in per camera. Reads directly from the converted v3 root's own
     # video files, not from Ray Data, so it needs v3_root (plumbed in by
     # train.py, not part of RunConfig's own schema -- see that file) and,
-    # when a real eval split exists, the held-out episode-index set so GIFs
-    # come specifically from data the model never trained on.
+    # when a real val split exists, the held-out episode-index set so GIFs
+    # come specifically from data the model never trained on (val's pool,
+    # never test's).
     v3_root = config.get("v3_root")
-    eval_episode_indices = config.get("eval_episode_indices")
+    val_episode_indices = config.get("val_episode_indices")
     gif_rng = random.Random(0)
-    # Computed once here, not per-window: the held-out set when a real eval
-    # split exists (so GIFs come specifically from data never trained on),
-    # else every real episode_index in the dataset (one lightweight
-    # meta/episodes read, not a Ray Data query). None/empty when GIFs
-    # aren't configured at all, so no extra I/O happens in the common case.
+    # Computed once here, not per-window: the held-out VAL set when active
+    # (so GIFs come specifically from data never trained on), else every
+    # real episode_index in the dataset (one lightweight meta/episodes
+    # read, not a Ray Data query). None/empty when GIFs aren't configured
+    # at all, so no extra I/O happens in the common case.
     gif_episode_pool: list[int] | None = None
     if rank == 0 and train_cfg.wandb_gif_cameras and v3_root:
-        if eval_episode_indices:
-            gif_episode_pool = list(eval_episode_indices)
+        if val_episode_indices:
+            gif_episode_pool = list(val_episode_indices)
         else:
             from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
 
@@ -317,6 +432,7 @@ def train_loop_per_worker(config: dict) -> None:
     # running "best loss seen this run", updated at both window and epoch
     # reports. Not restored from a resumed checkpoint.
     best_loss_seen = float("inf")
+    best_val_loss_seen = float("inf")
     windows_without_improvement = 0
     should_stop = False
 
@@ -477,9 +593,11 @@ def train_loop_per_worker(config: dict) -> None:
                     tb_writer.flush()
 
             # Step-windowed report: finer-grained than epoch, so early
-            # stopping and best-checkpoint scoring have more than one data
-            # point even within a single epoch or a max_train_steps-capped run.
-            if step % train_cfg.eval_every_steps == 0:
+            # stopping has more than one data point even within a single
+            # epoch or a max_train_steps-capped run. Training-loss-based
+            # only -- best-checkpoint scoring lives in the VAL block below
+            # whenever a val split is active.
+            if step % train_cfg.window_every_steps == 0:
                 window_metrics = {
                     "epoch": epoch, "steps": step, "report_kind": "window",
                     "loss": window_loss_sum / max(window_n, 1),
@@ -532,95 +650,16 @@ def train_loop_per_worker(config: dict) -> None:
                 window_optimizer_step_sum, window_optimizer_step_n = 0.0, 0
                 window_wall_start = time.perf_counter()
 
-                # Real held-out eval pass (--eval-split-fraction only) --
-                # reuses adapter.forward_loss unmodified, just under
-                # policy.eval()/no_grad() and fed from the held-out shard.
-                # Deliberately does NOT feed into checkpoint-improvement
-                # scoring/early-stopping above (still training-loss-based,
-                # unchanged) -- this is additional observability, not a
-                # change to the existing selection criteria.
-                if eval_shard is not None:
-                    policy.eval()
-                    eval_loss_sum, eval_n = 0.0, 0
-                    eval_metrics_sum: dict[str, float] = {}
-                    last_eval_inputs = None
-                    with torch.no_grad():
-                        for i, eval_batch in enumerate(
-                            eval_shard.iter_torch_batches(batch_size=train_cfg.batch_size, collate_fn=collate)
-                        ):
-                            if i >= _EVAL_MAX_BATCHES:
-                                break
-                            if not adapter.needs_task:
-                                eval_batch.pop("task", None)
-                            if not adapter.preprocessing_offloaded:
-                                eval_batch = apply_image_normalization(
-                                    eval_batch, data_cfg.image_normalization, data_cfg.default_image_normalization,
-                                    dataset_stats, data_cfg.image_normalization_max,
-                                )
-                            eval_inputs = eval_batch if adapter.preprocessing_offloaded else preprocessor(eval_batch)
-                            last_eval_inputs = eval_inputs
-                            if dist_ctx is not None and hasattr(dist_ctx, "autocast"):
-                                with dist_ctx.autocast():
-                                    eval_loss, eval_step_metrics = adapter.forward_loss(policy, eval_inputs)
-                            else:
-                                eval_loss, eval_step_metrics = adapter.forward_loss(policy, eval_inputs)
-                            if adapter.extra_metrics is not None:
-                                eval_step_metrics = {**eval_step_metrics, **adapter.extra_metrics(policy, eval_inputs)}
-                            eval_loss_sum += eval_loss.item()
-                            eval_n += 1
-                            for k, v in eval_step_metrics.items():
-                                eval_metrics_sum[k] = eval_metrics_sum.get(k, 0.0) + v
-
-                        # Predicted-frames GIFs -- pure groundwork for a
-                        # future policy that actually predicts visual
-                        # frames (e.g. a world model); see PolicyAdapter.
-                        # predict_frames's docstring. Inert no-op for
-                        # ACT/MolmoAct2/PI05 today (adapter.predict_frames
-                        # is None for all three). Logged at this eval
-                        # pass's own step, same key across the run, so
-                        # W&B's own per-step media history is what shows
-                        # the generated frames improving over training --
-                        # no extra "compare across steps" logic needed.
-                        # --wandb-predict-frames-every-steps controls how
-                        # often, relative to eval passes (can only be a
-                        # multiple of eval_every_steps -- generating one
-                        # needs a real eval batch, which only exists here).
-                        predict_frames_every = train_cfg.wandb_predict_frames_every_steps or train_cfg.eval_every_steps
-                        if (
-                            adapter.predict_frames is not None and rank == 0
-                            and wandb_run is not None and last_eval_inputs is not None
-                            and step % predict_frames_every == 0
-                        ):
-                            predicted = adapter.predict_frames(policy, last_eval_inputs)
-                            if predicted:
-                                import wandb
-
-                                media = {
-                                    f"eval_gif/{name}": wandb.Video(
-                                        frames.transpose(0, 3, 1, 2), format="gif", fps=data_cfg.robot.tick_fps,
-                                    )
-                                    for name, frames in predicted.items()
-                                }
-                                # Apply the same allow/deny filter as every other metric.
-                                filtered = filter_metrics(
-                                    media, train_cfg.wandb_metrics, train_cfg.wandb_exclude_metrics,
-                                )
-                                if filtered:
-                                    wandb_run.log(filtered, step=step)
-                    policy.train()
-                    # Collective -- every rank must call this, not just rank 0.
-                    eval_loss_sum, eval_n, eval_metrics_sum = _gather_eval_stats(
-                        eval_loss_sum, eval_n, eval_metrics_sum,
-                    )
-                    if rank == 0 and eval_n > 0:
-                        eval_values = {
-                            "loss": eval_loss_sum / eval_n,
-                            **{k: v / eval_n for k, v in eval_metrics_sum.items()},
-                        }
-                        _log_all(tb_writer, wandb_run, "eval", eval_values, step, train_cfg)
-
                 should_stop = _sync_should_stop(should_stop, device)  # every rank must call this
-                save_checkpoint = improved if train_cfg.save_only_on_improvement else True
+                # Whenever a val split is active, val owns checkpoint
+                # retention entirely (see the VAL block below) -- the
+                # windowed block becomes pure training-loss logging/early-
+                # stop, no checkpoint attached here. Disabled (val_shard is
+                # None): byte-for-byte today's behavior, unchanged.
+                save_checkpoint = (
+                    False if val_shard is not None
+                    else (improved if train_cfg.save_only_on_improvement else True)
+                )
                 with perf_logging.Timer() as t_ckpt:
                     _report_with_checkpoint(
                         window_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
@@ -629,12 +668,80 @@ def train_loop_per_worker(config: dict) -> None:
                 if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
                     _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
 
-            # Episode-preview GIFs -- independent cadence from the window
-            # report above (wandb_gif_every_steps can differ from
-            # eval_every_steps), so this is its own top-level check, not
-            # nested in the block above.
+            # Periodic VAL pass -- own top-level cadence check, not nested
+            # in the window block above (val_every_steps can differ from
+            # window_every_steps). Drives checkpoint retention: unlike the
+            # windowed/epoch-end blocks (training loss), this reports the
+            # real held-out val loss under checkpoint_score_attribute="loss",
+            # so a good-looking training loss that masks real overfitting no
+            # longer wins retention. Early stopping (above) stays
+            # training-loss-based, unchanged.
+            if val_shard is not None and step % effective_val_every_steps == 0:
+                policy.eval()
+                val_loss_sum, val_n, val_metrics_sum, last_val_inputs = _run_eval_pass(
+                    val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
+                    train_cfg.val_batch_size or train_cfg.batch_size, train_cfg.val_max_batches, device,
+                )
+
+                # Predicted-frames GIFs -- pure groundwork for a future
+                # policy that actually predicts visual frames (e.g. a world
+                # model); see PolicyAdapter.predict_frames's docstring.
+                # Inert no-op for ACT/MolmoAct2/PI05 today (adapter.
+                # predict_frames is None for all three). Logged at this val
+                # pass's own step, same key across the run, so W&B's own
+                # per-step media history is what shows the generated frames
+                # improving over training -- no extra "compare across
+                # steps" logic needed. --wandb-predict-frames-every-steps
+                # controls how often, relative to val passes (can only be a
+                # multiple of the EFFECTIVE val cadence -- generating one
+                # needs a real val batch, which only exists here).
+                predict_frames_every = train_cfg.wandb_predict_frames_every_steps or effective_val_every_steps
+                if (
+                    adapter.predict_frames is not None and rank == 0
+                    and wandb_run is not None and last_val_inputs is not None
+                    and step % predict_frames_every == 0
+                ):
+                    # last_val_inputs' tensors were created under
+                    # _run_eval_pass's own torch.inference_mode() -- an
+                    # inference tensor used in a graph built OUTSIDE
+                    # inference_mode can raise at runtime (autograd refuses
+                    # to save it for backward), so keep this call inside
+                    # the same mode too, not just policy.eval().
+                    with torch.inference_mode():
+                        predicted = adapter.predict_frames(policy, last_val_inputs)
+                    if predicted:
+                        import wandb
+
+                        media = {
+                            f"val_gif/{name}": wandb.Video(
+                                frames.transpose(0, 3, 1, 2), format="gif", fps=data_cfg.robot.tick_fps,
+                            )
+                            for name, frames in predicted.items()
+                        }
+                        # Apply the same allow/deny filter as every other metric.
+                        filtered = filter_metrics(media, train_cfg.wandb_metrics, train_cfg.wandb_exclude_metrics)
+                        if filtered:
+                            wandb_run.log(filtered, step=step)
+                policy.train()
+
+                # Collective -- _finish_val_pass's own _gather_eval_stats
+                # call, every rank must reach it. Unlike the training-loss
+                # window/epoch reports (rank 0's own local shard slice
+                # only), every rank ends up with the SAME globally-summed
+                # val loss after that gather, so this is safe to call
+                # identically on every rank.
+                best_val_loss_seen = _finish_val_pass(
+                    val_loss_sum, val_n, val_metrics_sum, adapter, unwrapped_policy, optimizer, dist_ctx,
+                    run_cfg, train_cfg, epoch, step, epoch_complete=False, rank=rank,
+                    tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+                )
+
+            # Episode-preview GIFs -- independent cadence from the val
+            # report above (wandb_gif_every_steps can differ from the
+            # effective val cadence), so this is its own top-level check,
+            # not nested in the block above.
             if rank == 0 and wandb_run is not None and gif_episode_pool:
-                gif_every = train_cfg.wandb_gif_every_steps or train_cfg.eval_every_steps
+                gif_every = train_cfg.wandb_gif_every_steps or effective_val_every_steps
                 if step % gif_every == 0:
                     ep_idx = gif_rng.choice(gif_episode_pool)
                     for cam in train_cfg.wandb_gif_cameras:
@@ -649,8 +756,7 @@ def train_loop_per_worker(config: dict) -> None:
 
                         frames_chw = frames.transpose(0, 3, 1, 2)
                         media = {f"gif/{cam}": wandb.Video(frames_chw, format="gif", fps=data_cfg.robot.tick_fps)}
-                        # Same filtering as every other metric -- see the
-                        # eval_gif/* fix above for why this was missing.
+                        # Same allow/deny filter as every other metric.
                         filtered = filter_metrics(media, train_cfg.wandb_metrics, train_cfg.wandb_exclude_metrics)
                         if filtered:
                             wandb_run.log(filtered, step=step)
@@ -686,17 +792,78 @@ def train_loop_per_worker(config: dict) -> None:
             if improved:
                 best_loss_seen = metrics["loss"]
 
-        save_checkpoint = improved if train_cfg.save_only_on_improvement else True
-        with perf_logging.Timer() as t_ckpt:
-            _report_with_checkpoint(
-                metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
-                run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
+        if val_shard is not None:
+            # Same gating as the windowed block: whenever a val split is
+            # active, val owns checkpoint retention exclusively -- an
+            # epoch-end checkpoint scored by training loss would otherwise
+            # sit in the SAME best-N pool as val-scored checkpoints under
+            # the same checkpoint_score_attribute="loss" key, letting a low
+            # training loss displace the intended val-selected checkpoints.
+            # Running a fresh val pass here (rather than just skipping
+            # attachment) matters for a SHORT run -- fewer steps than the
+            # val cadence never fires the periodic VAL block at all, and
+            # skipping epoch-end too would leave the run with NO checkpoint
+            # whatsoever. This may duplicate a val pass that happened to
+            # also fire at this exact step via the periodic block -- a
+            # small, bounded extra cost, not a correctness issue.
+            policy.eval()
+            epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, _ = _run_eval_pass(
+                val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
+                train_cfg.val_batch_size or train_cfg.batch_size, train_cfg.val_max_batches, device,
             )
-        if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
-            _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
+            policy.train()
+            best_val_loss_seen = _finish_val_pass(
+                epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, adapter, unwrapped_policy, optimizer,
+                dist_ctx, run_cfg, train_cfg, epoch, step, epoch_complete=True, rank=rank,
+                tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+            )
+        else:
+            save_checkpoint = improved if train_cfg.save_only_on_improvement else True
+            with perf_logging.Timer() as t_ckpt:
+                _report_with_checkpoint(
+                    metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
+                    run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
+                )
+            if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
+                _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
 
         if should_stop or (train_cfg.max_train_steps and step >= train_cfg.max_train_steps):
             break
+
+    # One-time TEST pass -- runs exactly once, after training completes
+    # (whether by exhausting num_epochs, early stop, or max_train_steps),
+    # against episodes NEVER touched during training or val. Uncapped
+    # (max_batches=None): evaluate the whole test split fully, exactly
+    # once -- capping it would defeat the point. save_checkpoint=False
+    # unconditionally: test's loss is recorded into Ray's own
+    # result.metrics (and therefore history.jsonl) but never attaches a
+    # checkpoint, so test can't influence retention by construction.
+    if test_shard is not None:
+        policy.eval()
+        test_loss_sum, test_n, test_metrics_sum, _ = _run_eval_pass(
+            test_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
+            train_cfg.val_batch_size or train_cfg.batch_size, max_batches=None, device=device,
+        )
+        policy.train()
+        # Collective -- every rank must call this, not just rank 0.
+        test_loss_sum, test_n, test_metrics_sum = _gather_eval_stats(test_loss_sum, test_n, test_metrics_sum)
+        test_report_metrics = {
+            "epoch": epoch, "steps": step, "report_kind": "test",
+            "loss": test_loss_sum / max(test_n, 1),
+            **{k: v / max(test_n, 1) for k, v in test_metrics_sum.items()},
+        }
+        if rank == 0 and test_n > 0:
+            _log_all(
+                tb_writer, wandb_run, "test",
+                {k: v for k, v in test_report_metrics.items() if k not in ("epoch", "steps", "report_kind")},
+                step, train_cfg,
+            )
+            if tb_writer is not None:
+                tb_writer.flush()
+        _report_with_checkpoint(
+            test_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
+            run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=False,
+        )
 
     if prof is not None and prof_started:
         # max_train_steps/should_stop broke out of the loop before reaching

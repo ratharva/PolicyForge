@@ -135,10 +135,11 @@ def main() -> None:
                          help="AdamW weight decay")
     parser.add_argument("--max-train-steps", type=int, default=None,
                          help="cap total steps for a smoke run; omit for a full run over the data")
-    parser.add_argument("--eval-every-steps", type=int, default=200,
-                         help="report/checkpoint/early-stop-check granularity, in steps")
+    parser.add_argument("--window-every-steps", type=int, default=200,
+                         help="training-loss report/early-stop-check granularity, in steps -- "
+                              "unrelated to val/test, which have their own cadence (--val-every-steps)")
     parser.add_argument("--early-stop-patience", type=int, default=5,
-                         help="stop after this many eval windows with no loss improvement; "
+                         help="stop after this many windows with no TRAINING-loss improvement; "
                               "pass 0 or a negative number to disable early stopping")
     parser.add_argument("--save-only-on-improvement", action="store_true",
                          help="only write a checkpoint when the loss improves, instead of on every "
@@ -194,23 +195,54 @@ def main() -> None:
                               "sampled from a real recorded episode's own consecutive frames (not a "
                               "shuffled training batch) -- off by default. Requires --wandb")
     parser.add_argument("--wandb-gif-every-steps", type=int, default=None,
-                         help="GIF logging cadence -- default: reuse --eval-every-steps")
+                         help="GIF logging cadence -- default: reuse the effective val cadence "
+                              "(--val-every-steps, or --window-every-steps if that's unset)")
     parser.add_argument("--wandb-gif-frames", type=int, default=30,
                          help="frames per GIF")
     parser.add_argument("--wandb-predict-frames-every-steps", type=int, default=None,
                          help="how often to log a policy's OWN predicted-frames GIF (only meaningful "
                               "for a future policy that implements PolicyAdapter.predict_frames -- "
                               "inert for act/molmoact2/pi05 today, which only predict actions) -- "
-                              "default: log one every eval pass. Can only be a multiple of "
-                              "--eval-every-steps, since generating one needs a real eval batch, which "
-                              "only exists when the eval pass itself runs")
-    parser.add_argument("--eval-split-fraction", type=float, default=None,
+                              "default: log one every val pass. Can only be a multiple of the "
+                              "effective val cadence, since generating one needs a real val batch, "
+                              "which only exists when the val pass itself runs")
+    parser.add_argument("--val-split-fraction", type=float, default=0.1,
                          help="hold out this fraction of episodes from training entirely, for a real "
-                              "eval pass (policy.eval()/no_grad(), reusing the same forward_loss) "
-                              "every --eval-every-steps, logged under eval/* -- default: no split, no "
-                              "eval pass, matching today's behavior exactly. When set, "
-                              "--wandb-gif-cameras also sample specifically from the held-out set "
-                              "instead of anywhere in the dataset")
+                              "periodic val pass (policy.eval()/inference_mode(), reusing the same "
+                              "forward_loss) every --val-every-steps, logged under val/* -- ON by "
+                              "default (0.1) and drives checkpoint retention (checkpoint_score_attribute "
+                              "reads val loss, not training loss, whenever val is active). Pass 0 to "
+                              "disable (byte-for-byte today's pre-val-split behavior: windowed/epoch-end "
+                              "checkpoints scored by training loss instead). Mutually exclusive with "
+                              "--val-v3-root. --wandb-gif-cameras sample from val's held-out episodes "
+                              "whenever val is active (either way), else anywhere in the dataset")
+    parser.add_argument("--val-every-steps", type=int, default=None,
+                         help="val's own report/checkpoint cadence -- default: reuse --window-every-steps")
+    parser.add_argument("--val-max-batches", type=int, default=50,
+                         help="cap the periodic val pass to this many batches per rank per window -- "
+                              "tune down if val is taking too long relative to --window-every-steps. "
+                              "The one-time end-of-training test pass is NOT capped by this")
+    parser.add_argument("--val-batch-size", type=int, default=None,
+                         help="default: reuse --batch-size. Val/test have no optimizer-state/gradient "
+                              "memory overhead, so a larger batch is often safe here and reduces "
+                              "per-batch overhead")
+    parser.add_argument("--val-v3-root", default=None,
+                         help="use a wholly separate, already-prepared LeRobot v3 root for val instead "
+                              "of a hash-based slice of the main --v3-root -- ALL of its episodes are "
+                              "used (no further filtering). Its schema (camera_keys/depth_camera_keys/"
+                              "state_components/action_components) must match the main root's; a "
+                              "tick_fps mismatch only warns. Mutually exclusive with "
+                              "--val-split-fraction (leave that at 0 when using this)")
+    parser.add_argument("--test-split-fraction", type=float, default=None,
+                         help="fully opt-in (default: disabled) -- hold out this fraction of episodes "
+                              "for a one-time test pass, run once after training completes, logged "
+                              "under test/*. NEVER touched during training or val, and never attaches "
+                              "a checkpoint -- can't influence retention by construction. Mutually "
+                              "exclusive with --test-v3-root")
+    parser.add_argument("--test-v3-root", default=None,
+                         help="use a wholly separate, already-prepared LeRobot v3 root for the one-time "
+                              "test pass instead of a hash-based slice -- same shape as --val-v3-root. "
+                              "Mutually exclusive with --test-split-fraction")
 
     # --- perf instrumentation (training/perf_logging.py) ---
     parser.add_argument("--log-perf-metrics", action="store_true",
@@ -414,7 +446,9 @@ def main() -> None:
     _apply_if_explicit(run_cfg.train, "grad_accum", args, "grad_accum", parser)
     _apply_if_explicit(run_cfg.train, "weight_decay", args, "weight_decay", parser)
     _apply_if_explicit(run_cfg.train, "max_train_steps", args, "max_train_steps", parser)
-    _apply_if_explicit(run_cfg.train, "eval_every_steps", args, "eval_every_steps", parser)
+    _apply_if_explicit(run_cfg.train, "window_every_steps", args, "window_every_steps", parser)
+    if run_cfg.train.window_every_steps <= 0:
+        parser.error(f"--window-every-steps must be positive, got {run_cfg.train.window_every_steps}")
     _apply_if_explicit(
         run_cfg.train, "early_stop_patience", args, "early_stop_patience", parser,
         transform=lambda v: v if v > 0 else None,
@@ -438,22 +472,51 @@ def main() -> None:
     _apply_if_explicit(
         run_cfg.train, "wandb_predict_frames_every_steps", args, "wandb_predict_frames_every_steps", parser,
     )
-    _apply_if_explicit(run_cfg.train, "eval_split_fraction", args, "eval_split_fraction", parser)
-    if run_cfg.train.eval_split_fraction is not None and not (0 < run_cfg.train.eval_split_fraction < 1):
+    # No transform here -- 0 is a real, valid "disabled" value (same as
+    # None) everywhere val_split_fraction/test_split_fraction are actually
+    # used below (all truthy checks, `or 0`, etc.), so a CLI 0 and a
+    # --config-file YAML 0 now behave identically. Mapping 0-or-negative to
+    # None here would also silently swallow a genuinely invalid negative
+    # value before the range check below ever saw it.
+    _apply_if_explicit(run_cfg.train, "val_split_fraction", args, "val_split_fraction", parser)
+    _apply_if_explicit(run_cfg.train, "val_every_steps", args, "val_every_steps", parser)
+    if run_cfg.train.val_every_steps is not None and run_cfg.train.val_every_steps <= 0:
+        parser.error(f"--val-every-steps must be positive, got {run_cfg.train.val_every_steps}")
+    _apply_if_explicit(run_cfg.train, "val_max_batches", args, "val_max_batches", parser)
+    if run_cfg.train.val_max_batches <= 0:
+        parser.error(f"--val-max-batches must be positive, got {run_cfg.train.val_max_batches}")
+    _apply_if_explicit(run_cfg.train, "val_batch_size", args, "val_batch_size", parser)
+    _apply_if_explicit(run_cfg.train, "test_split_fraction", args, "test_split_fraction", parser)
+    for frac_name, frac_value, root_flag, root_value in (
+        ("--val-split-fraction", run_cfg.train.val_split_fraction, "--val-v3-root", args.val_v3_root),
+        ("--test-split-fraction", run_cfg.train.test_split_fraction, "--test-v3-root", args.test_v3_root),
+    ):
+        if root_value and frac_value:
+            parser.error(f"{frac_name} and {root_flag} are mutually exclusive -- pick one")
+        # Exact 0 means "disabled" (falsy, skips this check) -- only a
+        # genuinely out-of-range value (negative, or >= 1) is rejected.
+        if frac_value and not (0 < frac_value < 1):
+            parser.error(f"{frac_name} must be strictly between 0 and 1, got {frac_value}")
+    if (
+        run_cfg.train.val_split_fraction and run_cfg.train.test_split_fraction
+        and run_cfg.train.val_split_fraction + run_cfg.train.test_split_fraction >= 1
+    ):
         parser.error(
-            f"--eval-split-fraction must be strictly between 0 and 1, got {run_cfg.train.eval_split_fraction}"
+            f"--val-split-fraction {run_cfg.train.val_split_fraction} + --test-split-fraction "
+            f"{run_cfg.train.test_split_fraction} must be < 1 -- some episodes must remain for training"
         )
 
     if run_cfg.train.wandb_gif_cameras and not run_cfg.train.wandb:
         parser.error("--wandb-gif-cameras requires --wandb")
+    effective_val_every_steps = run_cfg.train.val_every_steps or run_cfg.train.window_every_steps
     if (
         run_cfg.train.wandb_predict_frames_every_steps
-        and run_cfg.train.wandb_predict_frames_every_steps % run_cfg.train.eval_every_steps != 0
+        and run_cfg.train.wandb_predict_frames_every_steps % effective_val_every_steps != 0
     ):
         parser.error(
             f"--wandb-predict-frames-every-steps {run_cfg.train.wandb_predict_frames_every_steps} must be a "
-            f"multiple of --eval-every-steps {run_cfg.train.eval_every_steps} -- a predicted-frames GIF can "
-            f"only be generated when the eval pass itself runs, so any other value would never fire"
+            f"multiple of the effective val cadence ({effective_val_every_steps}) -- a predicted-frames GIF "
+            f"can only be generated when the val pass itself runs, so any other value would never fire"
         )
     if run_cfg.train.wandb_metric_groups:
         try:
@@ -631,55 +694,147 @@ def main() -> None:
             name=run_cfg.run_name,
         )
 
-    # Held-out eval split (--eval-split-fraction, opt-in) -- held out of
-    # TRAINING entirely, including normalization stats below (computing
-    # stats from episodes the eval pass then scores against would leak
-    # information the held-out set is supposed to be free of). Real
-    # eval_episode_indices computed directly from meta/episodes (the same
-    # deterministic hash split_by_episode uses, done here without touching
-    # Ray Data at all -- cheap, driver-side) so train_loop.py's GIF
-    # sampling can pick from it without re-querying the dataset.
-    eval_ds = None
-    eval_episode_indices = None
-    if run_cfg.train.eval_split_fraction:
-        from training.data.ray_dataset import _episode_in_eval, split_by_episode
+    # Held-out val/test split -- held out of TRAINING entirely, including
+    # normalization stats below (computing stats from episodes the val/test
+    # pass then scores against would leak information the held-out set is
+    # supposed to be free of). Two independent mechanisms per side, already
+    # validated mutually exclusive above: a hash-based slice of THIS root
+    # (--val-split-fraction/--test-split-fraction) or a wholly separate,
+    # already-prepared v3 root (--val-v3-root/--test-v3-root).
+    val_raw_ds = test_raw_ds = None
+    val_episode_indices = test_episode_indices = None
+
+    slice_val_fraction = run_cfg.train.val_split_fraction if not args.val_v3_root else None
+    slice_test_fraction = run_cfg.train.test_split_fraction if not args.test_v3_root else None
+    if slice_val_fraction or slice_test_fraction:
+        from training.data.ray_dataset import bucket_episodes, split_by_episode
         from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
 
         meta = LeRobotDatasourceMetadata(v3_root)
         all_episode_indices = meta.episodes.column("episode_index").to_pylist()
-        eval_episode_indices = [
-            idx for idx in all_episode_indices
-            if _episode_in_eval({"episode_index": idx}, seed=0, eval_fraction=run_cfg.train.eval_split_fraction)
-        ]
-        # A valid fraction can still hash every episode of a small dataset to one side.
-        if not eval_episode_indices or len(eval_episode_indices) == len(all_episode_indices):
-            raise SystemExit(
-                f"--eval-split-fraction {run_cfg.train.eval_split_fraction} hashed all "
-                f"{len(all_episode_indices)} episode(s) to one side (0 held out for eval) -- "
-                f"try a different fraction, or use more episodes."
-            )
-        print(
-            f"  eval split: {len(eval_episode_indices)}/{len(all_episode_indices)} episodes held out "
-            f"of training (--eval-split-fraction {run_cfg.train.eval_split_fraction})"
+        # Pure-Python bucketing (same hash split_by_episode uses internally)
+        # just to size/validate the split and get val's episode-index list
+        # for train_loop.py's GIF sampling -- no Ray Data touched here.
+        buckets = bucket_episodes(
+            all_episode_indices, seed=0,
+            val_fraction=slice_val_fraction or 0, test_fraction=slice_test_fraction or 0,
         )
-        raw_ds, eval_raw_ds = split_by_episode(raw_ds, run_cfg.train.eval_split_fraction, seed=0)
+        if slice_val_fraction and not buckets["val"]:
+            raise SystemExit(
+                f"--val-split-fraction {slice_val_fraction} hashed 0/{len(all_episode_indices)} "
+                f"episode(s) to val -- try a different fraction, or use more episodes."
+            )
+        if slice_test_fraction and not buckets["test"]:
+            raise SystemExit(
+                f"--test-split-fraction {slice_test_fraction} hashed 0/{len(all_episode_indices)} "
+                f"episode(s) to test -- try a different fraction, or use more episodes."
+            )
+        if not buckets["train"]:
+            raise SystemExit(
+                f"--val-split-fraction {slice_val_fraction}/--test-split-fraction {slice_test_fraction} "
+                f"hashed ALL {len(all_episode_indices)} episode(s) out of training -- try smaller fractions."
+            )
+        if slice_val_fraction:
+            val_episode_indices = buckets["val"]
+            print(f"  val split: {len(buckets['val'])}/{len(all_episode_indices)} episodes held out of "
+                  f"training (--val-split-fraction {slice_val_fraction})")
+        if slice_test_fraction:
+            test_episode_indices = buckets["test"]
+            print(f"  test split: {len(buckets['test'])}/{len(all_episode_indices)} episodes held out of "
+                  f"training (--test-split-fraction {slice_test_fraction})")
+        raw_ds, val_raw_ds, test_raw_ds = split_by_episode(
+            raw_ds, slice_val_fraction or 0, slice_test_fraction or 0, seed=0,
+        )
+
+    def _resolve_side_v3_root(kind: str, side_v3_root: str) -> tuple["ray.data.Dataset", list[int]]:
+        """--val-v3-root/--test-v3-root: resolves the side root's own
+        RobotSchema the same way the training root's is resolved above,
+        checks it's compatible enough to share this run's policy/collate
+        path, then builds its Dataset via the SAME build_lerobot_v3_dataset/
+        select_action_space/to_relative_action_space calls the training
+        root already goes through -- ALL of its episodes are used (no hash
+        filtering; the operator chose this root specifically to be the
+        val/test set)."""
+        side_conversion_params = read_conversion_params(side_v3_root)
+        side_dataset_source = (side_conversion_params or {}).get("dataset_source")
+        if not side_dataset_source:
+            raise SystemExit(
+                f"--{kind}-v3-root {side_v3_root}'s conversion_params.json doesn't record a "
+                f"dataset_source (likely a hand-built v3 root) -- can't resolve its schema."
+            )
+        side_robot = get_dataset_source(side_dataset_source).robot
+        # camera_keys/depth_camera_keys/state_components/action_components
+        # feed the same policy/collate path as the training root's -- a
+        # mismatch would break forward_loss/collate on this side. tick_fps
+        # only affects real-world timing semantics, not structure -- warn only.
+        mismatches = {
+            k: (getattr(original_robot, k), getattr(side_robot, k))
+            for k in ("camera_keys", "depth_camera_keys", "state_components", "action_components")
+            if getattr(original_robot, k) != getattr(side_robot, k)
+        }
+        if mismatches:
+            raise SystemExit(
+                f"--{kind}-v3-root {side_v3_root}'s schema doesn't match the training root's: "
+                + "; ".join(f"{k} train={v[0]!r} {kind}={v[1]!r}" for k, v in mismatches.items())
+            )
+        if original_robot.tick_fps != side_robot.tick_fps:
+            print(
+                f"WARNING: --{kind}-v3-root {side_v3_root} has tick_fps={side_robot.tick_fps}, training "
+                f"root has tick_fps={original_robot.tick_fps} -- real-world timing semantics differ."
+            )
+        # Imported here, not reused from the fraction-split branch above --
+        # this helper runs whenever --val-v3-root/--test-v3-root is passed,
+        # independently of whether a percentage split was also requested
+        # (the two are mutually exclusive per side, so that branch may
+        # never have run at all).
+        from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
+
+        side_meta = LeRobotDatasourceMetadata(side_v3_root)
+        side_episode_indices = side_meta.episodes.column("episode_index").to_pylist()
+        side_raw_ds = build_lerobot_v3_dataset(
+            side_v3_root, run_cfg.model.chunk_size, depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+        )
+        side_raw_ds = select_action_space(
+            side_raw_ds, side_robot, run_cfg.data.robot, name=f"{run_cfg.run_name}-{kind}",
+        )
+        if run_cfg.data.action_representation == "delta":
+            side_raw_ds = to_relative_action_space(
+                side_raw_ds, run_cfg.data.robot, exclude_components=run_cfg.data.action_delta_exclude,
+                name=f"{run_cfg.run_name}-{kind}",
+            )
+        return side_raw_ds, side_episode_indices
+
+    if args.val_v3_root:
+        val_raw_ds, val_episode_indices = _resolve_side_v3_root("val", args.val_v3_root)
+        print(f"  val split: {len(val_episode_indices)} episode(s) from separate --val-v3-root {args.val_v3_root}")
+    if args.test_v3_root:
+        test_raw_ds, test_episode_indices = _resolve_side_v3_root("test", args.test_v3_root)
+        print(f"  test split: {len(test_episode_indices)} episode(s) from separate --test-v3-root {args.test_v3_root}")
 
     print("\n=== compute normalization stats ===")
     # Sampled from raw_ds (pre-transpose, HWC), AFTER action-space selection/
-    # delta-conversion/eval-split above -- so stats reflect whatever's
+    # delta-conversion/val-test-split above -- so stats reflect whatever's
     # actually trained on (computing stats on absolute actions then
     # converting to delta afterwards would normalize deltas using
     # absolute-action mean/std, which is wrong; same reasoning for
-    # excluding the held-out eval episodes). See training/data/stats.py.
+    # excluding the held-out val/test episodes). Unaffected by a root-based
+    # val/test -- that data was never part of raw_ds to begin with. See
+    # training/data/stats.py.
     dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
 
     ds = transpose_for_training(
         raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name,
         depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
     )
-    if eval_episode_indices is not None:
-        eval_ds = transpose_for_training(
-            eval_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-eval",
+    val_ds = test_ds = None
+    if val_raw_ds is not None:
+        val_ds = transpose_for_training(
+            val_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-val",
+            depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+        )
+    if test_raw_ds is not None:
+        test_ds = transpose_for_training(
+            test_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-test",
             depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
         )
 
@@ -690,10 +845,15 @@ def main() -> None:
             ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
             concurrency=concurrency, name=run_cfg.run_name,
         )
-        if eval_ds is not None:
-            eval_ds = offload_molmoact2_preprocessing(
-                eval_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
-                concurrency=concurrency, name=f"{run_cfg.run_name}-eval",
+        if val_ds is not None:
+            val_ds = offload_molmoact2_preprocessing(
+                val_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
+                concurrency=concurrency, name=f"{run_cfg.run_name}-val",
+            )
+        if test_ds is not None:
+            test_ds = offload_molmoact2_preprocessing(
+                test_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
+                concurrency=concurrency, name=f"{run_cfg.run_name}-test",
             )
 
     if run_cfg.train.save_only_on_improvement:
@@ -712,19 +872,34 @@ def main() -> None:
         )
 
     datasets = {"train": ds}
-    if eval_ds is not None:
-        datasets["eval"] = eval_ds
+    if val_ds is not None:
+        datasets["val"] = val_ds
+    if test_ds is not None:
+        datasets["test"] = test_ds
 
     print(f"\n=== launch Ray Train: {run_cfg.run_name} ===")
     trainer = ray.train.torch.TorchTrainer(
         train_loop_per_worker=train_loop_per_worker,
         train_loop_config={
             "run_cfg": run_cfg, "dataset_stats": dataset_stats,
-            # v3_root/eval_episode_indices aren't part of RunConfig's own
-            # schema (internal plumbing for training/wandb_logging.py's
-            # sample_episode_frames, not user-facing config) -- threaded
+            # v3_root/val_episode_indices/test_episode_indices/val_active/
+            # test_active aren't part of RunConfig's own schema (internal
+            # plumbing for training/wandb_logging.py's sample_episode_frames
+            # and train_loop.py's get_dataset_shard gating -- val/test can be
+            # active via EITHER a split fraction OR a separate --val-v3-root/
+            # --test-v3-root, so train_loop.py needs an explicit bool rather
+            # than re-deriving it from a TrainConfig field) -- threaded
             # through train_loop_config the same way dataset_stats already is.
-            "v3_root": v3_root, "eval_episode_indices": eval_episode_indices,
+            # GIF sampling always reads from THIS "v3_root" key (train_loop.py's
+            # sample_episode_frames), so it must point at whichever root
+            # val_episode_indices' indices actually belong to: --val-v3-root
+            # when that's how val was configured (val_episode_indices are
+            # then indices into THAT separate root, not the training root --
+            # reusing the training v3_root here would read the wrong episode
+            # or a nonexistent one), else the training v3_root as before.
+            "v3_root": args.val_v3_root or v3_root, "val_episode_indices": val_episode_indices,
+            "test_episode_indices": test_episode_indices,
+            "val_active": val_ds is not None, "test_active": test_ds is not None,
         },
         scaling_config=ray.train.ScalingConfig(num_workers=num_workers, use_gpu=use_gpu),
         run_config=ray.train.RunConfig(

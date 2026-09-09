@@ -126,8 +126,10 @@ unverified.
 FSDP2 itself and affecting ACT equally: `train_loop_per_worker`'s resume
 logic computed `start_epoch = state["epoch"] + 1` unconditionally, which is
 only correct when resuming from an end-of-epoch checkpoint. A step-windowed
-(mid-epoch) checkpoint -- the ones this codebase takes every
-`--eval-every-steps`, its main checkpointing mechanism -- has `epoch` equal
+(mid-epoch) checkpoint -- what this codebase took every `--eval-every-steps`
+at the time (renamed `--window-every-steps` since; today's main
+checkpointing cadence has moved to `--val-every-steps` whenever val is
+active, the default) -- has `epoch` equal
 to whatever epoch was still in progress, so `epoch + 1` always looked like
 "the next epoch" and, combined with `num_epochs=1` (this codebase's own
 documented typical setting), `start_epoch >= num_epochs` always
