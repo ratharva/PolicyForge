@@ -1,15 +1,26 @@
-# Works for both --policy-type act and --policy-type molmoact2 -- MolmoAct2
-# is bundled in this pinned lerobot version (verified directly against the
-# real public PyPI wheel: lerobot/policies/molmoact2/ is really in there),
-# no fork or separate environment needed. (An earlier version of this file
-# said otherwise, based on research against a fork branch that was never
-# cross-checked against what's actually pinned below -- see README's
-# "MolmoAct2 environment" section for the correction.)
+# Works for --policy-type act, molmoact2, and pi05 -- all three are bundled
+# in this pinned lerobot version (verified directly against the real public
+# PyPI wheel), no fork or separate environment needed. (An earlier version
+# of this file said otherwise for MolmoAct2, based on research against a
+# fork branch that was never cross-checked against what's actually pinned
+# below -- see README's "MolmoAct2 environment" section for the correction.)
 # >=2.55: 2.49.0-2.54.0 have a Parquet-deserialization RCE (CVE-2026-41486)
 ray[data,train]>=2.55
 huggingface_hub
 mcap
 mcap-protobuf-support
+# Required for --policy-type molmoact2 AND pi05 -- both real-construct
+# transformers.* classes (MolmoAct2Policy/PI05Policy.__init__ call
+# require_package("transformers", extra="pi"/"molmoact2")), confirmed via a
+# real ImportError, not assumed. This had gone unnoticed for MolmoAct2 since
+# it's only ever been exercised here via the fake-policy integration test
+# pattern (which monkeypatches build_policy_and_processor and never actually
+# imports the real MolmoAct2Policy class) -- a real PI05Policy.from_pretrained
+# call was what actually surfaced it. Versions match lerobot==0.6.1's own
+# declared "transformers-dep"/"scipy-dep" extras exactly (pip show lerobot
+# --verbose, or importlib.metadata.distribution("lerobot").requires).
+transformers>=5.4.0,<5.6.0
+scipy>=1.14.0,<2.0.0
 # Pinned <16.0.0, not left unconstrained -- lerobot==0.6.1's own "dataset"
 # extra (needed by the droid ingestion strategy's
 # convert_dataset_v21_to_v30.py -> lerobot.datasets -> pyav_utils.py) hard-
