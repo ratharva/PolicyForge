@@ -352,6 +352,13 @@ def main() -> None:
                          help="pads input_features with dummy observation.images.empty_camera_{i} "
                               "VISUAL features up to this count -- for when --pi05-pretrained-path's "
                               "checkpoint expects more camera slots than this dataset has")
+    parser.add_argument("--pi05-dtype", choices=("bfloat16", "float32"), default="bfloat16",
+                         help="precision for most of the model (vision_tower/multi_modal_projector/"
+                              "layernorms always stay float32 for stability, regardless of this flag -- "
+                              "PaliGemmaWithExpertModel's own real design). bfloat16 (default) matches "
+                              "PI05's real upstream default and gets real speedup on H100/A100 tensor "
+                              "cores -- this pipeline previously never set this at all, silently training "
+                              "in full float32")
     args = parser.parse_args()
 
     # Policy-specific "required iff"/cross-field validation moved below,
@@ -503,6 +510,7 @@ def main() -> None:
         _apply_if_explicit(m, "train_expert_only", args, "pi05_train_expert_only", parser)
         _apply_if_explicit(m, "gradient_checkpointing", args, "pi05_gradient_checkpointing", parser)
         _apply_if_explicit(m, "empty_cameras", args, "pi05_empty_cameras", parser)
+        _apply_if_explicit(m, "dtype", args, "pi05_dtype", parser)
         if not m.pretrained_path:
             parser.error(
                 "--pi05-pretrained-path is required when --policy-type pi05 (either as a CLI flag or "

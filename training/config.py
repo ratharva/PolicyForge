@@ -102,6 +102,16 @@ class Pi05ConfigOverrides(PolicyOverrides):
     freeze_vision_encoder: bool = False   # freezes the vision tower only
     train_expert_only: bool = False       # only the action expert trains
     gradient_checkpointing: bool = True   # our own default; real PI05Config default is False
+    # "bfloat16" (real PI05Config/PaliGemmaWithExpertModel default) or
+    # "float32". Never wired through before this field existed -- PI05Config
+    # itself defaults to "float32", so every run silently trained in full
+    # fp32 on H100/A100 hardware that gets real speedup from bf16 tensor
+    # cores. bfloat16 casts most of the model (confirmed via
+    # to_bfloat16_for_selected_params's real source) but deliberately keeps
+    # vision_tower/multi_modal_projector/layernorms/model.norm in float32
+    # for numerical stability -- this is the library's own designed mixed-
+    # precision split, not a blunt whole-model cast.
+    dtype: str = "bfloat16"
     # Pads input_features with dummy observation.images.empty_camera_{i}
     # VISUAL features up to a target camera count, for when a pretrained
     # checkpoint expects more camera slots than this dataset has.

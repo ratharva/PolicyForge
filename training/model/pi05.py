@@ -59,6 +59,7 @@ def build_pi05_config(
         gradient_checkpointing=overrides.gradient_checkpointing,
         empty_cameras=overrides.empty_cameras,
         image_resolution=(h, w),
+        dtype=overrides.dtype,
         # STATE/ACTION: MEAN_STD (not the real default IDENTITY/QUANTILES),
         # same deliberate simplification as MolmoAct2, so
         # training/data/stats.py's mean/std-only compute_dataset_stats
