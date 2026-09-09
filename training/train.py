@@ -361,9 +361,9 @@ def main() -> None:
                          help="precision for most of the model (vision_tower/multi_modal_projector/"
                               "layernorms always stay float32 for stability, regardless of this flag -- "
                               "PaliGemmaWithExpertModel's own real design). bfloat16 (default) matches "
-                              "PI05's real upstream default and gets real speedup on H100/A100 tensor "
-                              "cores -- this pipeline previously never set this at all, silently training "
-                              "in full float32")
+                              "that same class's own real default and gets real speedup on H100/A100 "
+                              "tensor cores -- PI05Config itself defaults to float32, so this pipeline "
+                              "previously never set this at all, silently training in full float32")
     args = parser.parse_args()
 
     # Policy-specific "required iff"/cross-field validation moved below,

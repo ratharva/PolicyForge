@@ -8,18 +8,22 @@ import ray
 
 def _quiet_placement_group_cleaner() -> None:
     """worker_process_setup_hook -- runs once per Ray worker process at
-    startup. Silences PlacementGroupCleaner's own benign, high-frequency
-    "State API may be temporarily unavailable" warning (it just means its
-    periodic health-check query failed and it's retrying -- see
-    ray/train/v2/_internal/execution/controller/placement_group_cleaner.py)
-    without touching any other Ray-internal logger's level, unlike a
-    blanket ray.LoggingConfig(log_level=...) which would hide every Ray
-    WARNING everywhere."""
+    startup. Filters out ONLY PlacementGroupCleaner's benign, high-frequency
+    "State API may be temporarily unavailable" message (a periodic health-
+    check retry, not a real problem) -- NOT a setLevel(ERROR) on the whole
+    logger, which would also hide its other real warnings (cleanup failure,
+    monitor-thread shutdown timeout, dead-controller detection -- confirmed
+    by reading every logger.warning() call site in placement_group_cleaner.py)
+    that matter for noticing leaked resources."""
     import logging
+
+    class _TransientStateApiWarningFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "State API may be temporarily unavailable" not in record.getMessage()
 
     logging.getLogger(
         "ray.train.v2._internal.execution.controller.placement_group_cleaner"
-    ).setLevel(logging.ERROR)
+    ).addFilter(_TransientStateApiWarningFilter())
 
 
 def build_runtime_env(storage_root: str | None = None) -> dict:
