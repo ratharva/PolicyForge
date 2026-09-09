@@ -95,4 +95,17 @@ def build_policy_and_processor(
 
 def forward_loss(policy, inputs: dict) -> tuple[torch.Tensor, dict[str, float]]:
     loss, metrics = policy(inputs)
-    return loss, {k: float(v) for k, v in metrics.items()}
+    # PI05Policy.forward() returns loss_per_dim as a real list (one entry per
+    # action dim), not a scalar -- confirmed via its real installed source
+    # (modeling_pi05.py). Expand any list/tuple-valued metric into named
+    # per-index scalars instead of dropping it; it's genuinely useful
+    # (which action dims are harder to predict), and this handles any future
+    # list-valued metric generically, not just this one key.
+    scalars: dict[str, float] = {}
+    for k, v in metrics.items():
+        if isinstance(v, (list, tuple)):
+            for i, vi in enumerate(v):
+                scalars[f"{k}_{i}"] = float(vi)
+        else:
+            scalars[k] = float(v)
+    return loss, scalars
