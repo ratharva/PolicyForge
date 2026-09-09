@@ -134,7 +134,7 @@ def _report_with_checkpoint(
 
 def _run_eval_pass(
     shard, adapter: PolicyAdapter, policy, preprocessor, data_cfg, dataset_stats: dict,
-    dist_ctx, collate, batch_size: int, max_batches: int | None,
+    dist_ctx, collate, batch_size: int, max_batches: int | None, device: torch.device,
 ) -> tuple[float, int, dict[str, float], dict | None]:
     """Read-only forward+loss pass over `shard`, capped at `max_batches` per
     rank (None = unbounded -- the one-time TEST pass). Shared by the
@@ -143,13 +143,36 @@ def _run_eval_pass(
     _gather_eval_stats (this function only returns THIS rank's local
     contribution). torch.inference_mode() is strictly stronger than
     torch.no_grad() for a read-only pass like this (skips autograd
-    version-counter bookkeeping no_grad still does)."""
+    version-counter bookkeeping no_grad still does).
+
+    Each rank's own shard (ray.train.get_dataset_shard) isn't guaranteed to
+    have the same row count as every other rank's -- so without the
+    cross-rank sync below, a rank that runs out of local batches first
+    would exit into the collective _gather_eval_stats/all_gather_object
+    while another rank is still inside adapter.forward_loss, itself a
+    collective for DDP (buffer broadcast, on by default) or FSDP2 (param
+    all-gather) -- two different ranks stuck in two different collective
+    ops is a real deadlock, not a theoretical one. Every rank all_reduces
+    (MIN) a "do I still have a batch" flag before each forward call, so
+    all ranks agree to stop together and call forward() the exact same
+    number of times. Trade-off: the pass stops as soon as the SMALLEST
+    rank's shard (or max_batches) is exhausted -- it may not process every
+    row of an unevenly-split shard, which is preferable to hanging."""
     loss_sum, n = 0.0, 0
     metrics_sum: dict[str, float] = {}
     last_inputs = None
+    distributed = torch.distributed.is_initialized()
+    it = iter(shard.iter_torch_batches(batch_size=batch_size, collate_fn=collate))
+    i = 0
     with torch.inference_mode():
-        for i, batch in enumerate(shard.iter_torch_batches(batch_size=batch_size, collate_fn=collate)):
-            if max_batches is not None and i >= max_batches:
+        while max_batches is None or i < max_batches:
+            batch = next(it, None)
+            has_batch = batch is not None
+            if distributed:
+                flag = torch.tensor([1.0 if has_batch else 0.0], device=device)
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+                has_batch = bool(flag.item())
+            if not has_batch:
                 break
             if not adapter.needs_task:
                 batch.pop("task", None)
@@ -171,7 +194,53 @@ def _run_eval_pass(
             n += 1
             for k, v in step_metrics.items():
                 metrics_sum[k] = metrics_sum.get(k, 0.0) + v
+            i += 1
     return loss_sum, n, metrics_sum, last_inputs
+
+
+def _finish_val_pass(
+    loss_sum: float, n: int, metrics_sum: dict[str, float], adapter: PolicyAdapter,
+    unwrapped_policy, optimizer, dist_ctx, run_cfg: RunConfig, train_cfg: TrainConfig,
+    epoch: int, step: int, epoch_complete: bool, rank: int, tb_writer, wandb_run,
+    best_val_loss_seen: float,
+) -> float:
+    """Shared tail of a val pass -- gather this rank's _run_eval_pass output
+    across ranks, log under val/*, and attach a checkpoint scored by THIS
+    pass's loss (never training loss) when it improves best_val_loss_seen
+    (or unconditionally, per save_only_on_improvement). Returns the updated
+    best_val_loss_seen. Used by both the periodic VAL block and the
+    epoch-end safety-net val pass in train_loop_per_worker -- a short run
+    (fewer steps than the val cadence) would otherwise end with NO
+    checkpoint at all, now that neither the windowed nor epoch-end
+    training-loss reports attach one while val is active."""
+    loss_sum, n, metrics_sum = _gather_eval_stats(loss_sum, n, metrics_sum)
+    val_report_metrics = {
+        "epoch": epoch, "steps": step, "report_kind": "val",
+        "loss": loss_sum / max(n, 1),
+        **{k: v / max(n, 1) for k, v in metrics_sum.items()},
+    }
+    if rank == 0 and n > 0:
+        _log_all(
+            tb_writer, wandb_run, "val",
+            {k: v for k, v in val_report_metrics.items() if k not in ("epoch", "steps", "report_kind")},
+            step, train_cfg,
+        )
+        if tb_writer is not None:
+            tb_writer.flush()
+
+    val_improved = val_report_metrics["loss"] < best_val_loss_seen
+    if val_improved:
+        best_val_loss_seen = val_report_metrics["loss"]
+
+    save_checkpoint = val_improved if train_cfg.save_only_on_improvement else True
+    with perf_logging.Timer() as t_ckpt:
+        _report_with_checkpoint(
+            val_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
+            run_cfg, epoch, step, epoch_complete=epoch_complete, rank=rank, save_checkpoint=save_checkpoint,
+        )
+    if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
+        _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
+    return best_val_loss_seen
 
 
 def train_loop_per_worker(config: dict) -> None:
@@ -611,7 +680,7 @@ def train_loop_per_worker(config: dict) -> None:
                 policy.eval()
                 val_loss_sum, val_n, val_metrics_sum, last_val_inputs = _run_eval_pass(
                     val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
-                    train_cfg.val_batch_size or train_cfg.batch_size, train_cfg.val_max_batches,
+                    train_cfg.val_batch_size or train_cfg.batch_size, train_cfg.val_max_batches, device,
                 )
 
                 # Predicted-frames GIFs -- pure groundwork for a future
@@ -655,40 +724,17 @@ def train_loop_per_worker(config: dict) -> None:
                             wandb_run.log(filtered, step=step)
                 policy.train()
 
-                # Collective -- every rank must call this, not just rank 0.
-                # Unlike the training-loss window/epoch reports (rank 0's
-                # own local shard slice only), every rank ends up with the
-                # SAME globally-summed val loss after this gather, so
-                # val_report_metrics/val_improved below are identical on
-                # every rank -- no separate cross-rank broadcast needed for
-                # this block specifically.
-                val_loss_sum, val_n, val_metrics_sum = _gather_eval_stats(val_loss_sum, val_n, val_metrics_sum)
-                val_report_metrics = {
-                    "epoch": epoch, "steps": step, "report_kind": "val",
-                    "loss": val_loss_sum / max(val_n, 1),
-                    **{k: v / max(val_n, 1) for k, v in val_metrics_sum.items()},
-                }
-                if rank == 0 and val_n > 0:
-                    _log_all(
-                        tb_writer, wandb_run, "val",
-                        {k: v for k, v in val_report_metrics.items() if k not in ("epoch", "steps", "report_kind")},
-                        step, train_cfg,
-                    )
-                    if tb_writer is not None:
-                        tb_writer.flush()
-
-                val_improved = val_report_metrics["loss"] < best_val_loss_seen
-                if val_improved:
-                    best_val_loss_seen = val_report_metrics["loss"]
-
-                save_checkpoint = val_improved if train_cfg.save_only_on_improvement else True
-                with perf_logging.Timer() as t_ckpt:
-                    _report_with_checkpoint(
-                        val_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
-                        run_cfg, epoch, step, epoch_complete=False, rank=rank, save_checkpoint=save_checkpoint,
-                    )
-                if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
-                    _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
+                # Collective -- _finish_val_pass's own _gather_eval_stats
+                # call, every rank must reach it. Unlike the training-loss
+                # window/epoch reports (rank 0's own local shard slice
+                # only), every rank ends up with the SAME globally-summed
+                # val loss after that gather, so this is safe to call
+                # identically on every rank.
+                best_val_loss_seen = _finish_val_pass(
+                    val_loss_sum, val_n, val_metrics_sum, adapter, unwrapped_policy, optimizer, dist_ctx,
+                    run_cfg, train_cfg, epoch, step, epoch_complete=False, rank=rank,
+                    tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+                )
 
             # Episode-preview GIFs -- independent cadence from the val
             # report above (wandb_gif_every_steps can differ from the
@@ -746,23 +792,40 @@ def train_loop_per_worker(config: dict) -> None:
             if improved:
                 best_loss_seen = metrics["loss"]
 
-        # Same gating as the windowed block: whenever a val split is
-        # active, val owns checkpoint retention exclusively -- an
-        # epoch-end checkpoint scored by training loss would otherwise
-        # sit in the SAME best-N pool as val-scored checkpoints under the
-        # same checkpoint_score_attribute="loss" key, letting a low
-        # training loss displace the intended val-selected checkpoints.
-        save_checkpoint = (
-            False if val_shard is not None
-            else (improved if train_cfg.save_only_on_improvement else True)
-        )
-        with perf_logging.Timer() as t_ckpt:
-            _report_with_checkpoint(
-                metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
-                run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
+        if val_shard is not None:
+            # Same gating as the windowed block: whenever a val split is
+            # active, val owns checkpoint retention exclusively -- an
+            # epoch-end checkpoint scored by training loss would otherwise
+            # sit in the SAME best-N pool as val-scored checkpoints under
+            # the same checkpoint_score_attribute="loss" key, letting a low
+            # training loss displace the intended val-selected checkpoints.
+            # Running a fresh val pass here (rather than just skipping
+            # attachment) matters for a SHORT run -- fewer steps than the
+            # val cadence never fires the periodic VAL block at all, and
+            # skipping epoch-end too would leave the run with NO checkpoint
+            # whatsoever. This may duplicate a val pass that happened to
+            # also fire at this exact step via the periodic block -- a
+            # small, bounded extra cost, not a correctness issue.
+            policy.eval()
+            epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, _ = _run_eval_pass(
+                val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
+                train_cfg.val_batch_size or train_cfg.batch_size, train_cfg.val_max_batches, device,
             )
-        if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
-            _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
+            policy.train()
+            best_val_loss_seen = _finish_val_pass(
+                epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, adapter, unwrapped_policy, optimizer,
+                dist_ctx, run_cfg, train_cfg, epoch, step, epoch_complete=True, rank=rank,
+                tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+            )
+        else:
+            save_checkpoint = improved if train_cfg.save_only_on_improvement else True
+            with perf_logging.Timer() as t_ckpt:
+                _report_with_checkpoint(
+                    metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
+                    run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
+                )
+            if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
+                _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
 
         if should_stop or (train_cfg.max_train_steps and step >= train_cfg.max_train_steps):
             break
@@ -779,7 +842,7 @@ def train_loop_per_worker(config: dict) -> None:
         policy.eval()
         test_loss_sum, test_n, test_metrics_sum, _ = _run_eval_pass(
             test_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
-            train_cfg.val_batch_size or train_cfg.batch_size, max_batches=None,
+            train_cfg.val_batch_size or train_cfg.batch_size, max_batches=None, device=device,
         )
         policy.train()
         # Collective -- every rank must call this, not just rank 0.

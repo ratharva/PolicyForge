@@ -447,6 +447,8 @@ def main() -> None:
     _apply_if_explicit(run_cfg.train, "weight_decay", args, "weight_decay", parser)
     _apply_if_explicit(run_cfg.train, "max_train_steps", args, "max_train_steps", parser)
     _apply_if_explicit(run_cfg.train, "window_every_steps", args, "window_every_steps", parser)
+    if run_cfg.train.window_every_steps <= 0:
+        parser.error(f"--window-every-steps must be positive, got {run_cfg.train.window_every_steps}")
     _apply_if_explicit(
         run_cfg.train, "early_stop_patience", args, "early_stop_patience", parser,
         transform=lambda v: v if v > 0 else None,
@@ -478,6 +480,8 @@ def main() -> None:
     # value before the range check below ever saw it.
     _apply_if_explicit(run_cfg.train, "val_split_fraction", args, "val_split_fraction", parser)
     _apply_if_explicit(run_cfg.train, "val_every_steps", args, "val_every_steps", parser)
+    if run_cfg.train.val_every_steps is not None and run_cfg.train.val_every_steps <= 0:
+        parser.error(f"--val-every-steps must be positive, got {run_cfg.train.val_every_steps}")
     _apply_if_explicit(run_cfg.train, "val_max_batches", args, "val_max_batches", parser)
     if run_cfg.train.val_max_batches <= 0:
         parser.error(f"--val-max-batches must be positive, got {run_cfg.train.val_max_batches}")
