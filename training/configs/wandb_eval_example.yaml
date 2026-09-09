@@ -19,7 +19,7 @@ train:
   # keep only W&B).
   tensorboard: true
   wandb: true
-  wandb_project: policyforge
+  wandb_project: openpolicykernel
   # wandb_entity: your-team-or-username
 
   # Allowlist: only these (plus anything matching a glob) go to W&B --

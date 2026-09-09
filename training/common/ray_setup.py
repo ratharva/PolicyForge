@@ -59,9 +59,9 @@ def connect_ray(runtime_env: dict) -> "ray.runtime_context.RuntimeContext":
         print("connected to existing cluster")
     except ConnectionError:
         # Loopback-only by default (Ray's dashboard has no auth). Override via
-        # POLICYFORGE_DASHBOARD_HOST for remote access, or tunnel instead:
+        # OPENPOLICYKERNEL_DASHBOARD_HOST for remote access, or tunnel instead:
         # ssh -L 8265:localhost:8265 <host>
-        dashboard_host = os.environ.get("POLICYFORGE_DASHBOARD_HOST", "127.0.0.1")
+        dashboard_host = os.environ.get("OPENPOLICYKERNEL_DASHBOARD_HOST", "127.0.0.1")
         if dashboard_host not in ("127.0.0.1", "localhost", "::1"):
             print(f"WARNING: Ray dashboard binding to {dashboard_host!r} -- no built-in auth, "
                   f"anyone who can reach it can execute code on this machine.")
