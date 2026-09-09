@@ -454,9 +454,12 @@ def train_loop_per_worker(config: dict) -> None:
                     prof_started = False
 
             if step % 10 == 0 and rank == 0:
+                # Explicit timestamp -- Ray's own log capture for a worker's
+                # stdout only prefixes "(RayTrainWorker pid=...)", it doesn't
+                # add one the way the driver's own INFO lines do.
                 log.info(
-                    "epoch=%d step=%d loss=%.4f %s",
-                    epoch, step, loss.item(),
+                    "%s epoch=%d step=%d loss=%.4f %s",
+                    time.strftime("%Y-%m-%d %H:%M:%S"), epoch, step, loss.item(),
                     " ".join(f"{k}={v:.4f}" for k, v in step_metrics.items()),
                 )
                 train_values = {"loss": loss.item(), **step_metrics}

@@ -63,6 +63,13 @@ class MolmoAct2ConfigOverrides(PolicyOverrides):
     lora_dropout: float = 0.05
     lora_bias: str = "none"
     gradient_checkpointing: bool = True   # our own default; real MolmoAct2Config default is False
+    # "bfloat16" (real MolmoAct2Config default already) or "float32"/"float16".
+    # Unlike PI05, MolmoAct2Config.model_dtype already defaults to bfloat16
+    # upstream and drives a real torch.autocast(dtype=model_dtype) context
+    # (confirmed in modeling_molmoact2.py) -- this pipeline was already
+    # getting that benefit by not touching the field; this just makes it a
+    # real, user-selectable override (e.g. float32 to debug a numerics issue).
+    dtype: str = "bfloat16"
     image_keys: list[str] | None = None   # None -> derived from data_cfg.robot.camera_keys at build time
     setup_type: str = ""     # REQUIRED free-text embodiment prompt, validated non-empty at build time
     control_mode: str = ""   # REQUIRED free-text control-mode prompt, validated non-empty at build time
@@ -102,6 +109,16 @@ class Pi05ConfigOverrides(PolicyOverrides):
     freeze_vision_encoder: bool = False   # freezes the vision tower only
     train_expert_only: bool = False       # only the action expert trains
     gradient_checkpointing: bool = True   # our own default; real PI05Config default is False
+    # Precision options: "bfloat16" or "float32". Never wired through before
+    # this field existed -- PI05Config itself defaults to "float32" (its
+    # OWN dataclass default), so every run silently trained in full
+    # fp32 on H100/A100 hardware that gets real speedup from bf16 tensor
+    # cores. bfloat16 casts most of the model (confirmed via
+    # to_bfloat16_for_selected_params's real source) but deliberately keeps
+    # vision_tower/multi_modal_projector/layernorms/model.norm in float32
+    # for numerical stability -- this is the library's own designed mixed-
+    # precision split, not a blunt whole-model cast.
+    dtype: str = "bfloat16"
     # Pads input_features with dummy observation.images.empty_camera_{i}
     # VISUAL features up to a target camera count, for when a pretrained
     # checkpoint expects more camera slots than this dataset has.
