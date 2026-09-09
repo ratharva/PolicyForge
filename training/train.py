@@ -470,24 +470,28 @@ def main() -> None:
     _apply_if_explicit(
         run_cfg.train, "wandb_predict_frames_every_steps", args, "wandb_predict_frames_every_steps", parser,
     )
-    _apply_if_explicit(
-        run_cfg.train, "val_split_fraction", args, "val_split_fraction", parser,
-        transform=lambda v: v if v > 0 else None,
-    )
+    # No transform here -- 0 is a real, valid "disabled" value (same as
+    # None) everywhere val_split_fraction/test_split_fraction are actually
+    # used below (all truthy checks, `or 0`, etc.), so a CLI 0 and a
+    # --config-file YAML 0 now behave identically. Mapping 0-or-negative to
+    # None here would also silently swallow a genuinely invalid negative
+    # value before the range check below ever saw it.
+    _apply_if_explicit(run_cfg.train, "val_split_fraction", args, "val_split_fraction", parser)
     _apply_if_explicit(run_cfg.train, "val_every_steps", args, "val_every_steps", parser)
     _apply_if_explicit(run_cfg.train, "val_max_batches", args, "val_max_batches", parser)
+    if run_cfg.train.val_max_batches <= 0:
+        parser.error(f"--val-max-batches must be positive, got {run_cfg.train.val_max_batches}")
     _apply_if_explicit(run_cfg.train, "val_batch_size", args, "val_batch_size", parser)
-    _apply_if_explicit(
-        run_cfg.train, "test_split_fraction", args, "test_split_fraction", parser,
-        transform=lambda v: v if v > 0 else None,
-    )
+    _apply_if_explicit(run_cfg.train, "test_split_fraction", args, "test_split_fraction", parser)
     for frac_name, frac_value, root_flag, root_value in (
         ("--val-split-fraction", run_cfg.train.val_split_fraction, "--val-v3-root", args.val_v3_root),
         ("--test-split-fraction", run_cfg.train.test_split_fraction, "--test-v3-root", args.test_v3_root),
     ):
         if root_value and frac_value:
             parser.error(f"{frac_name} and {root_flag} are mutually exclusive -- pick one")
-        if frac_value is not None and not (0 < frac_value < 1):
+        # Exact 0 means "disabled" (falsy, skips this check) -- only a
+        # genuinely out-of-range value (negative, or >= 1) is rejected.
+        if frac_value and not (0 < frac_value < 1):
             parser.error(f"{frac_name} must be strictly between 0 and 1, got {frac_value}")
     if (
         run_cfg.train.val_split_fraction and run_cfg.train.test_split_fraction
@@ -774,6 +778,13 @@ def main() -> None:
                 f"WARNING: --{kind}-v3-root {side_v3_root} has tick_fps={side_robot.tick_fps}, training "
                 f"root has tick_fps={original_robot.tick_fps} -- real-world timing semantics differ."
             )
+        # Imported here, not reused from the fraction-split branch above --
+        # this helper runs whenever --val-v3-root/--test-v3-root is passed,
+        # independently of whether a percentage split was also requested
+        # (the two are mutually exclusive per side, so that branch may
+        # never have run at all).
+        from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
+
         side_meta = LeRobotDatasourceMetadata(side_v3_root)
         side_episode_indices = side_meta.episodes.column("episode_index").to_pylist()
         side_raw_ds = build_lerobot_v3_dataset(
@@ -875,7 +886,14 @@ def main() -> None:
             # --test-v3-root, so train_loop.py needs an explicit bool rather
             # than re-deriving it from a TrainConfig field) -- threaded
             # through train_loop_config the same way dataset_stats already is.
-            "v3_root": v3_root, "val_episode_indices": val_episode_indices,
+            # GIF sampling always reads from THIS "v3_root" key (train_loop.py's
+            # sample_episode_frames), so it must point at whichever root
+            # val_episode_indices' indices actually belong to: --val-v3-root
+            # when that's how val was configured (val_episode_indices are
+            # then indices into THAT separate root, not the training root --
+            # reusing the training v3_root here would read the wrong episode
+            # or a nonexistent one), else the training v3_root as before.
+            "v3_root": args.val_v3_root or v3_root, "val_episode_indices": val_episode_indices,
             "test_episode_indices": test_episode_indices,
             "val_active": val_ds is not None, "test_active": test_ds is not None,
         },

@@ -60,19 +60,11 @@ def connect_ray(runtime_env: dict) -> "ray.runtime_context.RuntimeContext":
     except ConnectionError:
         # Loopback-only by default (Ray's dashboard has no auth). Override via
         # ROBOPOLICYKERNEL_DASHBOARD_HOST for remote access, or tunnel instead:
-        # ssh -L 8265:localhost:8265 <host>. POLICYFORGE_DASHBOARD_HOST (the
-        # pre-rename name) still works as a fallback so an existing launch
-        # script that sets it doesn't silently start binding to loopback
-        # after upgrading -- the new name wins if both are set.
+        # ssh -L 8265:localhost:8265 <host>.
         # `or None` normalizes an explicitly-empty value to "unset" -- os.environ.get(key,
         # default) only falls back on a MISSING key, not a present-but-empty one, which
         # would otherwise silently produce dashboard_host="" instead of the real fallback.
-        legacy_dashboard_host = os.environ.get("POLICYFORGE_DASHBOARD_HOST") or None
-        new_dashboard_host = os.environ.get("ROBOPOLICYKERNEL_DASHBOARD_HOST") or None
-        if legacy_dashboard_host and not new_dashboard_host:
-            print("POLICYFORGE_DASHBOARD_HOST is deprecated -- rename it to "
-                  "ROBOPOLICYKERNEL_DASHBOARD_HOST (same effect, still honored for now).")
-        dashboard_host = new_dashboard_host or legacy_dashboard_host or "127.0.0.1"
+        dashboard_host = os.environ.get("ROBOPOLICYKERNEL_DASHBOARD_HOST") or "127.0.0.1"
         if dashboard_host not in ("127.0.0.1", "localhost", "::1"):
             print(f"WARNING: Ray dashboard binding to {dashboard_host!r} -- no built-in auth, "
                   f"anyone who can reach it can execute code on this machine.")

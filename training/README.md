@@ -332,8 +332,10 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --val-split-fraction 0
 
 # Val from a separate, already-prepared v3 root instead of a slice of this one
+# (--val-split-fraction defaults to 0.1 -- disable it explicitly, since the
+# two are mutually exclusive)
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \
-    --val-v3-root /data/curated_val_v3
+    --val-split-fraction 0 --val-v3-root /data/curated_val_v3
 
 # One-time test pass at the end, in addition to the default val split
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act \

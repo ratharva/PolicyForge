@@ -632,7 +632,14 @@ def train_loop_per_worker(config: dict) -> None:
                     and wandb_run is not None and last_val_inputs is not None
                     and step % predict_frames_every == 0
                 ):
-                    predicted = adapter.predict_frames(policy, last_val_inputs)
+                    # last_val_inputs' tensors were created under
+                    # _run_eval_pass's own torch.inference_mode() -- an
+                    # inference tensor used in a graph built OUTSIDE
+                    # inference_mode can raise at runtime (autograd refuses
+                    # to save it for backward), so keep this call inside
+                    # the same mode too, not just policy.eval().
+                    with torch.inference_mode():
+                        predicted = adapter.predict_frames(policy, last_val_inputs)
                     if predicted:
                         import wandb
 
@@ -739,7 +746,16 @@ def train_loop_per_worker(config: dict) -> None:
             if improved:
                 best_loss_seen = metrics["loss"]
 
-        save_checkpoint = improved if train_cfg.save_only_on_improvement else True
+        # Same gating as the windowed block: whenever a val split is
+        # active, val owns checkpoint retention exclusively -- an
+        # epoch-end checkpoint scored by training loss would otherwise
+        # sit in the SAME best-N pool as val-scored checkpoints under the
+        # same checkpoint_score_attribute="loss" key, letting a low
+        # training loss displace the intended val-selected checkpoints.
+        save_checkpoint = (
+            False if val_shard is not None
+            else (improved if train_cfg.save_only_on_improvement else True)
+        )
         with perf_logging.Timer() as t_ckpt:
             _report_with_checkpoint(
                 metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
