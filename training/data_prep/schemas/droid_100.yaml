@@ -1,0 +1,35 @@
+# lerobot/droid_100 -- a small (100-episode, 2GB), already-v3.0, open-access
+# mirror. NOT a subset of cadene/droid_1.0.1 (this project's full "droid"
+# dataset_source) -- its own real meta/info.json (fetched directly, not
+# guessed) has a different observation.state/action dim (7, not 8) and
+# different camera column names, so it needs its own schema/dataset_source
+# rather than a flag on "droid". Exists purely as a fast, small, real
+# end-to-end smoke test: the conversion mechanism (hf_lerobot_mirror's
+# convert_dataset_v21_to_v30.convert_dataset, which no-ops into a straight
+# download+repackage here since the source is already v3.0) was already
+# proven against this exact mirror in this exact codebase -- see
+# docs/customizing-datasets.md's "droid" section.
+dataset_source: droid_100
+ingestion_strategy: hf_lerobot_mirror
+default_source_uri: "hf://datasets/lerobot/droid_100"
+revision: "87301a2d2e99340e2010c9ef0f1d8e780b08aaf9"
+tick_fps: 15.0
+
+# Real column names confirmed directly from lerobot/droid_100's own
+# meta/info.json (features dict) -- NOT cadene/droid_1.0.1's naming
+# convention (droid.yaml's camera_keys drop "image", e.g. "exterior_1_left";
+# this mirror's real columns keep it: "observation.images.exterior_image_1_left").
+camera_keys: [exterior_image_1_left, exterior_image_2_left, wrist_image_left]
+
+state_components:
+  - ["observation.state", 7]
+action_components:
+  - ["action", 7]
+
+hf_lerobot_mirror:
+  full_repo_id: lerobot/droid_100
+  source_format_version: v3.0   # already v3.0 -- convert_dataset's own hub-tag check no-ops into a plain download
+  camera_key_map:
+    exterior_image_1_left: observation.images.exterior_image_1_left
+    exterior_image_2_left: observation.images.exterior_image_2_left
+    wrist_image_left: observation.images.wrist_image_left
