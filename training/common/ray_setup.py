@@ -47,9 +47,25 @@ def build_runtime_env(storage_root: str | None = None) -> dict:
             rel = None  # e.g. different drive on Windows
         if rel and not rel.startswith(".."):
             excludes.append(f"{rel}/**")
+
+    # Ray Train workers are spawned by Ray's own actor infrastructure, not
+    # plain child processes of this driver -- confirmed via a real repro:
+    # `export NCCL_NVLS_ENABLE=0` in the exact same shell, right before
+    # running this script, does NOT reach the worker process where NCCL
+    # actually initializes (still hit the same NVLS CUDA error). Forward
+    # any NCCL_* var the user already has set into the runtime_env's own
+    # env_vars explicitly, rather than hardcoding a specific NCCL opinion
+    # here -- this fixes the general propagation gap (any NCCL_* export),
+    # not just the one NVLS symptom that happened to surface it (a shared/
+    # virtualized multi-GPU instance whose NVLink SHARP multicast isn't
+    # fully exposed to this container -- real, reproduced error: "Failed to
+    # bind NVLink SHARP (NVLS) Multicast memory... CUDA error 401").
+    env_vars = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+
     return {
         "working_dir": ".", "excludes": excludes,
         "worker_process_setup_hook": _quiet_placement_group_cleaner,
+        "env_vars": env_vars,
     }
 
 
