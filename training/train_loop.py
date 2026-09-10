@@ -1049,12 +1049,31 @@ def train_loop_per_worker(config: dict) -> None:
             run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=False,
         )
 
-    if async_checkpointer is not None and rank == 0:
+    if async_checkpointer is not None:
         # Flush the LAST in-flight async save -- without this, a save
         # kicked off by the final checkpoint-worthy call never gets
         # reported to Ray at all (nothing left to trigger it), silently
         # losing what should be the run's final checkpoint.
-        _attach_finished_async_checkpoint(async_checkpointer.drain())
+        #
+        # Every rank MUST call ray.train.report() exactly once here,
+        # symmetrically -- a real deadlock was observed from an earlier,
+        # rank-0-only version of this block: only rank 0 ever touches
+        # async_checkpointer, so when it had a pending save to flush, it
+        # called report(checkpoint=...) here while every other rank called
+        # nothing at all, permanently desyncing Ray Train's cross-rank
+        # report() rendezvous (SynchronizationActor waited forever, not
+        # just the ~60-120s seen for the earlier, transient double-val-pass
+        # stall -- this one never resolves, since no later event makes the
+        # other ranks catch up). drain() on any non-zero rank always
+        # returns None (that rank's own async_checkpointer never had
+        # anything submitted to it), so the "else" branch below covers
+        # them for free -- this isn't rank-gated, it's just naturally a
+        # no-op there.
+        finished = async_checkpointer.drain() if rank == 0 else None
+        if finished is not None:
+            _attach_finished_async_checkpoint(finished)
+        else:
+            ray.train.report({"report_kind": "final_drain"})
 
     if prof is not None and prof_started:
         # max_train_steps/should_stop broke out of the loop before reaching
