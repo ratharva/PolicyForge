@@ -591,6 +591,13 @@ def train_loop_per_worker(config: dict) -> None:
     best_val_loss_seen = float("inf")
     windows_without_improvement = 0
     should_stop = False
+    # Tracks the last step the periodic VAL block actually ran at, so the
+    # epoch-end safety-net val pass (below) can skip itself when it would
+    # be a redundant, back-to-back re-run of the SAME step's val set (e.g.
+    # --max-train-steps landing exactly on a --val-every-steps boundary) --
+    # a real cross-rank ray.train.report() stall was observed from two val
+    # passes firing back-to-back at the same step, not just wasted compute.
+    last_val_step: int | None = None
 
     # --- perf instrumentation (training/perf_logging.py), opt-in via
     # --log-perf-metrics -- see that module's docstring for why it's not
@@ -834,6 +841,7 @@ def train_loop_per_worker(config: dict) -> None:
             # longer wins retention. Early stopping (above) stays
             # training-loss-based, unchanged.
             if val_shard is not None and step % effective_val_every_steps == 0:
+                last_val_step = step
                 policy.eval()
                 val_loss_sum, val_n, val_metrics_sum, last_val_inputs = _run_eval_pass(
                     val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
@@ -950,7 +958,7 @@ def train_loop_per_worker(config: dict) -> None:
             if improved:
                 best_loss_seen = metrics["loss"]
 
-        if val_shard is not None:
+        if val_shard is not None and step != last_val_step:
             # Same gating as the windowed block: whenever a val split is
             # active, val owns checkpoint retention exclusively -- an
             # epoch-end checkpoint scored by training loss would otherwise
@@ -961,9 +969,13 @@ def train_loop_per_worker(config: dict) -> None:
             # attachment) matters for a SHORT run -- fewer steps than the
             # val cadence never fires the periodic VAL block at all, and
             # skipping epoch-end too would leave the run with NO checkpoint
-            # whatsoever. This may duplicate a val pass that happened to
-            # also fire at this exact step via the periodic block -- a
-            # small, bounded extra cost, not a correctness issue.
+            # whatsoever. Skipped entirely (see the else branch) when the
+            # periodic VAL block already ran at this EXACT step (e.g.
+            # --max-train-steps landing on a --val-every-steps boundary) --
+            # NOT just "a small, bounded extra cost" as originally assumed
+            # here: a real run hit a genuine cross-rank ray.train.report()
+            # stall (SynchronizationActor waiting 120+s on one rank) from
+            # two val passes firing back-to-back at the same step.
             policy.eval()
             epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, _ = _run_eval_pass(
                 val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
@@ -977,7 +989,19 @@ def train_loop_per_worker(config: dict) -> None:
                 async_checkpointer=async_checkpointer,
             )
         else:
-            save_checkpoint = improved if train_cfg.save_only_on_improvement else True
+            # Either val is disabled entirely, OR periodic val already ran
+            # at this exact step -- report the training-loss epoch summary
+            # for bookkeeping symmetry (every rank must still call
+            # ray.train.report() once here), but NEVER attach a checkpoint
+            # from it when val is active: val already owns (or, via the
+            # async one-cycle lag, will shortly own) retention for this
+            # step, so a redundant training-loss-scored checkpoint here
+            # would just pollute the same scoring pool val is supposed to
+            # own exclusively.
+            save_checkpoint = (
+                False if val_shard is not None
+                else (improved if train_cfg.save_only_on_improvement else True)
+            )
             with perf_logging.Timer() as t_ckpt:
                 _report_with_checkpoint(
                     metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
