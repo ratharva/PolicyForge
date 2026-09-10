@@ -21,17 +21,11 @@ class PolicyOverrides(draccus.ChoiceRegistry):
     detail -- runtime code (train_loop.py, model/*.py) keeps accessing
     RunConfig.model by plain attribute access, unaffected by this base."""
 
-    # Populated by train.py's resolve_normalization(), driver-side, AFTER
-    # argparse/draccus parsing and BEFORE TorchTrainer construction -- never
-    # a CLI/YAML input itself (no --flag sets this directly). Every worker
-    # sees it for free via the existing run_cfg plumbing
-    # (train_loop_config["run_cfg"]). None for ACT/MolmoAct2 (no adapter
-    # hook sets it; their build_*_config keeps its own hardcoded
-    # normalization_mapping unchanged) and for pi05 whenever
-    # DataConfig.normalization is left at its all-defaults no-op path. A
-    # real dict is lerobot's own normalization_mapping shape (FeatureType
-    # name -> NormalizationMode name), e.g.
-    # {"VISUAL": "IDENTITY", "STATE": "QUANTILES", "ACTION": "QUANTILES"}.
+    # Populated by train.py's resolve_normalization(), driver-side, before
+    # TorchTrainer construction -- not a CLI/YAML input itself. None for
+    # ACT/MolmoAct2 and for pi05 when normalization resolution is unused.
+    # Shape matches lerobot's normalization_mapping (FeatureType name ->
+    # NormalizationMode name).
     resolved_normalization_mode: dict[str, str] | None = None
 
 
@@ -117,11 +111,8 @@ class Pi05ConfigOverrides(PolicyOverrides):
     # REQUIRED, no safe default -- find a real pretrained checkpoint on the
     # HF Hub and pass it via --pi05-pretrained-path.
     pretrained_path: str = ""
-    # Pins BOTH weight loading (PI05Policy.from_pretrained) and processor-
-    # config loading (get_pretrained_normalization) to this specific Hub
-    # revision/commit/tag. None (default) uses the Hub's default (latest)
-    # revision for both -- same as this pipeline's behavior before this
-    # field existed (no revision was ever passed at all).
+    # Pins both weight loading and normalization-config loading to a
+    # specific Hub revision/commit/tag. None -> Hub's default (latest).
     revision: str | None = None
     chunk_size: int = 50          # PI05Config's own default
     n_action_steps: int = 50      # PI05Config's own default
@@ -155,49 +146,31 @@ class Pi05ConfigOverrides(PolicyOverrides):
     fsdp_state_dict_type: str = "sharded_state_dict"  # accelerate's own default is "full_state_dict",
                                                        # which gathers the whole model onto one rank
 
-    # --- Speed-investigation flags (native-vs-Ray per-step compute gap) ---
-    # See training/README.md's speed-investigation section for the full
-    # writeup of what each of these tests and why. All default off/unused --
-    # byte-identical behavior otherwise.
+    # --- Speed flags (see training/README.md's "π0.5 training speed") ---
 
-    # Real, supported PI05Config fields (lerobot's own modeling_pi05.py
-    # already wires `if config.compile_model: self.forward =
-    # torch.compile(self.forward, mode=config.compile_mode)`) -- this
-    # pipeline just never set them before. Untested here for graph breaks/
-    # compile-time cost or interaction with distributed_strategy="fsdp2"/
-    # gradient_checkpointing -- verify on a short run before trusting for a
-    # real one.
+    # Recommended: closes most of the native-vs-Ray per-step compute gap
+    # (~1.12s -> ~0.46s). Wires PI05Config's own compile_model/compile_mode
+    # (lerobot already does `torch.compile(self.forward, mode=...)` when
+    # set). Use compile_mode "default" or "reduce-overhead", not
+    # "max-autotune" -- its warmup cost is severe.
     compile_model: bool = False
-    compile_mode: str = "max-autotune"   # PI05Config's own default
+    compile_mode: str = "max-autotune"   # PI05Config's own default -- see caveat above
 
-    # EXPERIMENTAL, opt-in: a real monkey-patch on the constructed model
-    # instance, NOT a supported lerobot config option -- see
-    # training/model/pi05.py's _apply_vision_bf16_override. Overrides
-    # lerobot's own PaliGemmaWithExpertModel.to_bfloat16_for_selected_params,
-    # which deliberately keeps vision_tower/multi_modal_projector in
-    # float32 ("so we never toggle (toggle causes optimizer 'same dtype'
-    # error)" -- that function's own real comment). Matches native openpi's
-    # vision precision (bf16) for an A/B speed test -- UNVERIFIED for
-    # training stability, confirm no NaN before trusting beyond a speed test.
+    # Recommended: ~1.12s -> ~0.60s alone, ~0.35s combined with
+    # compile_model. Monkey-patches vision_tower/multi_modal_projector to
+    # bf16 (lerobot keeps them float32 by default) -- see
+    # training/model/pi05.py's _apply_vision_bf16_override. Not yet
+    # confirmed stable over a long training run.
     vision_bf16: bool = False
 
-    # EXPERIMENTAL, opt-in: another real monkey-patch -- see
-    # training/model/pi05.py's _install_narrow_checkpoint_patch. Skips
-    # gradient-checkpointing ONLY the tiny action_out_proj Linear layer
-    # (near-zero memory saved by checkpointing it, pure recompute
-    # overhead), leaving every other checkpointed block untouched. Fragile:
-    # depends on lerobot's exact internal local-function naming (verified
-    # against lerobot==0.6.1) -- re-verify if the lerobot pin changes. Only
-    # meaningful when gradient_checkpointing is also True (the default).
+    # No measured speed effect -- kept as a documented dead end. Monkey-
+    # patches lerobot's _apply_checkpoint to skip checkpointing the tiny
+    # action_out_proj layer. See _install_narrow_checkpoint_patch.
     narrow_checkpoint: bool = False
 
-    # Diagnostic only, zero risk (reads two HF config attributes at
-    # construction time, no forward pass run) -- confirms/refutes whether
-    # this pipeline's training forward path (which never explicitly sets
-    # _attn_implementation, unlike lerobot's inference-only
-    # select_action/denoise_step) resolves to HF's default (usually "sdpa")
-    # or falls back to "eager". See training/model/pi05.py's
-    # _print_attn_implementation.
+    # Diagnostic, zero risk -- prints the real attn_implementation
+    # (confirmed "sdpa", not "eager", for training). See
+    # training/model/pi05.py's _print_attn_implementation.
     print_attn_impl: bool = False
 
 

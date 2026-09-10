@@ -211,10 +211,8 @@ def _report_with_checkpoint(
     own save_state/load_state, a separate mechanism this doesn't touch.
     normalization_snapshot (training/model/normalization.py's
     build_normalization_snapshot) is persisted into every checkpoint format
-    below so resume/inference can read back exactly what normalization this
-    checkpoint was trained with -- harmless, always-accurate metadata
-    regardless of policy (None mode for ACT/MolmoAct2, a real dict for pi05
-    whenever --normalization-mode-source checkpoint was used)."""
+    below so resume/inference read back the same normalization used at
+    train time."""
     if not save_checkpoint:
         ray.train.report(metrics)
         return
@@ -415,21 +413,15 @@ def train_loop_per_worker(config: dict) -> None:
 
     dataset_stats = config["dataset_stats"]
 
-    # Resume normalization cross-check -- must happen BEFORE adapter.build()
-    # below, since dataset_stats feeds directly into the constructed
-    # preprocessor and model_cfg.resolved_normalization_mode feeds into
-    # build_pi05_config's normalization_mapping. Peeks at a resumed
-    # checkpoint's own saved normalization snapshot (training/model/
-    # normalization.py's build_normalization_snapshot, persisted below) and,
-    # on ordinary numeric drift (expected -- dataset-mode stats sampling
-    # isn't seeded), prefers the checkpoint's exact saved stats/mode so
-    # inference/resume match train time exactly. Hard-fails only on a
-    # structural mismatch (different dims/mode keys), which indicates a
-    # genuinely different dataset/config is being resumed against. The
-    # checkpoint directory gets staged twice as a result (once here, once
-    # again below for the real model/optimizer restore, which needs
-    # dist_ctx -- not constructed yet at this point) -- an acceptable
-    # one-time resume cost, not a hot-path concern.
+    # Resume normalization cross-check -- must run BEFORE adapter.build()
+    # since dataset_stats/model_cfg.resolved_normalization_mode feed into
+    # it. Peeks at a resumed checkpoint's saved normalization snapshot and
+    # prefers its exact stats/mode on ordinary numeric drift (dataset-mode
+    # sampling isn't seeded); hard-fails only on a structural mismatch
+    # (different dims/mode keys). The checkpoint directory gets staged
+    # twice as a result (again below for the real model/optimizer restore,
+    # which needs dist_ctx, not yet constructed here) -- a one-time resume
+    # cost, not a hot-path concern.
     resume_checkpoint = ray.train.get_checkpoint()
     if resume_checkpoint is not None:
         with resume_checkpoint.as_directory() as d:

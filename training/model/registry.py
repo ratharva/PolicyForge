@@ -61,22 +61,14 @@ class PolicyAdapter:
     # test/* (both TensorBoard and W&B, subject to the same
     # --wandb-metrics/--wandb-metric-groups filtering) -- no new plumbing needed.
     extra_metrics: Callable[[Any, dict], dict[str, float]] | None = None
-    # (overrides) -> PretrainedNormalization. None for ACT (trains from
-    # scratch, no pretrained checkpoint whose scheme could mismatch) and
-    # MolmoAct2 (deliberately hardcodes MEAN_STD already, separately
-    # reasoned -- see training/model/molmoact2.py's build_molmoact2_config).
+    # (overrides) -> PretrainedNormalization. None for ACT/MolmoAct2.
     # Implemented by pi05 -- see training/model/normalization.py's
-    # resolve_normalization, which is what actually calls this.
+    # resolve_normalization, which calls this.
     get_pretrained_normalization: Callable[[Any], Any] | None = None
-    # Overrides DataConfig.default_image_normalization's own dataclass
-    # default ("mean_std") when the user hasn't explicitly passed
-    # --default-image-normalization. None (ACT, MolmoAct2) -- mean_std
-    # stays their default, unchanged. Set by pi05 to "unit01": lerobot's
-    # real installed pi05 model unconditionally does img*2-1 inside its own
-    # forward pass expecting [0,1] input (modeling_pi05.py:996-997) --
-    # mean_std's unbounded output breaks this regardless of which pi05
-    # checkpoint is used, so this is a real default fix, not an ambiguous
-    # per-checkpoint choice like STATE/ACTION mode above.
+    # Overrides DataConfig.default_image_normalization's dataclass default
+    # ("mean_std") unless --default-image-normalization was passed
+    # explicitly. None for ACT/MolmoAct2. pi05 sets "unit01" -- lerobot's
+    # pi05 model unconditionally expects [0,1] image input.
     preferred_visual_normalization: str | None = None
 
 

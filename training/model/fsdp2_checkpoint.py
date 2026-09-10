@@ -21,9 +21,7 @@ def save_checkpoint(
     the correct start_epoch.
 
     extra_meta: merged into meta.json as-is -- e.g. train_loop.py passes
-    {"normalization": normalization_snapshot} so resume/inference can read
-    back exactly what normalization this checkpoint was trained with. None
-    (MolmoAct2's call site) -- zero behavior change."""
+    {"normalization": normalization_snapshot}. None -> no change."""
     accelerator.save_state(out_dir)
     if accelerator.is_main_process:
         meta = {"epoch": epoch, "step": step, "epoch_complete": epoch_complete}

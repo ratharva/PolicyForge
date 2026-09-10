@@ -60,26 +60,15 @@ def build_pi05_config(
         empty_cameras=overrides.empty_cameras,
         image_resolution=(h, w),
         dtype=overrides.dtype,
-        # STATE/ACTION: MEAN_STD by default, same deliberate simplification
-        # as MolmoAct2 -- overridden to the checkpoint's own real scheme
-        # (QUANTILES for the real lerobot/pi05_droid checkpoint) when
-        # overrides.resolved_normalization_mode is set by
+        # STATE/ACTION: MEAN_STD by default, overridden to the checkpoint's
+        # own scheme when overrides.resolved_normalization_mode is set by
         # training/model/normalization.py's resolve_normalization
-        # (--normalization-mode-source checkpoint). See training/model/
-        # normalization.py's module docstring for why the old hardcoded
-        # MEAN_STD was a real, confirmed bug for this checkpoint. VISUAL:
-        # always IDENTITY regardless -- training/model/image_normalization.py
-        # owns all image scaling instead (applied in train_loop.py before
-        # this policy's preprocessor runs), so lerobot's own per-FeatureType
-        # normalizer must not also scale images.
+        # (--normalization-mode-source checkpoint). VISUAL: always
+        # IDENTITY -- training/model/image_normalization.py owns image
+        # scaling instead.
         normalization_mapping=overrides.resolved_normalization_mode or {
             "VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD",
         },
-        # Real, supported PI05Config fields -- lerobot's own modeling_pi05.py
-        # already wires `if config.compile_model: self.forward =
-        # torch.compile(self.forward, mode=config.compile_mode)`
-        # (PI05Pytorch.__init__), this pipeline just never set them before.
-        # See Pi05ConfigOverrides.compile_model's docstring for caveats.
         compile_model=overrides.compile_model,
         compile_mode=overrides.compile_mode,
         optimizer_lr=train_cfg.lr,
@@ -114,48 +103,29 @@ def build_policy_and_processor(
 
 
 # ---------------------------------------------------------------------------
-# Speed-investigation flags (native-vs-Ray per-step compute gap) -- all
-# opt-in, default off. See Pi05ConfigOverrides' docstrings (training/config.py)
-# for what each tests and why; this section is the implementation.
+# Speed flags (native-vs-Ray per-step compute gap) -- all opt-in, default
+# off. See Pi05ConfigOverrides (training/config.py) for what each tests.
 # ---------------------------------------------------------------------------
 
 
 def _print_attn_implementation(policy) -> None:
-    """--pi05-print-attn-impl. Diagnostic only -- reads two HF config
-    attributes, no forward pass run, zero risk. lerobot's inference-only
-    select_action/denoise_step explicitly force _attn_implementation="eager"
-    (confirmed via the real installed lerobot==0.6.1 source), but the
-    TRAINING forward path (PI05Pytorch.forward, called by adapter.
-    forward_loss) never touches this attribute at all -- so whatever HF
-    resolved at construction time (commonly "sdpa" when supported) is what
-    training actually uses, unless this print shows "eager" here too."""
+    """--pi05-print-attn-impl. Diagnostic only, zero risk. lerobot's
+    inference-only select_action/denoise_step force
+    _attn_implementation="eager", but the training forward path
+    (PI05Pytorch.forward) never touches this attribute -- so whatever HF
+    resolved at construction (commonly "sdpa") is what training uses."""
     lang_impl = policy.model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation
     expert_impl = policy.model.paligemma_with_expert.gemma_expert.model.config._attn_implementation
     print(f"[pi05 diagnostic] attn_implementation: language_model={lang_impl!r}, gemma_expert={expert_impl!r}")
 
 
 def _apply_vision_bf16_override(policy) -> None:
-    """--pi05-vision-bf16, EXPERIMENTAL. Overrides lerobot's own
-    PaliGemmaWithExpertModel.to_bfloat16_for_selected_params, which
-    deliberately keeps vision_tower/multi_modal_projector (and separately,
-    every layernorm -- input_layernorm/post_attention_layernorm/model.norm,
-    NOT touched here) in float32: "so we never toggle (toggle causes
-    optimizer 'same dtype' error)" -- that function's own real comment in
-    the installed lerobot==0.6.1 source. Only vision_tower/
-    multi_modal_projector are cast back to bf16 here, matching native
-    openpi's own vision precision (confirmed: openpi/src/openpi/models/
-    pi0.py constructs its SigLIP tower with dtype_mm=config.dtype, default
-    bfloat16, no fp32 carve-out) -- layernorms stay fp32 regardless, a
-    separate, much more universal mixed-precision-training practice
-    unrelated to this specific vision-dtype question.
-
-    MUST run before the optimizer is constructed -- train_loop.py's real
-    call order already guarantees this (adapter.build() runs fully, then
-    the optimizer is built from policy.get_optim_params() only afterward),
-    so this isn't the "toggle after the optimizer already has state" case
-    lerobot's own comment warns about. UNVERIFIED for training stability
-    beyond that -- confirm no NaN/instability on a real short run before
-    trusting this for anything but an A/B speed test."""
+    """--pi05-vision-bf16. Overrides lerobot's own
+    PaliGemmaWithExpertModel.to_bfloat16_for_selected_params, which keeps
+    vision_tower/multi_modal_projector in float32 -- casts them to bf16
+    here instead, matching native openpi's vision precision. Layernorms
+    are left untouched (still fp32). Must run before the optimizer is
+    constructed (train_loop.py's call order already guarantees this)."""
     import torch as _torch
 
     keep_bf16 = ("vision_tower", "multi_modal_projector")
@@ -165,24 +135,12 @@ def _apply_vision_bf16_override(policy) -> None:
 
 
 def _install_narrow_checkpoint_patch(pi05_pytorch_model) -> None:
-    """--pi05-narrow-checkpoint, EXPERIMENTAL. Monkey-patches the
-    constructed PI05Pytorch instance's _apply_checkpoint to skip gradient-
-    checkpointing ONLY the tiny action_out_proj_func call site (a single
-    nn.Linear -- checkpointing it saves near-zero memory but pays a full
-    recompute during backward, pure overhead), while leaving every other
-    checkpointed block (image/language embedding, the big joint
-    PaliGemma+expert transformer forward) untouched. Only meaningful when
-    gradient_checkpointing is otherwise enabled (the default) --
-    _apply_checkpoint itself no-ops when it isn't.
-
-    Fragile by construction: depends on lerobot's exact internal local-
-    function naming at the one call site we want to skip (verified against
-    the real installed lerobot==0.6.1 source, modeling_pi05.py's
-    PI05Pytorch.forward -- the function passed there is literally named
-    "action_out_proj_func"). Re-verify this name if the lerobot pin ever
-    changes; a silent no-op (falling through to the original, unpatched
-    behavior) is the failure mode if the name no longer matches, not a
-    crash -- confirmed by reading _apply_checkpoint's real fallback path."""
+    """--pi05-narrow-checkpoint. Monkey-patches the constructed
+    PI05Pytorch instance's _apply_checkpoint to skip gradient-checkpointing
+    only the action_out_proj_func call site (a single nn.Linear), leaving
+    every other checkpointed block untouched. Depends on lerobot's exact
+    internal function naming (lerobot==0.6.1) -- if that name ever changes,
+    this silently falls through to the original, unpatched behavior."""
     original_apply_checkpoint = pi05_pytorch_model._apply_checkpoint
 
     def _patched_apply_checkpoint(func, *args, **kwargs):
@@ -213,17 +171,11 @@ def forward_loss(policy, inputs: dict) -> tuple[torch.Tensor, dict[str, float]]:
 
 def get_pretrained_normalization(overrides: Pi05ConfigOverrides):
     """PolicyAdapter.get_pretrained_normalization hook -- read-only, no
-    training-data access. Uses lerobot's own supported PreTrainedConfig
-    loading API (NOT manual JSON parsing of config.json) -- confirmed via a
-    real call against lerobot/pi05_droid that PI05Config.from_pretrained
-    resolves local-dir-vs-Hub and revision pinning exactly like
-    PI05Policy.from_pretrained itself does, and gives real, typed access to
-    normalization_mapping/use_relative_actions/relative_exclude_joints/
-    input_features/output_features -- no need to hand-parse
-    policy_preprocessor.json for any of that. Numeric stat VALUES, when
-    published, live only in policy_preprocessor.json's normalizer_processor
-    step (confirmed: config.json never carries them) -- fetched separately
-    via normalization.fetch_processor_stats, which is why this needs both."""
+    training-data access. Uses PI05Config.from_pretrained (lerobot's own
+    supported loading API, not manual JSON parsing) for mode/action-
+    representation/dims. Numeric stat values, when published, live only in
+    policy_preprocessor.json (config.json never carries them), so those
+    are fetched separately via normalization.fetch_processor_stats."""
     from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
     from training.model.normalization import PretrainedNormalization, fetch_processor_stats

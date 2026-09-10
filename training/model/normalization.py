@@ -2,15 +2,6 @@
 policies, driven by DataConfig.normalization (training/common/config.py) and
 PolicyAdapter.get_pretrained_normalization (training/model/registry.py).
 
-Exists because of a real, confirmed bug: training/model/pi05.py hardcoded
-STATE/ACTION normalization_mapping=MEAN_STD, but the real lerobot/pi05_droid
-pretrained checkpoint's own saved config declares QUANTILES -- corrupting
-every input/target during finetuning. The fix is NOT to hardcode QUANTILES
-instead (replacing one hardcoded assumption with another) -- it's this
-module: mode and stats are resolved independently, validated before
-training, and the result is persisted with every checkpoint (train_loop.py)
-so inference/resume stay consistent with whatever was actually used.
-
 Default DataConfig.normalization (NormalizationConfig(), see common/config.py)
 makes every function here a no-op -- existing ACT/MolmoAct2/pi05 behavior is
 untouched unless a run opts in via --normalization-mode-source/--normalization-
@@ -33,24 +24,18 @@ _FEATURE_COLUMNS = {"STATE": "observation.state", "ACTION": "action"}
 
 @dataclass
 class PretrainedNormalization:
-    """Everything a pretrained checkpoint's own saved config actually
-    declares, as returned by PolicyAdapter.get_pretrained_normalization."""
+    """What a pretrained checkpoint's own saved config declares, returned by
+    PolicyAdapter.get_pretrained_normalization."""
 
     mode: dict[str, str]  # e.g. {"VISUAL": "IDENTITY", "STATE": "QUANTILES", "ACTION": "QUANTILES"}
-    # Per-feature numeric stats the checkpoint publishes -- {} (not None) when
-    # the checkpoint declares a mode but ships zero stat values, a real,
-    # confirmed case (lerobot/pi05_droid's policy_preprocessor.json declares
-    # QUANTILES with an empty "features" dict) that callers must treat as a
-    # clear, actionable error, not a silent fallback.
+    # Per-feature numeric stats the checkpoint publishes -- {} (not None)
+    # means the checkpoint declares a mode but ships no stat values, which
+    # callers must treat as an actionable error, not a silent fallback.
     stats: dict[str, dict]
     action_relative: bool
     action_relative_exclude: list[str]
-    # PI05Config-style checkpoints pad STATE/ACTION to a fixed capacity
-    # (max_state_dim/max_action_dim, e.g. 32) that has nothing to do with any
-    # particular dataset's real dims -- confirmed via a real config.json read
-    # (lerobot/pi05_droid declares shape [32] for both regardless of droid's
-    # real ~8-dim state). So this is a "must fit within" ceiling, never an
-    # exact-equality check against RobotSchema's real dims.
+    # Padded capacity (e.g. PI05Config's max_state_dim/max_action_dim), not
+    # a per-dataset dim -- a "must fit within" ceiling, not equality.
     max_state_dim: int | None
     max_action_dim: int | None
     revision: str | None
@@ -64,12 +49,10 @@ class ResolvedNormalization:
 
 
 def inspect_pretrained_normalization(policy_type: str, model_cfg) -> PretrainedNormalization | None:
-    """Read-only: what the active policy's pretrained checkpoint declares,
-    with zero training-data access. Used directly by --inspect-normalization
-    (Phase A) and internally by resolve_normalization (Phase B) -- the same
-    function both call, so Phase A's printed diff is never out of sync with
-    what Phase B actually resolves. Returns None when the active adapter has
-    no get_pretrained_normalization hook (ACT, MolmoAct2 today)."""
+    """Read-only, no training-data access. Used by --inspect-normalization
+    and internally by resolve_normalization -- same function both call, so
+    the two stay in sync. None when the adapter has no
+    get_pretrained_normalization hook (ACT, MolmoAct2 today)."""
     from training.model.registry import get_adapter
 
     adapter = get_adapter(policy_type)
@@ -79,18 +62,12 @@ def inspect_pretrained_normalization(policy_type: str, model_cfg) -> PretrainedN
 
 
 def fetch_processor_stats(pretrained_path: str, revision: str | None) -> dict:
-    """Real per-feature numeric stats a checkpoint's own saved
-    policy_preprocessor.json publishes, if any -- verified against the real
-    installed lerobot==0.6.1 processor-pipeline JSON shape
-    ({"steps": [{"registry_name": ..., "config": {...}}, ...]}) and a real
-    fetch of lerobot/pi05_droid's file. Stats, when published, live in the
-    normalizer_processor step's config["features"]. Shared helper (not
-    pi05-specific) -- any future adapter's get_pretrained_normalization can
-    reuse this, since this JSON layout is lerobot's own general
-    DataProcessorPipeline save format, not a pi05 convention. Returns {}
-    (never raises) whenever the file is missing/unparseable -- indistinguishable
-    from "file exists but publishes no stats" on purpose, since both mean the
-    same thing to a caller: no numeric stats available from this checkpoint."""
+    """Per-feature numeric stats a checkpoint's own saved
+    policy_preprocessor.json publishes, if any -- lives in the
+    normalizer_processor step's config["features"]. Not pi05-specific --
+    this is lerobot's general DataProcessorPipeline save format. Returns {}
+    (never raises) when the file is missing/unparseable or publishes no
+    stats -- both mean the same thing to a caller."""
     filename = "policy_preprocessor.json"
     if os.path.isdir(pretrained_path):
         path = os.path.join(pretrained_path, filename)
@@ -117,9 +94,8 @@ def fetch_processor_stats(pretrained_path: str, revision: str | None) -> dict:
 
 def _resolve_dataset_stats_for_mode(raw_ds, data_cfg: DataConfig, mode: dict[str, str]) -> dict:
     """Computes whatever training/data/stats.py functions the resolved mode
-    actually needs. Features resolved to MEAN_STD/IDENTITY are left out of
-    the returned dict entirely -- they defer to train.py's already-computed
-    compute_dataset_stats output, no need to recompute."""
+    needs. Features resolved to MEAN_STD/IDENTITY are left out -- they
+    defer to train.py's already-computed compute_dataset_stats output."""
     from training.data.stats import compute_quantile_stats
 
     quantile_needs: dict[tuple[float, float], list[str]] = {}
@@ -157,9 +133,8 @@ def _load_explicit_stats_file(path: str | None) -> dict:
 def resolve_normalization(
     data_cfg: DataConfig, policy_type: str, model_cfg, raw_ds,
 ) -> ResolvedNormalization:
-    """Driver-side, called once from train.py right after compute_dataset_stats.
-    Pure no-op (all-None fields, zero extra work) when data_cfg.normalization
-    is left at NormalizationConfig()'s defaults."""
+    """Called once from train.py right after compute_dataset_stats. No-op
+    when data_cfg.normalization is left at its defaults."""
     norm_cfg = data_cfg.normalization
 
     if norm_cfg.mode_source == "explicit" and norm_cfg.explicit_mode is None and norm_cfg.stats_source == "dataset":
@@ -183,7 +158,7 @@ def resolve_normalization(
     else:  # "dataset"
         stats = _resolve_dataset_stats_for_mode(raw_ds, data_cfg, mode) if mode is not None else None
         if stats == {}:
-            stats = None  # every resolved feature was MEAN_STD/IDENTITY -- true no-op, defer entirely
+            stats = None  # every resolved feature was MEAN_STD/IDENTITY -- true no-op
 
     return ResolvedNormalization(mode=mode, stats=stats, pretrained=pretrained)
 
@@ -195,8 +170,8 @@ def _stat_vector_len(feature_stats: dict) -> int:
 def validate_normalization(
     resolved: ResolvedNormalization, data_cfg: DataConfig, robot: RobotSchema, policy_type: str, model_cfg,
 ) -> None:
-    """Hard-fails with ValueError; called driver-side in train.py, before
-    TorchTrainer construction, so a bad config fails in seconds."""
+    """Hard-fails with ValueError, called driver-side before TorchTrainer
+    construction so a bad config fails in seconds."""
     norm_cfg = data_cfg.normalization
 
     if norm_cfg.mode_source == "checkpoint" and resolved.pretrained is None:
@@ -268,12 +243,9 @@ def validate_normalization(
                 "match or some action dims will be delta-transformed inconsistently with pretraining."
             )
 
-        # Units/component-ordering: not automatable -- lerobot's stat dict is
-        # keyed by the aggregate "observation.state"/"action" feature name
-        # only, no per-component name/unit metadata exists in
-        # policy_preprocessor.json even when its "features" dict is
-        # non-empty. Print a human-readable side-by-side for a person to
-        # eyeball instead of a pass/fail check.
+        # Not automatable -- no per-component name/unit metadata exists in
+        # the checkpoint's saved config. Print a side-by-side for a human
+        # to eyeball instead of a pass/fail check.
         print(
             "normalization: this run's RobotSchema state/action components "
             f"(name, dim), in order -- state: {robot.state_components}, action: {robot.action_components}. "
@@ -285,11 +257,8 @@ def validate_normalization(
 
 def build_normalization_snapshot(mode: dict[str, str] | None, stats: dict) -> dict:
     """{"mode": ..., "stats": {"observation.state": ..., "action": ...}} --
-    exact shape persisted into every checkpoint (train_loop.py), regardless
-    of whether normalization resolution was actively opted into -- every
-    pi05 run records what was actually used, for inference/resume
-    consistency (requirement: same normalization must be used at inference
-    and resume as was used at train time)."""
+    persisted into every checkpoint (train_loop.py) so inference/resume use
+    the same normalization that was actually used at train time."""
     return {
         "mode": mode,
         "stats": {

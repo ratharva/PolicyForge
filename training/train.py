@@ -300,31 +300,25 @@ def main() -> None:
 
     # --- STATE/ACTION normalization mode+stats resolution (training/model/normalization.py) ---
     parser.add_argument("--normalization-mode-source", choices=("explicit", "checkpoint"), default="explicit",
-                         help="explicit (default): use --normalization-explicit-mode (or, if unset, "
-                              "whatever the policy's own build_*_config hardcodes -- today's exact "
-                              "behavior). checkpoint: read the mode from the pretrained checkpoint's own "
-                              "saved config -- requires the policy's adapter to support this (pi05 does; "
-                              "act/molmoact2 don't -- fails fast with a clear error otherwise)")
+                         help="explicit (default): use --normalization-explicit-mode, or the policy's own "
+                              "hardcoded default if unset. checkpoint: read the mode from the pretrained "
+                              "checkpoint's own saved config -- requires adapter support (pi05 only)")
     parser.add_argument("--normalization-explicit-mode",
                          choices=("MEAN_STD", "MIN_MAX", "QUANTILES", "QUANTILE10", "IDENTITY"), default=None,
-                         help="only used when --normalization-mode-source explicit -- overrides the "
-                              "policy's own hardcoded STATE/ACTION normalization mode. None (default): "
-                              "don't override, today's exact behavior")
+                         help="only used with --normalization-mode-source explicit -- overrides the "
+                              "policy's own hardcoded STATE/ACTION mode. None: no override")
     parser.add_argument("--normalization-stats-source", choices=("dataset", "checkpoint", "explicit_file"),
                          default="dataset",
-                         help="dataset (default): compute from this run's own training data -- today's "
-                              "exact behavior. checkpoint: use numeric stat values the checkpoint itself "
-                              "publishes -- errors clearly if the checkpoint declares a mode but ships no "
-                              "stats (a real, confirmed case for lerobot/pi05_droid). explicit_file: load "
-                              "a pre-computed stats JSON from --normalization-explicit-stats-file")
+                         help="dataset (default): compute from this run's own training data. checkpoint: "
+                              "use numeric stats the checkpoint itself publishes (errors if it publishes "
+                              "none). explicit_file: load a pre-computed stats JSON")
     parser.add_argument("--normalization-explicit-stats-file", default=None,
                          help='required iff --normalization-stats-source explicit_file -- path to a JSON '
                               'file shaped like {"observation.state": {...}, "action": {...}}')
     parser.add_argument("--inspect-normalization", action="store_true",
                          help="print the active policy's pretrained checkpoint's declared normalization "
-                              "(mode, whether it publishes numeric stats, absolute/delta action "
-                              "representation, dims) vs. this run's resolved settings, then exit -- no "
-                              "training-data access, no TorchTrainer launched")
+                              "vs. this run's resolved settings, then exit -- no training-data access, "
+                              "no TorchTrainer launched")
 
     # --- per-camera image normalization ---
     parser.add_argument("--image-normalization", nargs="+", default=[],
@@ -445,42 +439,30 @@ def main() -> None:
     parser.add_argument("--pi05-fsdp-cpu-offload", action="store_true",
                          help="trades speed for fitting on fewer/smaller GPUs -- fsdp2 strategy only")
 
-    # --- pi05 speed-investigation flags (native-vs-Ray per-step compute gap) ---
+    # --- pi05 speed flags (see training/README.md's "π0.5 training speed") ---
     parser.add_argument("--pi05-compile-model", action="store_true",
-                         help="EXPERIMENTAL speed test: torch.compile(policy.forward, mode=...) -- a "
-                              "real, already-wired PI05Config field this pipeline never set before. "
-                              "Untested here for graph breaks/compile-time cost or interaction with "
-                              "--pi05-distributed-strategy fsdp2/gradient checkpointing -- verify on a "
-                              "short run before trusting for a real one")
+                         help="Recommended: 0.46s vs 1.12s perf/compute_s. Use with --pi05-compile-mode "
+                              "default or reduce-overhead, not the field's own 'max-autotune' default -- "
+                              "that has a severe warmup cost")
     parser.add_argument("--pi05-compile-mode", default="max-autotune",
-                         help="only used with --pi05-compile-model -- torch.compile's own mode string "
-                              "(PI05Config's own default is 'max-autotune')")
+                         help="only used with --pi05-compile-model -- torch.compile's mode string. "
+                              "PI05Config's own default ('max-autotune') is not recommended here; pass "
+                              "'default' or 'reduce-overhead' explicitly")
     parser.add_argument("--pi05-vision-bf16", action="store_true",
-                         help="EXPERIMENTAL, opt-in speed test: monkey-patches the constructed model to "
-                              "cast vision_tower/multi_modal_projector to bf16, overriding lerobot's own "
-                              "choice to keep them in float32 (matches native openpi's vision precision) "
-                              "-- NOT a supported lerobot option. lerobot's own code picked float32 'so "
-                              "we never toggle (toggle causes optimizer same dtype error)' -- verify no "
-                              "NaN/instability on a real short run before trusting this")
+                         help="Recommended: 0.60s vs 1.12s perf/compute_s alone, 0.35s combined with "
+                              "--pi05-compile-model. Monkey-patches the constructed model to cast "
+                              "vision_tower/multi_modal_projector to bf16 -- not a supported lerobot "
+                              "option, not yet confirmed stable over a long training run")
     parser.add_argument("--pi05-narrow-checkpoint", action="store_true",
-                         help="EXPERIMENTAL, opt-in speed test: monkey-patches lerobot's internal "
-                              "_apply_checkpoint to skip gradient-checkpointing the tiny action_out_proj "
-                              "Linear layer specifically (near-zero memory saved, pure recompute "
-                              "overhead), leaving every other checkpointed block untouched -- fragile, "
-                              "depends on lerobot's exact internal function naming (verified against "
-                              "lerobot==0.6.1); re-verify if the lerobot pin changes. Only meaningful "
-                              "when gradient checkpointing is otherwise enabled (the default)")
+                         help="Tested, no measured speed effect -- kept as a documented dead end. "
+                              "Monkey-patches lerobot's _apply_checkpoint to skip checkpointing the "
+                              "action_out_proj layer specifically")
     parser.add_argument("--pi05-print-attn-impl", action="store_true",
-                         help="diagnostic only, zero risk -- prints the real attn_implementation "
-                              "(language_model/gemma_expert) HF resolved at construction time, once, so "
-                              "you can confirm/refute whether training uses eager attention before "
-                              "trying to fix anything about it")
+                         help="diagnostic only, zero risk -- prints the real attn_implementation used "
+                              "during training (confirmed 'sdpa', not 'eager')")
     parser.add_argument("--pi05-revision", default=None,
-                         help="pins BOTH weight loading (PI05Policy.from_pretrained) and processor-config "
-                              "loading (--normalization-mode-source/--normalization-stats-source "
-                              "checkpoint, --inspect-normalization) to this specific Hub revision/commit/"
-                              "tag -- default: the Hub's default (latest) revision for both, same as "
-                              "before this flag existed (no revision was ever pinned at all)")
+                         help="pins both weight loading and normalization-config loading to a specific "
+                              "Hub revision/commit/tag -- default: the Hub's latest")
     args = parser.parse_args()
 
     # Policy-specific "required iff"/cross-field validation moved below,
@@ -685,15 +667,10 @@ def main() -> None:
             )
 
     # --- image-normalization default: an adapter's preferred_visual_normalization
-    # (e.g. pi05's "unit01" -- lerobot's real installed pi05 model
-    # unconditionally does img*2-1 expecting [0,1] input, so mean_std's
-    # unbounded output is a real bug there -- see training/model/registry.py)
-    # wins over DataConfig.default_image_normalization's own dataclass
-    # default ("mean_std") whenever the user hasn't explicitly passed
-    # --image-normalization-default. An explicit flag always wins over the
-    # adapter's preference -- the _apply_if_explicit call right below this
-    # runs unconditionally and overrides whatever this block set, iff the
-    # user actually passed the flag.
+    # (e.g. pi05's "unit01") wins over DataConfig.default_image_normalization's
+    # own default ("mean_std") unless --image-normalization-default was
+    # explicitly passed -- the _apply_if_explicit call below still overrides
+    # this if the user actually passed the flag.
     from training.model.registry import get_adapter
 
     adapter = get_adapter(run_cfg.policy_type)
@@ -981,10 +958,9 @@ def main() -> None:
     # training/data/stats.py.
     dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
 
-    # STATE/ACTION normalization mode+stats resolution -- no-op (byte-
-    # identical to today's behavior) when run_cfg.data.normalization is left
-    # at its all-defaults. See training/model/normalization.py's module
-    # docstring for the real bug this fixes.
+    # STATE/ACTION normalization mode+stats resolution -- no-op when
+    # run_cfg.data.normalization is left at its defaults. See
+    # training/model/normalization.py.
     from training.model.normalization import resolve_normalization, validate_normalization
 
     resolved_normalization = resolve_normalization(run_cfg.data, run_cfg.policy_type, run_cfg.model, raw_ds)

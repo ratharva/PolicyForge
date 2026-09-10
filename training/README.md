@@ -267,6 +267,12 @@ weights, not random init, and this project never identified/verified a
 specific real π0.5 checkpoint repo id for you (the standing rule here is
 to never guess a repo id) -- find a real one on the HF Hub yourself first.
 
+**Start with `training/configs/pi05_base_conf.yaml`** for any new run
+(`--config-file training/configs/pi05_base_conf.yaml`) -- it bundles the
+real, measured normalization-scheme fix and speed optimizations described
+below, instead of you needing to already know this history and pass 6+
+flags by hand.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--pi05-pretrained-path` | -- (required) | HF repo id or local path to a real pretrained π0.5 checkpoint |
@@ -276,6 +282,14 @@ to never guess a repo id) -- find a real one on the HF Hub yourself first.
 | `--pi05-empty-cameras` | `0` | pad `input_features` with dummy camera slots -- for when the pretrained checkpoint expects more cameras than this dataset has |
 | `--pi05-distributed-strategy` | `ddp` | `ddp` or `fsdp2` (accelerate-driven FSDP2 sharding, same mechanism as MolmoAct2's) -- unlike MolmoAct2, usable with ANY `--pi05-freeze-vision-encoder`/`--pi05-train-expert-only` combination (PI05 has no LoRA to already solve memory, and DDP always fully replicates the whole model regardless of what's frozen, so FSDP2's sharding benefit applies every mode) |
 | `--pi05-fsdp-cpu-offload` | off | trades speed for fitting on fewer/smaller GPUs -- `fsdp2` only |
+| `--pi05-revision` | none (Hub latest) | pins BOTH weight loading and normalization-resolution config loading to a specific Hub revision/commit/tag |
+| `--normalization-mode-source` | `explicit` | `explicit` (today's hardcoded default) or `checkpoint` (read STATE/ACTION mode from the pretrained checkpoint's own saved config) -- see "π0.5 normalization resolution" below |
+| `--normalization-stats-source` | `dataset` | `dataset`, `checkpoint`, or `explicit_file` -- see below |
+| `--pi05-compile-model` | off | **recommended, real measured ~2.4x per-step speedup** (0.46s vs 1.12s `compute_s` on real H100 hardware) -- see "π0.5 training speed" below |
+| `--pi05-compile-mode` | `max-autotune` | only with `--pi05-compile-model` -- use `default` or `reduce-overhead` instead, see below (real, measured `max-autotune` warmup cost was severe) |
+| `--pi05-vision-bf16` | off | **recommended, real measured ~1.9x per-step speedup** (0.60s vs 1.12s `compute_s`), stacks with `--pi05-compile-model` (combined: 0.35s, faster than native) -- monkey-patches lerobot internals, see below |
+| `--pi05-narrow-checkpoint` | off | tested, real, but **no measured effect** (1.12s, unchanged) -- kept as a documented dead end, not worth using |
+| `--pi05-print-attn-impl` | off | diagnostic, zero risk -- confirmed real training uses `sdpa`, not eager attention |
 
 ### π0.5 FSDP2
 
@@ -335,6 +349,95 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
     --pi05-pretrained-path <your-real-checkpoint-repo-id> \
     --pi05-distributed-strategy fsdp2 --pi05-fsdp-cpu-offload --batch-size 32
 ```
+
+### π0.5 normalization resolution
+
+Real, confirmed bug (found via a direct native-openpi-vs-Ray training comparison
+on `lerobot/pi05_droid` + droid100): this pipeline hardcoded
+`normalization_mapping={"STATE": "MEAN_STD", "ACTION": "MEAN_STD", ...}` in
+`build_pi05_config`, but the real pretrained checkpoint's own saved config
+declares `QUANTILES` for both (confirmed via `PI05Config.from_pretrained`
+and a real HF Hub fetch) -- a genuine scheme mismatch that corrupts every
+input/target during finetuning. A second, independent bug was found in the
+same investigation: this pipeline's image-normalization default (`mean_std`)
+doesn't produce the `[0,1]` range lerobot's own pi05 model unconditionally
+expects (`img = img * 2.0 - 1.0` inside `modeling_pi05.py`) -- `unit01` is
+the correct mode, and is now π0.5's automatic default (no flag needed).
+
+`training/model/normalization.py` resolves STATE/ACTION mode and stats
+*independently* rather than hardcoding a new fixed scheme in place of the
+old one:
+```bash
+# Read the checkpoint's own declared mode+stats before training, no GPU needed
+python -m training.train --tasks <tasks> --dataset-source <source> --policy-type pi05 \
+    --pi05-pretrained-path lerobot/pi05_droid --inspect-normalization
+
+# Use the checkpoint's mode (QUANTILES), computing stats from this run's own data
+# (the checkpoint publishes NO numeric stats -- only the scheme -- confirmed via
+# a real model.safetensors header inspection, zero normalization buffers present)
+python -m training.train --tasks <tasks> --dataset-source <source> --policy-type pi05 \
+    --pi05-pretrained-path lerobot/pi05_droid \
+    --normalization-mode-source checkpoint --normalization-stats-source dataset
+```
+Real measured result on droid100 (1xH100, `--max-train-steps 1000`,
+otherwise byte-identical hyperparameters): baseline (old hardcoded
+`MEAN_STD` + `mean_std` image range) trained to a val loss of ~0.94;
+with both fixes, individual training-step losses in the back half of the
+run repeatedly land in the 0.08-0.35 range (best single value 0.08) --
+much closer to native openpi's own reference (~0.037 on the same
+checkpoint/dataset/hyperparameters) than the old baseline ever got.
+Default behavior (no `--normalization-*` flags passed) is unchanged for
+every policy -- this is strictly opt-in.
+
+### π0.5 training speed (native vs Ray)
+
+A genuine, real ~2.3-2.4x native-vs-Ray per-step slowdown was found and
+root-caused during the same investigation (`perf/compute_s`: native
+~0.48s, Ray ~1.12-1.16s, identical regardless of GPU count -- confirmed via
+a real 1-GPU test that this is NOT DDP/NCCL communication overhead).
+Four candidate causes were checked directly against real code and real
+hardware, not guessed:
+
+| Cause | Verdict | Real `compute_s` |
+|---|---|---|
+| DDP/NCCL gradient sync | **ruled out** -- identical at 1 GPU (no DDP at all) | n/a |
+| Eager attention (`--pi05-print-attn-impl`) | **ruled out for training** -- lerobot only forces `_attn_implementation="eager"` inside inference-only `select_action`/`denoise_step`; training's own forward path resolves to `sdpa` | n/a |
+| `torch.compile` disabled (`--pi05-compile-model`) | **confirmed, the dominant cause** -- `PI05Config.compile_model` defaults `False` and was never wired before | 1.12s -> **0.46s** |
+| Vision runs fp32 not bf16 (`--pi05-vision-bf16`) | **confirmed, secondary contributor** -- native's own SigLIP tower runs bf16; lerobot's deliberately keeps it fp32 | 1.12s -> **0.60s** |
+| Coarse gradient-checkpoint boundary (`--pi05-narrow-checkpoint`) | tested, **no measured effect** -- the checkpointed `action_out_proj` Linear layer was never the bottleneck | 1.12s -> 1.12s (unchanged) |
+
+**Combined, `--pi05-compile-model --pi05-compile-mode default --pi05-vision-bf16`
+measured `compute_s` of 0.35s -- faster than native's 0.48s.** Recommended
+for any real π0.5 run once you've confirmed the caveats below on your own
+setup:
+```bash
+python -m training.train --tasks <tasks> --dataset-source <source> --policy-type pi05 \
+    --pi05-pretrained-path lerobot/pi05_droid \
+    --pi05-compile-model --pi05-compile-mode default --pi05-vision-bf16
+```
+
+**`--pi05-compile-mode`: do not use `max-autotune` (the field's own
+default) without deliberately choosing it.** A real test hit a severe
+warmup cost -- TorchInductor benchmarks many Triton kernel configs per
+distinct tensor shape the model executes (each search taking 4-17+
+seconds, real "OutOfMemoryError...Ignoring this choice" lines are normal,
+benign per-candidate rejections, not failures), and with this model's many
+shapes, warmup can dominate or exceed a short run entirely. Use `default`
+or `reduce-overhead` unless you've confirmed `max-autotune`'s longer
+warmup is worth it for your own run length. Also unverified: whether the
+real dataset's variable prompt/tokenized-length shapes cause repeated
+recompilation deep into a long training run rather than staying warm
+after the first occurrence of each shape.
+
+**`--pi05-vision-bf16` caveats**: real monkey-patch on the constructed
+model (casts `vision_tower`/`multi_modal_projector` to bf16, overriding
+lerobot's own choice to keep them fp32 "so we never toggle" -- see
+`training/model/pi05.py`'s `_apply_vision_bf16_override` for exactly what
+it touches and why the ordering relative to optimizer construction
+matters). Validated so far only as a short-run speed/memory measurement
+(confirmed real ~1.2-2.4GB VRAM reduction alongside the speedup) -- NOT
+yet confirmed stable (no NaN/divergence) over a long real training run.
+Confirm that before trusting it beyond a speed probe.
 
 ## Overriding the dataset source / v3 root
 
