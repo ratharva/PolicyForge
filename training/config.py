@@ -155,6 +155,51 @@ class Pi05ConfigOverrides(PolicyOverrides):
     fsdp_state_dict_type: str = "sharded_state_dict"  # accelerate's own default is "full_state_dict",
                                                        # which gathers the whole model onto one rank
 
+    # --- Speed-investigation flags (native-vs-Ray per-step compute gap) ---
+    # See training/README.md's speed-investigation section for the full
+    # writeup of what each of these tests and why. All default off/unused --
+    # byte-identical behavior otherwise.
+
+    # Real, supported PI05Config fields (lerobot's own modeling_pi05.py
+    # already wires `if config.compile_model: self.forward =
+    # torch.compile(self.forward, mode=config.compile_mode)`) -- this
+    # pipeline just never set them before. Untested here for graph breaks/
+    # compile-time cost or interaction with distributed_strategy="fsdp2"/
+    # gradient_checkpointing -- verify on a short run before trusting for a
+    # real one.
+    compile_model: bool = False
+    compile_mode: str = "max-autotune"   # PI05Config's own default
+
+    # EXPERIMENTAL, opt-in: a real monkey-patch on the constructed model
+    # instance, NOT a supported lerobot config option -- see
+    # training/model/pi05.py's _apply_vision_bf16_override. Overrides
+    # lerobot's own PaliGemmaWithExpertModel.to_bfloat16_for_selected_params,
+    # which deliberately keeps vision_tower/multi_modal_projector in
+    # float32 ("so we never toggle (toggle causes optimizer 'same dtype'
+    # error)" -- that function's own real comment). Matches native openpi's
+    # vision precision (bf16) for an A/B speed test -- UNVERIFIED for
+    # training stability, confirm no NaN before trusting beyond a speed test.
+    vision_bf16: bool = False
+
+    # EXPERIMENTAL, opt-in: another real monkey-patch -- see
+    # training/model/pi05.py's _install_narrow_checkpoint_patch. Skips
+    # gradient-checkpointing ONLY the tiny action_out_proj Linear layer
+    # (near-zero memory saved by checkpointing it, pure recompute
+    # overhead), leaving every other checkpointed block untouched. Fragile:
+    # depends on lerobot's exact internal local-function naming (verified
+    # against lerobot==0.6.1) -- re-verify if the lerobot pin changes. Only
+    # meaningful when gradient_checkpointing is also True (the default).
+    narrow_checkpoint: bool = False
+
+    # Diagnostic only, zero risk (reads two HF config attributes at
+    # construction time, no forward pass run) -- confirms/refutes whether
+    # this pipeline's training forward path (which never explicitly sets
+    # _attn_implementation, unlike lerobot's inference-only
+    # select_action/denoise_step) resolves to HF's default (usually "sdpa")
+    # or falls back to "eager". See training/model/pi05.py's
+    # _print_attn_implementation.
+    print_attn_impl: bool = False
+
 
 @dataclass
 class TrainConfig:

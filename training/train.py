@@ -444,6 +444,37 @@ def main() -> None:
                               "carries real unverified checkpoint-resume risk")
     parser.add_argument("--pi05-fsdp-cpu-offload", action="store_true",
                          help="trades speed for fitting on fewer/smaller GPUs -- fsdp2 strategy only")
+
+    # --- pi05 speed-investigation flags (native-vs-Ray per-step compute gap) ---
+    parser.add_argument("--pi05-compile-model", action="store_true",
+                         help="EXPERIMENTAL speed test: torch.compile(policy.forward, mode=...) -- a "
+                              "real, already-wired PI05Config field this pipeline never set before. "
+                              "Untested here for graph breaks/compile-time cost or interaction with "
+                              "--pi05-distributed-strategy fsdp2/gradient checkpointing -- verify on a "
+                              "short run before trusting for a real one")
+    parser.add_argument("--pi05-compile-mode", default="max-autotune",
+                         help="only used with --pi05-compile-model -- torch.compile's own mode string "
+                              "(PI05Config's own default is 'max-autotune')")
+    parser.add_argument("--pi05-vision-bf16", action="store_true",
+                         help="EXPERIMENTAL, opt-in speed test: monkey-patches the constructed model to "
+                              "cast vision_tower/multi_modal_projector to bf16, overriding lerobot's own "
+                              "choice to keep them in float32 (matches native openpi's vision precision) "
+                              "-- NOT a supported lerobot option. lerobot's own code picked float32 'so "
+                              "we never toggle (toggle causes optimizer same dtype error)' -- verify no "
+                              "NaN/instability on a real short run before trusting this")
+    parser.add_argument("--pi05-narrow-checkpoint", action="store_true",
+                         help="EXPERIMENTAL, opt-in speed test: monkey-patches lerobot's internal "
+                              "_apply_checkpoint to skip gradient-checkpointing the tiny action_out_proj "
+                              "Linear layer specifically (near-zero memory saved, pure recompute "
+                              "overhead), leaving every other checkpointed block untouched -- fragile, "
+                              "depends on lerobot's exact internal function naming (verified against "
+                              "lerobot==0.6.1); re-verify if the lerobot pin changes. Only meaningful "
+                              "when gradient checkpointing is otherwise enabled (the default)")
+    parser.add_argument("--pi05-print-attn-impl", action="store_true",
+                         help="diagnostic only, zero risk -- prints the real attn_implementation "
+                              "(language_model/gemma_expert) HF resolved at construction time, once, so "
+                              "you can confirm/refute whether training uses eager attention before "
+                              "trying to fix anything about it")
     parser.add_argument("--pi05-revision", default=None,
                          help="pins BOTH weight loading (PI05Policy.from_pretrained) and processor-config "
                               "loading (--normalization-mode-source/--normalization-stats-source "
@@ -638,6 +669,11 @@ def main() -> None:
         _apply_if_explicit(m, "distributed_strategy", args, "pi05_distributed_strategy", parser)
         _apply_if_explicit(m, "fsdp_cpu_offload", args, "pi05_fsdp_cpu_offload", parser)
         _apply_if_explicit(m, "revision", args, "pi05_revision", parser)
+        _apply_if_explicit(m, "compile_model", args, "pi05_compile_model", parser)
+        _apply_if_explicit(m, "compile_mode", args, "pi05_compile_mode", parser)
+        _apply_if_explicit(m, "vision_bf16", args, "pi05_vision_bf16", parser)
+        _apply_if_explicit(m, "narrow_checkpoint", args, "pi05_narrow_checkpoint", parser)
+        _apply_if_explicit(m, "print_attn_impl", args, "pi05_print_attn_impl", parser)
         # No fsdp2-requires-X restriction here (unlike MolmoAct2's fsdp2-
         # requires-train_mode-fft check): PI05 has no LoRA, so FSDP2's
         # memory-sharding benefit applies regardless of
