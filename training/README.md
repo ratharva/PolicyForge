@@ -259,12 +259,13 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 
 ## π0.5
 
-`--policy-type pi05` -- a PaliGemma-based VLM (~2.3B params total).
-`--pi05-pretrained-path` is **required** -- "finetuning" implies starting
-from real pretrained weights, not random init, and this project never
-identified/verified a specific real π0.5 checkpoint repo id for you (the
-standing rule here is to never guess a repo id) -- find a real one on the
-HF Hub yourself first.
+`--policy-type pi05` -- a PaliGemma-based VLM (~3.2-3.3B params total:
+gemma_2b VLM ≈2.0B + vocab embed ≈0.5B, gemma_300m action-expert ≈0.3B,
+SigLIP so400m vision tower ≈0.4B). `--pi05-pretrained-path` is
+**required** -- "finetuning" implies starting from real pretrained
+weights, not random init, and this project never identified/verified a
+specific real π0.5 checkpoint repo id for you (the standing rule here is
+to never guess a repo id) -- find a real one on the HF Hub yourself first.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -273,11 +274,39 @@ HF Hub yourself first.
 | `--pi05-train-expert-only` | off | only the action expert trains, everything else frozen -- combinable with `--pi05-freeze-vision-encoder` |
 | `--pi05-no-gradient-checkpointing` | off (checkpointing on) | disable only with confirmed memory headroom -- auto-wires from `PI05Config`, no extra wiring needed unlike MolmoAct2 |
 | `--pi05-empty-cameras` | `0` | pad `input_features` with dummy camera slots -- for when the pretrained checkpoint expects more cameras than this dataset has |
+| `--pi05-distributed-strategy` | `ddp` | `ddp` or `fsdp2` (accelerate-driven FSDP2 sharding, same mechanism as MolmoAct2's) -- unlike MolmoAct2, usable with ANY `--pi05-freeze-vision-encoder`/`--pi05-train-expert-only` combination (PI05 has no LoRA to already solve memory, and DDP always fully replicates the whole model regardless of what's frozen, so FSDP2's sharding benefit applies every mode) |
+| `--pi05-fsdp-cpu-offload` | off | trades speed for fitting on fewer/smaller GPUs -- `fsdp2` only |
 
-DDP only -- no FSDP2 path exists for π0.5 in this pipeline (no real VRAM
-number ever justified building one; extending `model/pi05.py` to FSDP2
-later is a mechanical repeat of `model/molmoact2.py`'s pattern if a real
-run shows DDP doesn't fit).
+### π0.5 FSDP2
+
+`transformer_cls_names_to_wrap = ["_PiGemmaDecoderLayerBase", "SiglipEncoderLayer"]`
+-- confirmed via the real installed `lerobot==0.6.1` source: the PaliGemma
+VLM's `language_model` layers AND the separately-instantiated
+`gemma_expert.model`'s layers are both built by the same locally-scoped
+factory (`lerobot/policies/pi05/pi_gemma.py`'s
+`_get_pi_gemma_decoder_layer_base`) -- different Python class objects per
+call, but `type(m).__name__` is identical for both, so ONE name covers
+both sub-models (no MolmoAct2-style mutual-exclusivity handling needed).
+`SiglipEncoderLayer` covers the vision tower separately (a real HF
+`SiglipVisionModel`).
+
+Unlike MolmoAct2's `wrap_for_training` (which hardcodes
+`Accelerator(mixed_precision="bf16")`), PI05's does **not** pass
+`mixed_precision` at all: PI05 already hand-casts a mixed bf16/fp32 scheme
+onto individual params at construction time
+(`PaliGemmaWithExpertModel.to_bfloat16_for_selected_params`, keeping
+`vision_tower`/`multi_modal_projector`/layernorms in float32 for
+stability, before `wrap_for_training` ever runs) -- passing
+`mixed_precision="bf16"` too would blanket-recast everything back to
+bf16 and undo that split. **UNVERIFIED** (no GPU-capable dev environment
+available here): that these fp32-designated params actually survive
+`accelerator.prepare()` still showing `dtype=torch.float32` in
+`named_parameters()`, and that mixing fp32 layernorms with bf16
+attention/MLP inside the same `_PiGemmaDecoderLayerBase`-wrapped FSDP unit
+doesn't break FSDP2's flat-parameter sharding -- confirm both before
+trusting a real training run (same "same environment" `save_state`/
+`load_state` scoping and crash+resume-test discipline as MolmoAct2's FSDP2
+section applies here too).
 
 ```bash
 # Full fine-tune on one GPU
@@ -295,6 +324,16 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
     --pi05-pretrained-path <your-real-checkpoint-repo-id> \
     --pi05-empty-cameras 2
+
+# Full fine-tune with FSDP2 across multiple GPUs on one node
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
+    --pi05-pretrained-path <your-real-checkpoint-repo-id> \
+    --pi05-distributed-strategy fsdp2 --batch-size 32
+
+# FSDP2 with CPU offload for VRAM headroom
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
+    --pi05-pretrained-path <your-real-checkpoint-repo-id> \
+    --pi05-distributed-strategy fsdp2 --pi05-fsdp-cpu-offload --batch-size 32
 ```
 
 ## Overriding the dataset source / v3 root
@@ -353,10 +392,23 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 ### Async checkpoint writes (`--async-checkpoint`, experimental)
 
 Plain-DDP checkpoints (no effect under `--molmoact2-distributed-strategy
-fsdp2`) are written via `torch.distributed.checkpoint.async_save` instead
-of a blocking `pickle.dump` -- the slow disk write happens in a background
-thread while training continues, instead of stalling the training loop
-for the full write duration. Real tradeoff: a checkpoint is only reported
+fsdp2`/`--pi05-distributed-strategy fsdp2`, which already use accelerate's
+own `save_state`/`load_state`) copy model/optimizer state to CPU
+synchronously (fast), then write it to disk via `pickle.dump` in a
+background thread while training continues on the GPU -- instead of
+stalling the training loop for the full write duration.
+`torch.distributed.checkpoint.async_save` was tried first and rejected: it
+requires a CPU-capable process-group backend (`cpu:gloo,cuda:nccl`) for
+its own internal coordination -- real coordination that matters for
+genuinely sharded/distributed checkpoints (FSDP2), but pure overhead for
+an unsharded plain-DDP checkpoint that only rank 0 ever saves -- and Ray
+Train's NCCL-only process group doesn't provide it, confirmed by a real
+`AssertionError: A CPU backend must be enabled for async save` on an
+actual run. A plain background thread sidesteps the question entirely.
+On-disk format is identical to the non-async path (`state.pkl`), so
+resuming a run that switches `--async-checkpoint` on/off between
+checkpoints just works, no format detection needed. Real tradeoff: a
+checkpoint is only reported
 to Ray's own tracking (eligible for `checkpoint_score_attribute` scoring
 or resume) one checkpoint-cycle late, once its write is confirmed
 finished -- see `train_loop.py`'s `_AsyncCheckpointer`. This also means

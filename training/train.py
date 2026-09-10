@@ -154,12 +154,14 @@ def main() -> None:
                               "recent isn't among the N best -- native Ray Train checkpoint-manager "
                               "behavior, not custom logic here")
     parser.add_argument("--async-checkpoint", action="store_true",
-                         help="write checkpoints via torch.distributed.checkpoint.async_save instead "
-                              "of a blocking pickle.dump -- the slow disk write happens in the "
-                              "background while training continues. Opt-in, plain-DDP path only (no "
-                              "effect under --molmoact2-distributed-strategy fsdp2). Carries real, "
-                              "not-fully-verified risk: a save is only reported to Ray -- eligible "
-                              "for checkpoint retention/resume -- one checkpoint-cycle late, once its "
+                         help="copy model/optimizer state to CPU synchronously (fast), then write it "
+                              "via pickle.dump in a background thread while training continues, "
+                              "instead of blocking the training loop for the full write duration. "
+                              "Opt-in, plain-DDP path only (no effect under "
+                              "--molmoact2-distributed-strategy/--pi05-distributed-strategy fsdp2, "
+                              "which already use accelerate's own save_state/load_state). Carries "
+                              "real, not-fully-verified risk: a save is only reported to Ray -- "
+                              "eligible for checkpoint retention/resume -- one checkpoint-cycle late, once its "
                               "write is confirmed finished. Test with a real crash+resume before "
                               "trusting this for a long run")
     parser.add_argument("--num-workers", type=int, default=None,
@@ -314,7 +316,7 @@ def main() -> None:
     parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05"), required=True,
                          help="which policy family to train -- act (this repo's original "
                               "lightweight policy, trains from random init), molmoact2 (~8B-param VLA), "
-                              "or pi05 (~2.3B-param VLA, needs --pi05-pretrained-path) -- all three "
+                              "or pi05 (~3.2-3.3B-param VLA, needs --pi05-pretrained-path) -- all three "
                               "share the same lerobot install, see README")
     parser.add_argument("--molmoact2-checkpoint-path", default="allenai/MolmoAct2",
                          help="HF repo id or local path MolmoAct2's VLM backbone loads from")
@@ -405,6 +407,15 @@ def main() -> None:
                               "that same class's own real default and gets real speedup on H100/A100 "
                               "tensor cores -- PI05Config itself defaults to float32, so this pipeline "
                               "previously never set this at all, silently training in full float32")
+    parser.add_argument("--pi05-distributed-strategy", choices=("ddp", "fsdp2"), default="ddp",
+                         help="ddp (default): plain DDP via ray.train.torch.prepare_model. fsdp2: "
+                              "accelerate-driven FSDP2 sharding inside the Ray Train worker -- unlike "
+                              "MolmoAct2, usable with any --pi05-freeze-vision-encoder/"
+                              "--pi05-train-expert-only combination (PI05 has no LoRA to already "
+                              "solve memory) -- see README's FSDP2 section before using this, it "
+                              "carries real unverified checkpoint-resume risk")
+    parser.add_argument("--pi05-fsdp-cpu-offload", action="store_true",
+                         help="trades speed for fitting on fewer/smaller GPUs -- fsdp2 strategy only")
     args = parser.parse_args()
 
     # Policy-specific "required iff"/cross-field validation moved below,
@@ -590,6 +601,12 @@ def main() -> None:
         _apply_if_explicit(m, "gradient_checkpointing", args, "pi05_gradient_checkpointing", parser)
         _apply_if_explicit(m, "empty_cameras", args, "pi05_empty_cameras", parser)
         _apply_if_explicit(m, "dtype", args, "pi05_dtype", parser)
+        _apply_if_explicit(m, "distributed_strategy", args, "pi05_distributed_strategy", parser)
+        _apply_if_explicit(m, "fsdp_cpu_offload", args, "pi05_fsdp_cpu_offload", parser)
+        # No fsdp2-requires-X restriction here (unlike MolmoAct2's fsdp2-
+        # requires-train_mode-fft check): PI05 has no LoRA, so FSDP2's
+        # memory-sharding benefit applies regardless of
+        # freeze_vision_encoder/train_expert_only.
         if not m.pretrained_path:
             parser.error(
                 "--pi05-pretrained-path is required when --policy-type pi05 (either as a CLI flag or "

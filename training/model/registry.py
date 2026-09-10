@@ -87,18 +87,19 @@ def _molmoact2_adapter(distributed_strategy: str, offload_tokenization: bool) ->
     )
 
 
-def _pi05_adapter() -> PolicyAdapter:
+def _pi05_adapter(distributed_strategy: str) -> PolicyAdapter:
     from training.model import pi05
+    is_fsdp2 = distributed_strategy == "fsdp2"
     return PolicyAdapter(
         build=pi05.build_policy_and_processor,
         forward_loss=pi05.forward_loss,
         needs_task=True,
         # No post_build_hook -- gradient checkpointing auto-wires from
         # PI05Config's own flag at construction time.
-        # No wrap_for_training/save_checkpoint/load_checkpoint -- DDP only
-        # for pi05 in this pipeline. Extending to FSDP2 later is a
-        # mechanical repeat of model/molmoact2.py's pattern.
-        prepare_model_kwargs={"find_unused_parameters": True},
+        wrap_for_training=pi05.wrap_for_training if is_fsdp2 else None,
+        save_checkpoint=pi05.save_checkpoint if is_fsdp2 else None,
+        load_checkpoint=pi05.load_checkpoint if is_fsdp2 else None,
+        prepare_model_kwargs=None if is_fsdp2 else {"find_unused_parameters": True},
     )
 
 
@@ -108,5 +109,5 @@ def get_adapter(policy_type: str, distributed_strategy: str = "ddp", offload_tok
     if policy_type == "molmoact2":
         return _molmoact2_adapter(distributed_strategy, offload_tokenization)
     if policy_type == "pi05":
-        return _pi05_adapter()
+        return _pi05_adapter(distributed_strategy)
     raise ValueError(f"unknown policy_type {policy_type!r}, expected one of ('act', 'molmoact2', 'pi05')")

@@ -87,31 +87,68 @@ def _log_all(
             wandb_run.log(filtered, step=wandb_step if wandb_step is not None else step)
 
 
+def _clone_state_to_cpu(obj):
+    """Recursively clones every torch.Tensor found in a nested dict/list/
+    tuple structure to a detached CPU copy -- a stable snapshot safe to
+    read from a background thread while training continues mutating the
+    LIVE GPU tensors (the next optimizer.step() only touches those, never
+    this copy). Non-tensor leaves (ints, strings, small dicts inside
+    optimizer state, etc.) pass through unchanged."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _clone_state_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clone_state_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_clone_state_to_cpu(v) for v in obj)
+    return obj
+
+
+def _write_pickle_checkpoint(cpu_state: dict, ckpt_dir: str) -> None:
+    """Runs in the background thread -- the slow part (was previously done
+    synchronously in _report_with_checkpoint's default DDP path). Writes
+    the exact same state.pkl format the synchronous path already uses, so
+    the resume/load logic needs no format-detection branch at all -- a
+    checkpoint written with --async-checkpoint on or off looks identical
+    on disk."""
+    with open(os.path.join(ckpt_dir, "state.pkl"), "wb") as f:
+        pickle.dump(cpu_state, f)
+
+
 class _AsyncCheckpointer:
     """--async-checkpoint (opt-in, plain-DDP path only -- see training/README.md).
-    Wraps torch.distributed.checkpoint.async_save so at most ONE checkpoint
-    write is ever in flight -- PyTorch's own docs recommend this explicitly
-    (more than one risks unbounded CPU-staging-buffer growth). async_save
-    itself does the "copy into internal CPU buffers" step SYNCHRONOUSLY
-    (fast -- this is what makes the subsequent background disk write safe:
-    it's writing a stable CPU snapshot, not live GPU tensor references that
-    the next optimizer.step() would mutate mid-write) and returns a Future
-    covering just the slow disk-write part.
+    Backgrounds the slow pickle.dump()+write behind a plain single-worker
+    thread pool, instead of torch.distributed.checkpoint.async_save.
 
-    Real, deliberate design constraint: a save kicked off at step N is NOT
-    reported to Ray (and so isn't eligible for checkpoint_score_attribute
-    scoring or resume) until the NEXT checkpoint-worthy call, once its
-    write has actually finished -- confirmed via this class's own Future,
-    not assumed. This is a one-cycle lag, not a bug: ray.train.Checkpoint.
-    from_directory() needs the directory's files fully written before Ray
-    reads them, and whether calling ray.train.report(checkpoint=...) while
-    DCP is still writing in the background is safe is NOT verified against
-    a real Ray install here -- so this only ever hands Ray a directory
-    whose write already completed. In practice a save takes far less than a
-    full window_every_steps/val_every_steps cycle, so `_future.result()`
-    below should return immediately, not actually block."""
+    DCP's own async_save was tried first and rejected after a real run hit
+    `AssertionError: A CPU backend must be enabled for async save` --
+    DCP's async machinery needs a CPU-capable process-group backend
+    (cpu:gloo,cuda:nccl) for its own internal coordination, which Ray
+    Train's NCCL-only process group doesn't provide. That coordination
+    exists to support genuinely SHARDED/distributed checkpoints (FSDP2,
+    tensor-parallel) -- overkill here: a plain-DDP checkpoint is an
+    unsharded full replica and only rank 0 ever saves, so there's no
+    cross-rank coordination need for the save itself. A plain background
+    thread sidesteps the question entirely -- no torch.distributed
+    involvement at all.
+
+    Tensors are copied to CPU SYNCHRONOUSLY first (fast, purely local --
+    this is what makes the subsequent background write safe, since the
+    next optimizer.step() only mutates the LIVE GPU tensors, never this
+    snapshot), then the slow pickle.dump()+write happens in the background
+    thread. Only one save is ever in flight (the thread pool has exactly
+    one worker) -- a save kicked off at step N is only reported to Ray
+    (eligible for checkpoint_score_attribute scoring or resume) one
+    checkpoint-cycle late, once its write is CONFIRMED finished via the
+    Future, not assumed. In practice a save takes far less than a full
+    window_every_steps/val_every_steps cycle, so `_future.result()` below
+    should return immediately, not actually block."""
 
     def __init__(self):
+        import concurrent.futures
+
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._future = None
         self._pending: tuple[dict, str, int, int, bool] | None = None
 
@@ -128,13 +165,12 @@ class _AsyncCheckpointer:
     ) -> tuple[dict, str, int, int, bool] | None:
         """Waits for any previous save to finish (returning ITS
         (metrics, ckpt_dir, epoch, step, epoch_complete) for the caller to
-        report to Ray), then kicks off a NEW async save for `state` and
-        remembers it as pending. Caller must gate this to rank 0 only."""
-        import torch.distributed.checkpoint as dcp
-
+        report to Ray), then kicks off a NEW background save for `state`
+        and remembers it as pending. Caller must gate this to rank 0 only."""
         finished = self._flush_pending()
         os.makedirs(ckpt_dir, exist_ok=True)
-        self._future = dcp.async_save(state, checkpoint_id=ckpt_dir)
+        cpu_state = _clone_state_to_cpu(state)
+        self._future = self._executor.submit(_write_pickle_checkpoint, cpu_state, ckpt_dir)
         self._pending = (metrics, ckpt_dir, epoch, step, epoch_complete)
         return finished
 
@@ -145,22 +181,16 @@ class _AsyncCheckpointer:
 
 
 def _attach_finished_async_checkpoint(finished: tuple[dict, str, int, int, bool] | None) -> None:
-    """Reports a finished async-checkpoint's own metrics + directory to Ray
-    (writing the small epoch/step/epoch_complete JSON sidecar first -- kept
-    OUT of the tensor state dict async_save itself writes, since mixing
-    plain ints/bools into that dict is unverified against DCP's real
-    behavior), then removes the directory -- mirrors the old code's
+    """Reports a finished async-checkpoint's own metrics + directory to
+    Ray, then removes the directory -- mirrors the old code's
     tempfile.TemporaryDirectory() auto-cleanup, just done manually since
     this directory has to outlive the call that created it. No-op if
     nothing was pending. Rank 0 only, caller must gate."""
     if finished is None:
         return
-    import json
     import shutil
 
     metrics, ckpt_dir, epoch, step, epoch_complete = finished
-    with open(os.path.join(ckpt_dir, "_meta.json"), "w") as f:
-        json.dump({"epoch": epoch, "step": step, "epoch_complete": epoch_complete}, f)
     ray.train.report(metrics, checkpoint=ray.train.Checkpoint.from_directory(ckpt_dir))
     shutil.rmtree(ckpt_dir, ignore_errors=True)
 
@@ -214,7 +244,11 @@ def _report_with_checkpoint(
             ckpt_dir = os.path.join(
                 run_cfg.storage_root, run_cfg.run_name, f"_async_checkpoint_tmp_{step}",
             )
-            state = {"model": unwrapped_policy.state_dict(), "optim": optimizer.state_dict()}
+            state = {
+                "model": unwrapped_policy.state_dict(),
+                "optim": optimizer.state_dict(),
+                "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
+            }
             finished = async_checkpointer.save(state, ckpt_dir, metrics, epoch, step, epoch_complete)
             if finished is not None:
                 _attach_finished_async_checkpoint(finished)
@@ -352,33 +386,6 @@ def _finish_val_pass(
     return best_val_loss_seen
 
 
-def _load_async_checkpoint(d: str, unwrapped_policy, optimizer) -> dict:
-    """Loads a checkpoint written by _AsyncCheckpointer.save() (DCP format +
-    a _meta.json sidecar for epoch/step/epoch_complete, kept separate since
-    mixing plain ints/bools into the tensor state dict DCP itself writes is
-    unverified) -- the load-side counterpart to _report_with_checkpoint's
-    async_checkpointer branch. DCP's load() is in-place: it fills a
-    scaffold state dict (the model/optimizer's OWN current state_dict(),
-    used only for its shapes/keys) by reading from disk, then
-    load_state_dict() applies the now-filled values -- unlike pickle's
-    load-and-return pattern. Kept as its own standalone function (not
-    inlined in train_loop_per_worker) specifically so this local `import
-    torch.distributed.checkpoint` can't retroactively make the bare `torch`
-    name local to train_loop_per_worker's whole body -- see CLAUDE.md's
-    torch.profiler gotcha, the same hazard applies to any local
-    `import torch.<submodule>` inside a function that also uses `torch.*`
-    from its outer-scope import."""
-    import json
-    import torch.distributed.checkpoint as dcp
-
-    state_dict = {"model": unwrapped_policy.state_dict(), "optim": optimizer.state_dict()}
-    dcp.load(state_dict, checkpoint_id=d)
-    unwrapped_policy.load_state_dict(state_dict["model"])
-    optimizer.load_state_dict(state_dict["optim"])
-    with open(os.path.join(d, "_meta.json")) as f:
-        return json.load(f)
-
-
 def train_loop_per_worker(config: dict) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_cfg: RunConfig = config["run_cfg"]
@@ -435,18 +442,16 @@ def train_loop_per_worker(config: dict) -> None:
             with checkpoint.as_directory() as d:
                 state = adapter.load_checkpoint(dist_ctx, d)
         else:
+            # Same state.pkl format regardless of --async-checkpoint --
+            # _AsyncCheckpointer writes via a background thread instead of
+            # inline, but the on-disk format (and this load path) is
+            # identical either way, so resuming a run that switches
+            # --async-checkpoint on/off between checkpoints just works.
             with checkpoint.as_directory() as d:
-                if os.path.exists(os.path.join(d, "_meta.json")):
-                    # Written by --async-checkpoint's _AsyncCheckpointer (DCP
-                    # format) -- detected by the sidecar file's presence, so
-                    # resuming a run that switches --async-checkpoint on/off
-                    # between checkpoints still works either way.
-                    state = _load_async_checkpoint(d, unwrapped_policy, optimizer)
-                else:
-                    with open(os.path.join(d, "state.pkl"), "rb") as f:
-                        state = pickle.load(f)
-                    unwrapped_policy.load_state_dict(state["model"])
-                    optimizer.load_state_dict(state["optim"])
+                with open(os.path.join(d, "state.pkl"), "rb") as f:
+                    state = pickle.load(f)
+                unwrapped_policy.load_state_dict(state["model"])
+                optimizer.load_state_dict(state["optim"])
         # Only advance to the next epoch when the checkpoint actually
         # finished one; otherwise resume the same epoch (its data iterator
         # restarts from row 0). Checkpoints predating epoch_complete default

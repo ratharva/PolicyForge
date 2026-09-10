@@ -110,3 +110,73 @@ def forward_loss(policy, inputs: dict) -> tuple[torch.Tensor, dict[str, float]]:
         else:
             scalars[k] = float(v)
     return loss, scalars
+
+
+# ---------------------------------------------------------------------------
+# Full-finetune / FSDP2 path (overrides.distributed_strategy == "fsdp2")
+# ---------------------------------------------------------------------------
+# Uses accelerate's own FSDP2 support, same mechanism as model/molmoact2.py.
+# Unlike MolmoAct2, NOT restricted to any particular
+# freeze_vision_encoder/train_expert_only combination -- PI05 has no LoRA
+# to already solve memory (which is why MolmoAct2 restricts fsdp2 to
+# train_mode=="fft"), and DDP always fully replicates the whole model
+# regardless of what's frozen, so FSDP2's memory-sharding benefit applies
+# to every PI05 training mode.
+
+
+def wrap_for_training(policy, optimizer, overrides: Pi05ConfigOverrides, device):
+    """Returns (policy, optimizer, accelerator). Use accelerator.unwrap_model()
+    in place of the DDP `.module` pattern."""
+    from accelerate import Accelerator
+    from accelerate.utils import FullyShardedDataParallelPlugin
+
+    # _PiGemmaDecoderLayerBase covers BOTH the PaliGemma VLM's language_model
+    # layers and the separately-instantiated gemma_expert.model's layers --
+    # both are built by the same locally-scoped factory
+    # (lerobot/policies/pi05/pi_gemma.py's _get_pi_gemma_decoder_layer_base),
+    # so type(m).__name__ is identical for both despite being different
+    # Python class objects per call -- confirmed via the real installed
+    # lerobot==0.6.1 source, not guessed. SiglipEncoderLayer covers the
+    # vision tower (a real HF SiglipVisionModel). Filtered against what's
+    # actually present, same defensive pattern as molmoact2.py's
+    # wrap_for_training -- accelerate's class-name matching is exact
+    # type(module).__name__ ==, not isinstance-based.
+    present_classes = {type(m).__name__ for m in policy.modules()}
+    candidate_wrap_classes = ["_PiGemmaDecoderLayerBase", "SiglipEncoderLayer"]
+    transformer_cls_names_to_wrap = [c for c in candidate_wrap_classes if c in present_classes]
+    if not transformer_cls_names_to_wrap:
+        raise RuntimeError(
+            f"None of the candidate FSDP2 wrap classes {candidate_wrap_classes} were found on the "
+            f"constructed policy (found: {sorted(present_classes)}) -- the installed PI05 model's "
+            "internal class names have likely changed; update candidate_wrap_classes."
+        )
+
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
+        reshard_after_forward=True,
+        cpu_offload=overrides.fsdp_cpu_offload,
+        state_dict_type=overrides.fsdp_state_dict_type,
+        auto_wrap_policy="transformer_based_wrap",
+        transformer_cls_names_to_wrap=transformer_cls_names_to_wrap,
+    )
+    # No mixed_precision= kwarg, unlike MolmoAct2's hardcoded
+    # mixed_precision="bf16" -- PI05 already hand-casts a mixed bf16/fp32
+    # scheme onto individual params at construction time
+    # (PaliGemmaWithExpertModel.to_bfloat16_for_selected_params, called
+    # from build_policy_and_processor before this ever runs, keeping
+    # vision_tower/multi_modal_projector/layernorms in float32 for
+    # stability). Passing mixed_precision="bf16" here too would
+    # blanket-recast everything back to bf16 and undo that split.
+    # UNVERIFIED (no GPU-capable dev environment here): that these
+    # fp32-designated params actually survive accelerator.prepare() still
+    # showing dtype=torch.float32 -- confirm via named_parameters() before
+    # trusting a real run, see training/README.md's FSDP2 section.
+    accelerator = Accelerator(fsdp_plugin=fsdp_plugin)
+    policy, optimizer = accelerator.prepare(policy, optimizer)
+    return policy, optimizer, accelerator
+
+
+# save_checkpoint/load_checkpoint: fully generic over accelerator/paths, no
+# PI05-specific logic -- shared with molmoact2.py's own FSDP2 path instead
+# of duplicated.
+from training.model.fsdp2_checkpoint import load_checkpoint, save_checkpoint  # noqa: E402,F401

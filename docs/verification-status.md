@@ -135,11 +135,17 @@ storage backends).
    [Customizing policies](customizing-policies.md#molmoact2) for exactly
    what HAS been verified at the config/integration-test level.
 
-5. **`--policy-type pi05` -- the real ~2.3B model has never actually run
-   end-to-end**, same reason as MolmoAct2: no verified real pretrained
-   checkpoint repo id was found. See
+5. **`--policy-type pi05` -- the real ~3.2-3.3B model has never actually run
+   end-to-end** (corrected from an earlier "~2.3B" estimate -- confirmed by
+   reading the real installed `lerobot==0.6.1` source's actual layer dims),
+   same reason as MolmoAct2: no verified real pretrained checkpoint repo id
+   was found. `--pi05-distributed-strategy fsdp2` was added mirroring
+   MolmoAct2's FSDP2 pattern, but -- unlike MolmoAct2's, which was verified
+   live via a fake-policy crash+resume test -- has NOT been exercised at
+   all yet, not even at the fake-policy level: no GPU-capable environment
+   was available when it was written. See
    [Customizing policies](customizing-policies.md#π05) for what HAS been
-   verified.
+   verified and exactly what remains open for the FSDP2 path specifically.
 
 6. **`--dataset-source droid` -- real-tested against `lerobot/droid_100`
    (2GB), not against `cadene/droid_1.0.1`** (18.4GB, the dataset the

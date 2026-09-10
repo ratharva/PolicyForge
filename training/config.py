@@ -124,6 +124,18 @@ class Pi05ConfigOverrides(PolicyOverrides):
     # checkpoint expects more camera slots than this dataset has.
     empty_cameras: int = 0
 
+    # --- Full-finetune / FSDP2 -- unlike MolmoAct2, NOT restricted to any
+    # particular freeze_vision_encoder/train_expert_only combination: PI05
+    # has no LoRA to already solve memory (which is why MolmoAct2 restricts
+    # fsdp2 to train_mode=="fft"), and DDP always fully replicates the
+    # whole model regardless of what's frozen -- so FSDP2's memory-sharding
+    # benefit applies to every PI05 training mode, not just a "full
+    # finetune" one. ---
+    distributed_strategy: str = "ddp"   # "ddp" | "fsdp2"
+    fsdp_cpu_offload: bool = False      # trades speed for fitting on fewer/smaller GPUs
+    fsdp_state_dict_type: str = "sharded_state_dict"  # accelerate's own default is "full_state_dict",
+                                                       # which gathers the whole model onto one rank
+
 
 @dataclass
 class TrainConfig:
@@ -155,13 +167,14 @@ class TrainConfig:
     save_only_on_improvement: bool = False
     checkpoint_max_to_keep: int = 3
     # Opt-in, plain-DDP path only (no effect under FSDP2, which already
-    # uses accelerate's own save_state/load_state) -- writes checkpoints via
-    # torch.distributed.checkpoint.async_save instead of a blocking
-    # pickle.dump, so the slow disk write happens in the background while
-    # training continues. Carries real, not-fully-verified risk: a save is
-    # only reported to Ray (eligible for checkpoint_score_attribute scoring
-    # or resume) one checkpoint-cycle late, once its write is CONFIRMED
-    # finished -- see train_loop.py's _AsyncCheckpointer. Test with a real
+    # uses accelerate's own save_state/load_state) -- copies model/optimizer
+    # state to CPU synchronously (fast), then writes it via pickle.dump in
+    # a background thread while training continues, instead of blocking the
+    # training loop for the full write duration. Carries real,
+    # not-fully-verified risk: a save is only reported to Ray (eligible for
+    # checkpoint_score_attribute scoring or resume) one checkpoint-cycle
+    # late, once its write is CONFIRMED finished -- see train_loop.py's
+    # _AsyncCheckpointer. Test with a real
     # crash+resume before trusting this for a long run.
     async_checkpoint: bool = False
 
