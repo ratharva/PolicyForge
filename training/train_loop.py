@@ -6,6 +6,7 @@ best-N-checkpoints + step-windowed early stopping.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import pickle
@@ -23,6 +24,7 @@ from training import perf_logging
 from training.vendor.util import NumpyToTorchCollate
 from training.config import RunConfig, TrainConfig
 from training.model.image_normalization import apply_image_normalization
+from training.model.normalization import build_normalization_snapshot
 from training.model.registry import PolicyAdapter, get_adapter
 from training.wandb_logging import filter_metrics, sample_episode_frames
 
@@ -198,7 +200,7 @@ def _attach_finished_async_checkpoint(finished: tuple[dict, str, int, int, bool]
 def _report_with_checkpoint(
     metrics: dict, adapter: PolicyAdapter, unwrapped_policy, optimizer, dist_ctx,
     run_cfg: RunConfig, epoch: int, step: int, epoch_complete: bool, rank: int, save_checkpoint: bool,
-    async_checkpointer: "_AsyncCheckpointer | None" = None,
+    async_checkpointer: "_AsyncCheckpointer | None" = None, normalization_snapshot: dict | None = None,
 ) -> None:
     """dist_ctx is the accelerator from adapter.wrap_for_training (FSDP2 path)
     or None (DDP path). epoch_complete distinguishes a step-windowed
@@ -206,7 +208,13 @@ def _report_with_checkpoint(
     resume logic in train_loop_per_worker to pick the correct epoch.
     async_checkpointer is only ever non-None for the plain-DDP path (see
     _AsyncCheckpointer) -- the FSDP2 branch below always uses accelerate's
-    own save_state/load_state, a separate mechanism this doesn't touch."""
+    own save_state/load_state, a separate mechanism this doesn't touch.
+    normalization_snapshot (training/model/normalization.py's
+    build_normalization_snapshot) is persisted into every checkpoint format
+    below so resume/inference can read back exactly what normalization this
+    checkpoint was trained with -- harmless, always-accurate metadata
+    regardless of policy (None mode for ACT/MolmoAct2, a real dict for pi05
+    whenever --normalization-mode-source checkpoint was used)."""
     if not save_checkpoint:
         ray.train.report(metrics)
         return
@@ -217,7 +225,10 @@ def _report_with_checkpoint(
         # path derived from run_cfg rather than a per-rank temp dir.
         ckpt_dir = os.path.join(run_cfg.storage_root, run_cfg.run_name, "_fsdp2_checkpoint_tmp")
         os.makedirs(ckpt_dir, exist_ok=True)
-        adapter.save_checkpoint(dist_ctx, ckpt_dir, epoch, step, epoch_complete)
+        adapter.save_checkpoint(
+            dist_ctx, ckpt_dir, epoch, step, epoch_complete,
+            extra_meta={"normalization": normalization_snapshot},
+        )
         if rank == 0:
             ray.train.report(metrics, checkpoint=ray.train.Checkpoint.from_directory(ckpt_dir))
         else:
@@ -248,6 +259,7 @@ def _report_with_checkpoint(
                 "model": unwrapped_policy.state_dict(),
                 "optim": optimizer.state_dict(),
                 "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
+                "normalization": normalization_snapshot,
             }
             finished = async_checkpointer.save(state, ckpt_dir, metrics, epoch, step, epoch_complete)
             if finished is not None:
@@ -265,6 +277,7 @@ def _report_with_checkpoint(
             "model": unwrapped_policy.state_dict(),
             "optim": optimizer.state_dict(),
             "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
+            "normalization": normalization_snapshot,
         }
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "state.pkl"), "wb") as f:
@@ -345,6 +358,7 @@ def _finish_val_pass(
     unwrapped_policy, optimizer, dist_ctx, run_cfg: RunConfig, train_cfg: TrainConfig,
     epoch: int, step: int, epoch_complete: bool, rank: int, tb_writer, wandb_run,
     best_val_loss_seen: float, async_checkpointer: "_AsyncCheckpointer | None" = None,
+    normalization_snapshot: dict | None = None,
 ) -> float:
     """Shared tail of a val pass -- gather this rank's _run_eval_pass output
     across ranks, log under val/*, and attach a checkpoint scored by THIS
@@ -379,7 +393,7 @@ def _finish_val_pass(
         _report_with_checkpoint(
             val_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
             run_cfg, epoch, step, epoch_complete=epoch_complete, rank=rank, save_checkpoint=save_checkpoint,
-            async_checkpointer=async_checkpointer,
+            async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
         )
     if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
         _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -400,6 +414,67 @@ def train_loop_per_worker(config: dict) -> None:
     )
 
     dataset_stats = config["dataset_stats"]
+
+    # Resume normalization cross-check -- must happen BEFORE adapter.build()
+    # below, since dataset_stats feeds directly into the constructed
+    # preprocessor and model_cfg.resolved_normalization_mode feeds into
+    # build_pi05_config's normalization_mapping. Peeks at a resumed
+    # checkpoint's own saved normalization snapshot (training/model/
+    # normalization.py's build_normalization_snapshot, persisted below) and,
+    # on ordinary numeric drift (expected -- dataset-mode stats sampling
+    # isn't seeded), prefers the checkpoint's exact saved stats/mode so
+    # inference/resume match train time exactly. Hard-fails only on a
+    # structural mismatch (different dims/mode keys), which indicates a
+    # genuinely different dataset/config is being resumed against. The
+    # checkpoint directory gets staged twice as a result (once here, once
+    # again below for the real model/optimizer restore, which needs
+    # dist_ctx -- not constructed yet at this point) -- an acceptable
+    # one-time resume cost, not a hot-path concern.
+    resume_checkpoint = ray.train.get_checkpoint()
+    if resume_checkpoint is not None:
+        with resume_checkpoint.as_directory() as d:
+            if adapter.save_checkpoint:  # FSDP2 -- meta.json sidecar
+                meta_path = os.path.join(d, "meta.json")
+                saved_normalization = None
+                if os.path.exists(meta_path):
+                    with open(meta_path) as f:
+                        saved_normalization = json.load(f).get("normalization")
+            else:  # plain DDP (sync or async -- identical on-disk format) -- state.pkl
+                state_path = os.path.join(d, "state.pkl")
+                saved_normalization = None
+                if os.path.exists(state_path):
+                    with open(state_path, "rb") as f:
+                        saved_normalization = pickle.load(f).get("normalization")
+        if saved_normalization:
+            for column, expected_dim in (
+                ("observation.state", data_cfg.robot.state_dim), ("action", data_cfg.robot.action_dim),
+            ):
+                saved_stat = (saved_normalization.get("stats") or {}).get(column)
+                fresh_stat = dataset_stats.get(column)
+                if not saved_stat or not fresh_stat:
+                    continue
+                saved_len = len(next(iter(saved_stat.values())))
+                if set(saved_stat) != set(fresh_stat) or saved_len != expected_dim:
+                    raise RuntimeError(
+                        f"resuming {run_cfg.run_name!r}: checkpoint's saved normalization for {column!r} "
+                        f"(keys={sorted(saved_stat)}, dim={saved_len}) is structurally incompatible with "
+                        f"this run's freshly-resolved normalization (keys={sorted(fresh_stat)}, expected "
+                        f"dim={expected_dim}) -- looks like a genuinely different dataset/config is being "
+                        "resumed against."
+                    )
+                dataset_stats[column] = saved_stat
+            saved_mode = saved_normalization.get("mode")
+            if saved_mode is not None:
+                model_cfg.resolved_normalization_mode = saved_mode
+            log.info(
+                "resuming %s with checkpoint's own saved normalization (mode=%s)",
+                run_cfg.run_name, saved_mode,
+            )
+
+    normalization_snapshot = build_normalization_snapshot(
+        getattr(model_cfg, "resolved_normalization_mode", None), dataset_stats,
+    )
+
     policy, preprocessor = adapter.build(data_cfg, model_cfg, train_cfg, dataset_stats, device=str(device))
     policy = policy.to(device)
     if adapter.post_build_hook:
@@ -827,7 +902,7 @@ def train_loop_per_worker(config: dict) -> None:
                     _report_with_checkpoint(
                         window_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
                         run_cfg, epoch, step, epoch_complete=False, rank=rank, save_checkpoint=save_checkpoint,
-                        async_checkpointer=async_checkpointer,
+                        async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
                     )
                 if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
                     _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -899,7 +974,7 @@ def train_loop_per_worker(config: dict) -> None:
                     val_loss_sum, val_n, val_metrics_sum, adapter, unwrapped_policy, optimizer, dist_ctx,
                     run_cfg, train_cfg, epoch, step, epoch_complete=False, rank=rank,
                     tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
-                    async_checkpointer=async_checkpointer,
+                    async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
                 )
 
             # Episode-preview GIFs -- independent cadence from the val
@@ -986,7 +1061,7 @@ def train_loop_per_worker(config: dict) -> None:
                 epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, adapter, unwrapped_policy, optimizer,
                 dist_ctx, run_cfg, train_cfg, epoch, step, epoch_complete=True, rank=rank,
                 tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
-                async_checkpointer=async_checkpointer,
+                async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
             )
         else:
             # Either val is disabled entirely, OR periodic val already ran
@@ -1006,7 +1081,7 @@ def train_loop_per_worker(config: dict) -> None:
                 _report_with_checkpoint(
                     metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
                     run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
-                    async_checkpointer=async_checkpointer,
+                    async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
                 )
             if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
                 _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -1047,6 +1122,7 @@ def train_loop_per_worker(config: dict) -> None:
         _report_with_checkpoint(
             test_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
             run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=False,
+            normalization_snapshot=normalization_snapshot,
         )
 
     if async_checkpointer is not None:

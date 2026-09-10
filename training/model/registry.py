@@ -61,6 +61,23 @@ class PolicyAdapter:
     # test/* (both TensorBoard and W&B, subject to the same
     # --wandb-metrics/--wandb-metric-groups filtering) -- no new plumbing needed.
     extra_metrics: Callable[[Any, dict], dict[str, float]] | None = None
+    # (overrides) -> PretrainedNormalization. None for ACT (trains from
+    # scratch, no pretrained checkpoint whose scheme could mismatch) and
+    # MolmoAct2 (deliberately hardcodes MEAN_STD already, separately
+    # reasoned -- see training/model/molmoact2.py's build_molmoact2_config).
+    # Implemented by pi05 -- see training/model/normalization.py's
+    # resolve_normalization, which is what actually calls this.
+    get_pretrained_normalization: Callable[[Any], Any] | None = None
+    # Overrides DataConfig.default_image_normalization's own dataclass
+    # default ("mean_std") when the user hasn't explicitly passed
+    # --default-image-normalization. None (ACT, MolmoAct2) -- mean_std
+    # stays their default, unchanged. Set by pi05 to "unit01": lerobot's
+    # real installed pi05 model unconditionally does img*2-1 inside its own
+    # forward pass expecting [0,1] input (modeling_pi05.py:996-997) --
+    # mean_std's unbounded output breaks this regardless of which pi05
+    # checkpoint is used, so this is a real default fix, not an ambiguous
+    # per-checkpoint choice like STATE/ACTION mode above.
+    preferred_visual_normalization: str | None = None
 
 
 def _act_adapter() -> PolicyAdapter:
@@ -100,6 +117,9 @@ def _pi05_adapter(distributed_strategy: str) -> PolicyAdapter:
         save_checkpoint=pi05.save_checkpoint if is_fsdp2 else None,
         load_checkpoint=pi05.load_checkpoint if is_fsdp2 else None,
         prepare_model_kwargs=None if is_fsdp2 else {"find_unused_parameters": True},
+        # Both orthogonal to distributed_strategy -- wired unconditionally.
+        get_pretrained_normalization=pi05.get_pretrained_normalization,
+        preferred_visual_normalization="unit01",
     )
 
 

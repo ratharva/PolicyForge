@@ -60,15 +60,21 @@ def build_pi05_config(
         empty_cameras=overrides.empty_cameras,
         image_resolution=(h, w),
         dtype=overrides.dtype,
-        # STATE/ACTION: MEAN_STD (not the real default IDENTITY/QUANTILES),
-        # same deliberate simplification as MolmoAct2, so
-        # training/data/stats.py's mean/std-only compute_dataset_stats
-        # works unchanged. VISUAL: IDENTITY -- training/model/
-        # image_normalization.py now owns all image scaling instead
-        # (applied in train_loop.py before this policy's preprocessor
-        # runs), so lerobot's own per-FeatureType normalizer must not also
-        # scale images.
-        normalization_mapping={"VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
+        # STATE/ACTION: MEAN_STD by default, same deliberate simplification
+        # as MolmoAct2 -- overridden to the checkpoint's own real scheme
+        # (QUANTILES for the real lerobot/pi05_droid checkpoint) when
+        # overrides.resolved_normalization_mode is set by
+        # training/model/normalization.py's resolve_normalization
+        # (--normalization-mode-source checkpoint). See training/model/
+        # normalization.py's module docstring for why the old hardcoded
+        # MEAN_STD was a real, confirmed bug for this checkpoint. VISUAL:
+        # always IDENTITY regardless -- training/model/image_normalization.py
+        # owns all image scaling instead (applied in train_loop.py before
+        # this policy's preprocessor runs), so lerobot's own per-FeatureType
+        # normalizer must not also scale images.
+        normalization_mapping=overrides.resolved_normalization_mode or {
+            "VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD",
+        },
         optimizer_lr=train_cfg.lr,
         # Not consumed by this pipeline's optimizer construction (train_loop.py
         # builds AdamW directly from get_optim_params() + train_cfg, bypassing
@@ -89,7 +95,7 @@ def build_policy_and_processor(
     from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 
     cfg = build_pi05_config(data_cfg, overrides, train_cfg, device=device)
-    policy = PI05Policy.from_pretrained(overrides.pretrained_path, config=cfg)
+    policy = PI05Policy.from_pretrained(overrides.pretrained_path, config=cfg, revision=overrides.revision)
     preprocessor, _postprocessor = make_pi05_pre_post_processors(cfg, dataset_stats=dataset_stats)
     return policy, preprocessor
 
@@ -110,6 +116,39 @@ def forward_loss(policy, inputs: dict) -> tuple[torch.Tensor, dict[str, float]]:
         else:
             scalars[k] = float(v)
     return loss, scalars
+
+
+def get_pretrained_normalization(overrides: Pi05ConfigOverrides):
+    """PolicyAdapter.get_pretrained_normalization hook -- read-only, no
+    training-data access. Uses lerobot's own supported PreTrainedConfig
+    loading API (NOT manual JSON parsing of config.json) -- confirmed via a
+    real call against lerobot/pi05_droid that PI05Config.from_pretrained
+    resolves local-dir-vs-Hub and revision pinning exactly like
+    PI05Policy.from_pretrained itself does, and gives real, typed access to
+    normalization_mapping/use_relative_actions/relative_exclude_joints/
+    input_features/output_features -- no need to hand-parse
+    policy_preprocessor.json for any of that. Numeric stat VALUES, when
+    published, live only in policy_preprocessor.json's normalizer_processor
+    step (confirmed: config.json never carries them) -- fetched separately
+    via normalization.fetch_processor_stats, which is why this needs both."""
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+    from training.model.normalization import PretrainedNormalization, fetch_processor_stats
+
+    cfg = PI05Config.from_pretrained(overrides.pretrained_path, revision=overrides.revision)
+    mode = {k: v.value for k, v in cfg.normalization_mapping.items()}
+    stats = fetch_processor_stats(overrides.pretrained_path, overrides.revision)
+    max_state_dim = cfg.input_features["observation.state"].shape[0] if "observation.state" in cfg.input_features else None
+    max_action_dim = cfg.output_features["action"].shape[0] if "action" in cfg.output_features else None
+    return PretrainedNormalization(
+        mode=mode,
+        stats=stats,
+        action_relative=bool(cfg.use_relative_actions),
+        action_relative_exclude=list(cfg.relative_exclude_joints or []),
+        max_state_dim=max_state_dim,
+        max_action_dim=max_action_dim,
+        revision=overrides.revision,
+    )
 
 
 # ---------------------------------------------------------------------------

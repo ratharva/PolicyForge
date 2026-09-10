@@ -298,6 +298,34 @@ def main() -> None:
                          help="action component names to keep absolute even under "
                               "--action-representation delta (e.g. a gripper component name)")
 
+    # --- STATE/ACTION normalization mode+stats resolution (training/model/normalization.py) ---
+    parser.add_argument("--normalization-mode-source", choices=("explicit", "checkpoint"), default="explicit",
+                         help="explicit (default): use --normalization-explicit-mode (or, if unset, "
+                              "whatever the policy's own build_*_config hardcodes -- today's exact "
+                              "behavior). checkpoint: read the mode from the pretrained checkpoint's own "
+                              "saved config -- requires the policy's adapter to support this (pi05 does; "
+                              "act/molmoact2 don't -- fails fast with a clear error otherwise)")
+    parser.add_argument("--normalization-explicit-mode",
+                         choices=("MEAN_STD", "MIN_MAX", "QUANTILES", "QUANTILE10", "IDENTITY"), default=None,
+                         help="only used when --normalization-mode-source explicit -- overrides the "
+                              "policy's own hardcoded STATE/ACTION normalization mode. None (default): "
+                              "don't override, today's exact behavior")
+    parser.add_argument("--normalization-stats-source", choices=("dataset", "checkpoint", "explicit_file"),
+                         default="dataset",
+                         help="dataset (default): compute from this run's own training data -- today's "
+                              "exact behavior. checkpoint: use numeric stat values the checkpoint itself "
+                              "publishes -- errors clearly if the checkpoint declares a mode but ships no "
+                              "stats (a real, confirmed case for lerobot/pi05_droid). explicit_file: load "
+                              "a pre-computed stats JSON from --normalization-explicit-stats-file")
+    parser.add_argument("--normalization-explicit-stats-file", default=None,
+                         help='required iff --normalization-stats-source explicit_file -- path to a JSON '
+                              'file shaped like {"observation.state": {...}, "action": {...}}')
+    parser.add_argument("--inspect-normalization", action="store_true",
+                         help="print the active policy's pretrained checkpoint's declared normalization "
+                              "(mode, whether it publishes numeric stats, absolute/delta action "
+                              "representation, dims) vs. this run's resolved settings, then exit -- no "
+                              "training-data access, no TorchTrainer launched")
+
     # --- per-camera image normalization ---
     parser.add_argument("--image-normalization", nargs="+", default=[],
                          metavar="CAMERA=MODE",
@@ -416,6 +444,12 @@ def main() -> None:
                               "carries real unverified checkpoint-resume risk")
     parser.add_argument("--pi05-fsdp-cpu-offload", action="store_true",
                          help="trades speed for fitting on fewer/smaller GPUs -- fsdp2 strategy only")
+    parser.add_argument("--pi05-revision", default=None,
+                         help="pins BOTH weight loading (PI05Policy.from_pretrained) and processor-config "
+                              "loading (--normalization-mode-source/--normalization-stats-source "
+                              "checkpoint, --inspect-normalization) to this specific Hub revision/commit/"
+                              "tag -- default: the Hub's default (latest) revision for both, same as "
+                              "before this flag existed (no revision was ever pinned at all)")
     args = parser.parse_args()
 
     # Policy-specific "required iff"/cross-field validation moved below,
@@ -603,6 +637,7 @@ def main() -> None:
         _apply_if_explicit(m, "dtype", args, "pi05_dtype", parser)
         _apply_if_explicit(m, "distributed_strategy", args, "pi05_distributed_strategy", parser)
         _apply_if_explicit(m, "fsdp_cpu_offload", args, "pi05_fsdp_cpu_offload", parser)
+        _apply_if_explicit(m, "revision", args, "pi05_revision", parser)
         # No fsdp2-requires-X restriction here (unlike MolmoAct2's fsdp2-
         # requires-train_mode-fft check): PI05 has no LoRA, so FSDP2's
         # memory-sharding benefit applies regardless of
@@ -612,6 +647,25 @@ def main() -> None:
                 "--pi05-pretrained-path is required when --policy-type pi05 (either as a CLI flag or "
                 "in --config-file's model section)"
             )
+
+    # --- image-normalization default: an adapter's preferred_visual_normalization
+    # (e.g. pi05's "unit01" -- lerobot's real installed pi05 model
+    # unconditionally does img*2-1 expecting [0,1] input, so mean_std's
+    # unbounded output is a real bug there -- see training/model/registry.py)
+    # wins over DataConfig.default_image_normalization's own dataclass
+    # default ("mean_std") whenever the user hasn't explicitly passed
+    # --image-normalization-default. An explicit flag always wins over the
+    # adapter's preference -- the _apply_if_explicit call right below this
+    # runs unconditionally and overrides whatever this block set, iff the
+    # user actually passed the flag.
+    from training.model.registry import get_adapter
+
+    adapter = get_adapter(run_cfg.policy_type)
+    if (
+        adapter.preferred_visual_normalization
+        and args.image_normalization_default == parser.get_default("image_normalization_default")
+    ):
+        run_cfg.data.default_image_normalization = adapter.preferred_visual_normalization
 
     # --- data: action-space/image-normalization -- CLI wins per-key for the
     # two dict fields (a config-file's other camera entries are preserved,
@@ -628,6 +682,17 @@ def main() -> None:
     if run_cfg.data.action_representation not in ("absolute", "delta"):
         parser.error("action representation must be 'absolute' or 'delta'")
     _apply_if_explicit(run_cfg.data, "action_delta_exclude", args, "action_delta_exclude", parser)
+
+    _apply_if_explicit(run_cfg.data.normalization, "mode_source", args, "normalization_mode_source", parser)
+    _apply_if_explicit(run_cfg.data.normalization, "explicit_mode", args, "normalization_explicit_mode", parser)
+    _apply_if_explicit(run_cfg.data.normalization, "stats_source", args, "normalization_stats_source", parser)
+    _apply_if_explicit(
+        run_cfg.data.normalization, "explicit_stats_file", args, "normalization_explicit_stats_file", parser,
+    )
+    if run_cfg.data.normalization.mode_source not in ("explicit", "checkpoint"):
+        parser.error("normalization mode_source must be 'explicit' or 'checkpoint'")
+    if run_cfg.data.normalization.stats_source not in ("dataset", "checkpoint", "explicit_file"):
+        parser.error("normalization stats_source must be 'dataset', 'checkpoint', or 'explicit_file'")
 
     _apply_if_explicit(run_cfg, "storage_root", args, "storage_root", parser)
     run_cfg.storage_root = os.path.abspath(run_cfg.storage_root)
@@ -663,6 +728,37 @@ def main() -> None:
             f"{dataset_source!r} -- available: {sorted(original_robot.action_space_components) or '(none)'}"
         )
     run_cfg.data.robot = original_robot.select_action_space(run_cfg.data.action_space)
+
+    if args.inspect_normalization:
+        from training.model.normalization import inspect_pretrained_normalization
+
+        print(f"\n=== normalization inspection ({run_cfg.policy_type}) ===")
+        pretrained = inspect_pretrained_normalization(run_cfg.policy_type, run_cfg.model)
+        if pretrained is None:
+            print(
+                f"  policy_type={run_cfg.policy_type!r} has no get_pretrained_normalization hook -- "
+                "nothing to inspect (only pi05 implements this today)."
+            )
+        else:
+            print(f"  checkpoint declared mode: {pretrained.mode}")
+            print(
+                f"  checkpoint publishes numeric stats: {'yes' if pretrained.stats else 'no'} "
+                f"({sorted(pretrained.stats) if pretrained.stats else '[]'})"
+            )
+            print(
+                f"  checkpoint action_relative={pretrained.action_relative} "
+                f"exclude={pretrained.action_relative_exclude} vs. this run's "
+                f"--action-representation {run_cfg.data.action_representation!r} "
+                f"--action-delta-exclude {run_cfg.data.action_delta_exclude!r}"
+            )
+            print(
+                f"  checkpoint max_state_dim={pretrained.max_state_dim} "
+                f"max_action_dim={pretrained.max_action_dim} (padded capacity, not per-dataset dims) "
+                f"vs. this run's RobotSchema state_dim={run_cfg.data.robot.state_dim} "
+                f"action_dim={run_cfg.data.robot.action_dim}"
+            )
+        print(f"  resolved default image-normalization mode: {run_cfg.data.default_image_normalization!r}")
+        return
 
     for cam, mode in run_cfg.data.image_normalization.items():
         if mode not in IMAGE_NORMALIZATION_MODES:
@@ -848,6 +944,22 @@ def main() -> None:
     # val/test -- that data was never part of raw_ds to begin with. See
     # training/data/stats.py.
     dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
+
+    # STATE/ACTION normalization mode+stats resolution -- no-op (byte-
+    # identical to today's behavior) when run_cfg.data.normalization is left
+    # at its all-defaults. See training/model/normalization.py's module
+    # docstring for the real bug this fixes.
+    from training.model.normalization import resolve_normalization, validate_normalization
+
+    resolved_normalization = resolve_normalization(run_cfg.data, run_cfg.policy_type, run_cfg.model, raw_ds)
+    validate_normalization(
+        resolved_normalization, run_cfg.data, run_cfg.data.robot, run_cfg.policy_type, run_cfg.model,
+    )
+    if resolved_normalization.stats:
+        for key, val in resolved_normalization.stats.items():
+            dataset_stats[key] = val
+    if resolved_normalization.mode is not None:
+        run_cfg.model.resolved_normalization_mode = resolved_normalization.mode
 
     ds = transpose_for_training(
         raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name,

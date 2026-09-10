@@ -21,6 +21,19 @@ class PolicyOverrides(draccus.ChoiceRegistry):
     detail -- runtime code (train_loop.py, model/*.py) keeps accessing
     RunConfig.model by plain attribute access, unaffected by this base."""
 
+    # Populated by train.py's resolve_normalization(), driver-side, AFTER
+    # argparse/draccus parsing and BEFORE TorchTrainer construction -- never
+    # a CLI/YAML input itself (no --flag sets this directly). Every worker
+    # sees it for free via the existing run_cfg plumbing
+    # (train_loop_config["run_cfg"]). None for ACT/MolmoAct2 (no adapter
+    # hook sets it; their build_*_config keeps its own hardcoded
+    # normalization_mapping unchanged) and for pi05 whenever
+    # DataConfig.normalization is left at its all-defaults no-op path. A
+    # real dict is lerobot's own normalization_mapping shape (FeatureType
+    # name -> NormalizationMode name), e.g.
+    # {"VISUAL": "IDENTITY", "STATE": "QUANTILES", "ACTION": "QUANTILES"}.
+    resolved_normalization_mode: dict[str, str] | None = None
+
 
 @PolicyOverrides.register_subclass("act")
 @dataclass
@@ -104,6 +117,12 @@ class Pi05ConfigOverrides(PolicyOverrides):
     # REQUIRED, no safe default -- find a real pretrained checkpoint on the
     # HF Hub and pass it via --pi05-pretrained-path.
     pretrained_path: str = ""
+    # Pins BOTH weight loading (PI05Policy.from_pretrained) and processor-
+    # config loading (get_pretrained_normalization) to this specific Hub
+    # revision/commit/tag. None (default) uses the Hub's default (latest)
+    # revision for both -- same as this pipeline's behavior before this
+    # field existed (no revision was ever passed at all).
+    revision: str | None = None
     chunk_size: int = 50          # PI05Config's own default
     n_action_steps: int = 50      # PI05Config's own default
     freeze_vision_encoder: bool = False   # freezes the vision tower only
