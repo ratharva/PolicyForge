@@ -154,6 +154,16 @@ class TrainConfig:
     # attaching checkpoints at all in that case (val owns retention).
     save_only_on_improvement: bool = False
     checkpoint_max_to_keep: int = 3
+    # Opt-in, plain-DDP path only (no effect under FSDP2, which already
+    # uses accelerate's own save_state/load_state) -- writes checkpoints via
+    # torch.distributed.checkpoint.async_save instead of a blocking
+    # pickle.dump, so the slow disk write happens in the background while
+    # training continues. Carries real, not-fully-verified risk: a save is
+    # only reported to Ray (eligible for checkpoint_score_attribute scoring
+    # or resume) one checkpoint-cycle late, once its write is CONFIRMED
+    # finished -- see train_loop.py's _AsyncCheckpointer. Test with a real
+    # crash+resume before trusting this for a long run.
+    async_checkpoint: bool = False
 
     # Opt-in perf instrumentation (training/perf_logging.py) -- off by
     # default so a normal run pays zero cost: accurate step-timing needs

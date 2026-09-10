@@ -153,6 +153,15 @@ def main() -> None:
                               "close to wherever training actually stopped), even when the most "
                               "recent isn't among the N best -- native Ray Train checkpoint-manager "
                               "behavior, not custom logic here")
+    parser.add_argument("--async-checkpoint", action="store_true",
+                         help="write checkpoints via torch.distributed.checkpoint.async_save instead "
+                              "of a blocking pickle.dump -- the slow disk write happens in the "
+                              "background while training continues. Opt-in, plain-DDP path only (no "
+                              "effect under --molmoact2-distributed-strategy fsdp2). Carries real, "
+                              "not-fully-verified risk: a save is only reported to Ray -- eligible "
+                              "for checkpoint retention/resume -- one checkpoint-cycle late, once its "
+                              "write is confirmed finished. Test with a real crash+resume before "
+                              "trusting this for a long run")
     parser.add_argument("--num-workers", type=int, default=None,
                          help="Ray Train DDP workers; default = live GPU count")
 
@@ -455,6 +464,7 @@ def main() -> None:
     )
     _apply_if_explicit(run_cfg.train, "save_only_on_improvement", args, "save_only_on_improvement", parser)
     _apply_if_explicit(run_cfg.train, "checkpoint_max_to_keep", args, "checkpoint_max_to_keep", parser)
+    _apply_if_explicit(run_cfg.train, "async_checkpoint", args, "async_checkpoint", parser)
     _apply_if_explicit(run_cfg.train, "log_perf_metrics", args, "log_perf_metrics", parser)
     if args.profile_steps is not None:  # already parsed into the (start, end) tuple `profile_steps` above
         run_cfg.train.profile_steps = profile_steps

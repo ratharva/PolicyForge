@@ -87,14 +87,96 @@ def _log_all(
             wandb_run.log(filtered, step=wandb_step if wandb_step is not None else step)
 
 
+class _AsyncCheckpointer:
+    """--async-checkpoint (opt-in, plain-DDP path only -- see training/README.md).
+    Wraps torch.distributed.checkpoint.async_save so at most ONE checkpoint
+    write is ever in flight -- PyTorch's own docs recommend this explicitly
+    (more than one risks unbounded CPU-staging-buffer growth). async_save
+    itself does the "copy into internal CPU buffers" step SYNCHRONOUSLY
+    (fast -- this is what makes the subsequent background disk write safe:
+    it's writing a stable CPU snapshot, not live GPU tensor references that
+    the next optimizer.step() would mutate mid-write) and returns a Future
+    covering just the slow disk-write part.
+
+    Real, deliberate design constraint: a save kicked off at step N is NOT
+    reported to Ray (and so isn't eligible for checkpoint_score_attribute
+    scoring or resume) until the NEXT checkpoint-worthy call, once its
+    write has actually finished -- confirmed via this class's own Future,
+    not assumed. This is a one-cycle lag, not a bug: ray.train.Checkpoint.
+    from_directory() needs the directory's files fully written before Ray
+    reads them, and whether calling ray.train.report(checkpoint=...) while
+    DCP is still writing in the background is safe is NOT verified against
+    a real Ray install here -- so this only ever hands Ray a directory
+    whose write already completed. In practice a save takes far less than a
+    full window_every_steps/val_every_steps cycle, so `_future.result()`
+    below should return immediately, not actually block."""
+
+    def __init__(self):
+        self._future = None
+        self._pending: tuple[dict, str, int, int, bool] | None = None
+
+    def _flush_pending(self) -> tuple[dict, str, int, int, bool] | None:
+        if self._future is None:
+            return None
+        self._future.result()  # blocks -- see class docstring on why this should be a no-op in practice
+        self._future = None
+        pending, self._pending = self._pending, None
+        return pending
+
+    def save(
+        self, state: dict, ckpt_dir: str, metrics: dict, epoch: int, step: int, epoch_complete: bool,
+    ) -> tuple[dict, str, int, int, bool] | None:
+        """Waits for any previous save to finish (returning ITS
+        (metrics, ckpt_dir, epoch, step, epoch_complete) for the caller to
+        report to Ray), then kicks off a NEW async save for `state` and
+        remembers it as pending. Caller must gate this to rank 0 only."""
+        import torch.distributed.checkpoint as dcp
+
+        finished = self._flush_pending()
+        os.makedirs(ckpt_dir, exist_ok=True)
+        self._future = dcp.async_save(state, checkpoint_id=ckpt_dir)
+        self._pending = (metrics, ckpt_dir, epoch, step, epoch_complete)
+        return finished
+
+    def drain(self) -> tuple[dict, str, int, int, bool] | None:
+        """Call once at the very end of training so the LAST in-flight save
+        still gets reported to Ray instead of silently vanishing."""
+        return self._flush_pending()
+
+
+def _attach_finished_async_checkpoint(finished: tuple[dict, str, int, int, bool] | None) -> None:
+    """Reports a finished async-checkpoint's own metrics + directory to Ray
+    (writing the small epoch/step/epoch_complete JSON sidecar first -- kept
+    OUT of the tensor state dict async_save itself writes, since mixing
+    plain ints/bools into that dict is unverified against DCP's real
+    behavior), then removes the directory -- mirrors the old code's
+    tempfile.TemporaryDirectory() auto-cleanup, just done manually since
+    this directory has to outlive the call that created it. No-op if
+    nothing was pending. Rank 0 only, caller must gate."""
+    if finished is None:
+        return
+    import json
+    import shutil
+
+    metrics, ckpt_dir, epoch, step, epoch_complete = finished
+    with open(os.path.join(ckpt_dir, "_meta.json"), "w") as f:
+        json.dump({"epoch": epoch, "step": step, "epoch_complete": epoch_complete}, f)
+    ray.train.report(metrics, checkpoint=ray.train.Checkpoint.from_directory(ckpt_dir))
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
+
+
 def _report_with_checkpoint(
     metrics: dict, adapter: PolicyAdapter, unwrapped_policy, optimizer, dist_ctx,
     run_cfg: RunConfig, epoch: int, step: int, epoch_complete: bool, rank: int, save_checkpoint: bool,
+    async_checkpointer: "_AsyncCheckpointer | None" = None,
 ) -> None:
     """dist_ctx is the accelerator from adapter.wrap_for_training (FSDP2 path)
     or None (DDP path). epoch_complete distinguishes a step-windowed
     (mid-epoch) checkpoint from an end-of-epoch one -- required for the
-    resume logic in train_loop_per_worker to pick the correct epoch."""
+    resume logic in train_loop_per_worker to pick the correct epoch.
+    async_checkpointer is only ever non-None for the plain-DDP path (see
+    _AsyncCheckpointer) -- the FSDP2 branch below always uses accelerate's
+    own save_state/load_state, a separate mechanism this doesn't touch."""
     if not save_checkpoint:
         ray.train.report(metrics)
         return
@@ -116,8 +198,34 @@ def _report_with_checkpoint(
             torch.distributed.barrier()
         return
 
-    # Default (DDP) path: pickle the unwrapped model/optimizer state_dict,
-    # rank 0 only.
+    if async_checkpointer is not None:
+        # Deliberately exactly ONE ray.train.report() call here, matching
+        # every other call site in this file -- calling it twice (once for
+        # a just-finished previous checkpoint, once more for THIS cycle's
+        # live metrics) would make rank 0's report() call COUNT differ from
+        # every other rank's for this same event, an unverified risk on top
+        # of an already-experimental feature. The real, user-visible cost:
+        # whenever a previous save just finished, Ray's OWN tracked metrics
+        # (result.metrics, history.jsonl) report that PREVIOUS cycle's
+        # values, not this one -- TensorBoard/W&B already have the current
+        # cycle's real numbers from _log_all above, so nothing is actually
+        # lost, but Ray's own history looks one checkpoint-cycle stale.
+        if rank == 0:
+            ckpt_dir = os.path.join(
+                run_cfg.storage_root, run_cfg.run_name, f"_async_checkpoint_tmp_{step}",
+            )
+            state = {"model": unwrapped_policy.state_dict(), "optim": optimizer.state_dict()}
+            finished = async_checkpointer.save(state, ckpt_dir, metrics, epoch, step, epoch_complete)
+            if finished is not None:
+                _attach_finished_async_checkpoint(finished)
+            else:
+                ray.train.report(metrics)
+        else:
+            ray.train.report(metrics)
+        return
+
+    # Default (synchronous DDP) path: pickle the unwrapped model/optimizer
+    # state_dict, rank 0 only. This is what --async-checkpoint replaces.
     if rank == 0:
         state = {
             "model": unwrapped_policy.state_dict(),
@@ -202,7 +310,7 @@ def _finish_val_pass(
     loss_sum: float, n: int, metrics_sum: dict[str, float], adapter: PolicyAdapter,
     unwrapped_policy, optimizer, dist_ctx, run_cfg: RunConfig, train_cfg: TrainConfig,
     epoch: int, step: int, epoch_complete: bool, rank: int, tb_writer, wandb_run,
-    best_val_loss_seen: float,
+    best_val_loss_seen: float, async_checkpointer: "_AsyncCheckpointer | None" = None,
 ) -> float:
     """Shared tail of a val pass -- gather this rank's _run_eval_pass output
     across ranks, log under val/*, and attach a checkpoint scored by THIS
@@ -237,10 +345,38 @@ def _finish_val_pass(
         _report_with_checkpoint(
             val_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
             run_cfg, epoch, step, epoch_complete=epoch_complete, rank=rank, save_checkpoint=save_checkpoint,
+            async_checkpointer=async_checkpointer,
         )
     if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
         _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
     return best_val_loss_seen
+
+
+def _load_async_checkpoint(d: str, unwrapped_policy, optimizer) -> dict:
+    """Loads a checkpoint written by _AsyncCheckpointer.save() (DCP format +
+    a _meta.json sidecar for epoch/step/epoch_complete, kept separate since
+    mixing plain ints/bools into the tensor state dict DCP itself writes is
+    unverified) -- the load-side counterpart to _report_with_checkpoint's
+    async_checkpointer branch. DCP's load() is in-place: it fills a
+    scaffold state dict (the model/optimizer's OWN current state_dict(),
+    used only for its shapes/keys) by reading from disk, then
+    load_state_dict() applies the now-filled values -- unlike pickle's
+    load-and-return pattern. Kept as its own standalone function (not
+    inlined in train_loop_per_worker) specifically so this local `import
+    torch.distributed.checkpoint` can't retroactively make the bare `torch`
+    name local to train_loop_per_worker's whole body -- see CLAUDE.md's
+    torch.profiler gotcha, the same hazard applies to any local
+    `import torch.<submodule>` inside a function that also uses `torch.*`
+    from its outer-scope import."""
+    import json
+    import torch.distributed.checkpoint as dcp
+
+    state_dict = {"model": unwrapped_policy.state_dict(), "optim": optimizer.state_dict()}
+    dcp.load(state_dict, checkpoint_id=d)
+    unwrapped_policy.load_state_dict(state_dict["model"])
+    optimizer.load_state_dict(state_dict["optim"])
+    with open(os.path.join(d, "_meta.json")) as f:
+        return json.load(f)
 
 
 def train_loop_per_worker(config: dict) -> None:
@@ -282,6 +418,14 @@ def train_loop_per_worker(config: dict) -> None:
         # > 1, so `policy` may have no `.module` -- unwrap defensively.
         unwrapped_policy = policy.module if hasattr(policy, "module") else policy
 
+    # --async-checkpoint: only meaningful for the plain-DDP path -- FSDP2
+    # (adapter.save_checkpoint set) always uses accelerate's own
+    # save_state/load_state instead, a separate mechanism this doesn't
+    # touch, so _report_with_checkpoint's FSDP2 branch ignores this anyway.
+    async_checkpointer = (
+        _AsyncCheckpointer() if train_cfg.async_checkpoint and not adapter.save_checkpoint else None
+    )
+
     policy.train()  # load-bearing for MolmoAct2's train_mode="freeze" (see model/molmoact2.py)
 
     start_epoch, step = 0, 0
@@ -292,10 +436,17 @@ def train_loop_per_worker(config: dict) -> None:
                 state = adapter.load_checkpoint(dist_ctx, d)
         else:
             with checkpoint.as_directory() as d:
-                with open(os.path.join(d, "state.pkl"), "rb") as f:
-                    state = pickle.load(f)
-                unwrapped_policy.load_state_dict(state["model"])
-                optimizer.load_state_dict(state["optim"])
+                if os.path.exists(os.path.join(d, "_meta.json")):
+                    # Written by --async-checkpoint's _AsyncCheckpointer (DCP
+                    # format) -- detected by the sidecar file's presence, so
+                    # resuming a run that switches --async-checkpoint on/off
+                    # between checkpoints still works either way.
+                    state = _load_async_checkpoint(d, unwrapped_policy, optimizer)
+                else:
+                    with open(os.path.join(d, "state.pkl"), "rb") as f:
+                        state = pickle.load(f)
+                    unwrapped_policy.load_state_dict(state["model"])
+                    optimizer.load_state_dict(state["optim"])
         # Only advance to the next epoch when the checkpoint actually
         # finished one; otherwise resume the same epoch (its data iterator
         # restarts from row 0). Checkpoints predating epoch_complete default
@@ -664,6 +815,7 @@ def train_loop_per_worker(config: dict) -> None:
                     _report_with_checkpoint(
                         window_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
                         run_cfg, epoch, step, epoch_complete=False, rank=rank, save_checkpoint=save_checkpoint,
+                        async_checkpointer=async_checkpointer,
                     )
                 if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
                     _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -734,6 +886,7 @@ def train_loop_per_worker(config: dict) -> None:
                     val_loss_sum, val_n, val_metrics_sum, adapter, unwrapped_policy, optimizer, dist_ctx,
                     run_cfg, train_cfg, epoch, step, epoch_complete=False, rank=rank,
                     tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+                    async_checkpointer=async_checkpointer,
                 )
 
             # Episode-preview GIFs -- independent cadence from the val
@@ -816,6 +969,7 @@ def train_loop_per_worker(config: dict) -> None:
                 epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, adapter, unwrapped_policy, optimizer,
                 dist_ctx, run_cfg, train_cfg, epoch, step, epoch_complete=True, rank=rank,
                 tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+                async_checkpointer=async_checkpointer,
             )
         else:
             save_checkpoint = improved if train_cfg.save_only_on_improvement else True
@@ -823,6 +977,7 @@ def train_loop_per_worker(config: dict) -> None:
                 _report_with_checkpoint(
                     metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
                     run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
+                    async_checkpointer=async_checkpointer,
                 )
             if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
                 _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -864,6 +1019,13 @@ def train_loop_per_worker(config: dict) -> None:
             test_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
             run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=False,
         )
+
+    if async_checkpointer is not None and rank == 0:
+        # Flush the LAST in-flight async save -- without this, a save
+        # kicked off by the final checkpoint-worthy call never gets
+        # reported to Ray at all (nothing left to trigger it), silently
+        # losing what should be the run's final checkpoint.
+        _attach_finished_async_checkpoint(async_checkpointer.drain())
 
     if prof is not None and prof_started:
         # max_train_steps/should_stop broke out of the loop before reaching

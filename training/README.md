@@ -350,6 +350,26 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --checkpoint-max-to-keep 10
 ```
 
+### Async checkpoint writes (`--async-checkpoint`, experimental)
+
+Plain-DDP checkpoints (no effect under `--molmoact2-distributed-strategy
+fsdp2`) are written via `torch.distributed.checkpoint.async_save` instead
+of a blocking `pickle.dump` -- the slow disk write happens in a background
+thread while training continues, instead of stalling the training loop
+for the full write duration. Real tradeoff: a checkpoint is only reported
+to Ray's own tracking (eligible for `checkpoint_score_attribute` scoring
+or resume) one checkpoint-cycle late, once its write is confirmed
+finished -- see `train_loop.py`'s `_AsyncCheckpointer`. This also means
+Ray's own `result.metrics`/`history.jsonl` entries lag by one cycle
+whenever a checkpoint just finished writing (TensorBoard/W&B are
+unaffected -- they already have the real-time numbers). Carries real,
+not-fully-verified risk -- test with a real crash+resume before trusting
+it for a long run.
+
+```bash
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --async-checkpoint
+```
+
 ## After training
 
 ```bash
