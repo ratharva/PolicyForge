@@ -6,6 +6,7 @@ best-N-checkpoints + step-windowed early stopping.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import pickle
@@ -23,6 +24,7 @@ from training import perf_logging
 from training.vendor.util import NumpyToTorchCollate
 from training.config import RunConfig, TrainConfig
 from training.model.image_normalization import apply_image_normalization
+from training.model.normalization import build_normalization_snapshot
 from training.model.registry import PolicyAdapter, get_adapter
 from training.wandb_logging import filter_metrics, sample_episode_frames
 
@@ -87,14 +89,130 @@ def _log_all(
             wandb_run.log(filtered, step=wandb_step if wandb_step is not None else step)
 
 
+def _clone_state_to_cpu(obj):
+    """Recursively clones every torch.Tensor found in a nested dict/list/
+    tuple structure to a detached CPU copy -- a stable snapshot safe to
+    read from a background thread while training continues mutating the
+    LIVE GPU tensors (the next optimizer.step() only touches those, never
+    this copy). Non-tensor leaves (ints, strings, small dicts inside
+    optimizer state, etc.) pass through unchanged."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _clone_state_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clone_state_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_clone_state_to_cpu(v) for v in obj)
+    return obj
+
+
+def _write_pickle_checkpoint(cpu_state: dict, ckpt_dir: str) -> None:
+    """Runs in the background thread -- the slow part (was previously done
+    synchronously in _report_with_checkpoint's default DDP path). Writes
+    the exact same state.pkl format the synchronous path already uses, so
+    the resume/load logic needs no format-detection branch at all -- a
+    checkpoint written with --async-checkpoint on or off looks identical
+    on disk."""
+    with open(os.path.join(ckpt_dir, "state.pkl"), "wb") as f:
+        pickle.dump(cpu_state, f)
+
+
+class _AsyncCheckpointer:
+    """--async-checkpoint (opt-in, plain-DDP path only -- see training/README.md).
+    Backgrounds the slow pickle.dump()+write behind a plain single-worker
+    thread pool, instead of torch.distributed.checkpoint.async_save.
+
+    DCP's own async_save was tried first and rejected after a real run hit
+    `AssertionError: A CPU backend must be enabled for async save` --
+    DCP's async machinery needs a CPU-capable process-group backend
+    (cpu:gloo,cuda:nccl) for its own internal coordination, which Ray
+    Train's NCCL-only process group doesn't provide. That coordination
+    exists to support genuinely SHARDED/distributed checkpoints (FSDP2,
+    tensor-parallel) -- overkill here: a plain-DDP checkpoint is an
+    unsharded full replica and only rank 0 ever saves, so there's no
+    cross-rank coordination need for the save itself. A plain background
+    thread sidesteps the question entirely -- no torch.distributed
+    involvement at all.
+
+    Tensors are copied to CPU SYNCHRONOUSLY first (fast, purely local --
+    this is what makes the subsequent background write safe, since the
+    next optimizer.step() only mutates the LIVE GPU tensors, never this
+    snapshot), then the slow pickle.dump()+write happens in the background
+    thread. Only one save is ever in flight (the thread pool has exactly
+    one worker) -- a save kicked off at step N is only reported to Ray
+    (eligible for checkpoint_score_attribute scoring or resume) one
+    checkpoint-cycle late, once its write is CONFIRMED finished via the
+    Future, not assumed. In practice a save takes far less than a full
+    window_every_steps/val_every_steps cycle, so `_future.result()` below
+    should return immediately, not actually block."""
+
+    def __init__(self):
+        import concurrent.futures
+
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._future = None
+        self._pending: tuple[dict, str, int, int, bool] | None = None
+
+    def _flush_pending(self) -> tuple[dict, str, int, int, bool] | None:
+        if self._future is None:
+            return None
+        self._future.result()  # blocks -- see class docstring on why this should be a no-op in practice
+        self._future = None
+        pending, self._pending = self._pending, None
+        return pending
+
+    def save(
+        self, state: dict, ckpt_dir: str, metrics: dict, epoch: int, step: int, epoch_complete: bool,
+    ) -> tuple[dict, str, int, int, bool] | None:
+        """Waits for any previous save to finish (returning ITS
+        (metrics, ckpt_dir, epoch, step, epoch_complete) for the caller to
+        report to Ray), then kicks off a NEW background save for `state`
+        and remembers it as pending. Caller must gate this to rank 0 only."""
+        finished = self._flush_pending()
+        os.makedirs(ckpt_dir, exist_ok=True)
+        cpu_state = _clone_state_to_cpu(state)
+        self._future = self._executor.submit(_write_pickle_checkpoint, cpu_state, ckpt_dir)
+        self._pending = (metrics, ckpt_dir, epoch, step, epoch_complete)
+        return finished
+
+    def drain(self) -> tuple[dict, str, int, int, bool] | None:
+        """Call once at the very end of training so the LAST in-flight save
+        still gets reported to Ray instead of silently vanishing."""
+        return self._flush_pending()
+
+
+def _attach_finished_async_checkpoint(finished: tuple[dict, str, int, int, bool] | None) -> None:
+    """Reports a finished async-checkpoint's own metrics + directory to
+    Ray, then removes the directory -- mirrors the old code's
+    tempfile.TemporaryDirectory() auto-cleanup, just done manually since
+    this directory has to outlive the call that created it. No-op if
+    nothing was pending. Rank 0 only, caller must gate."""
+    if finished is None:
+        return
+    import shutil
+
+    metrics, ckpt_dir, epoch, step, epoch_complete = finished
+    ray.train.report(metrics, checkpoint=ray.train.Checkpoint.from_directory(ckpt_dir))
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
+
+
 def _report_with_checkpoint(
     metrics: dict, adapter: PolicyAdapter, unwrapped_policy, optimizer, dist_ctx,
     run_cfg: RunConfig, epoch: int, step: int, epoch_complete: bool, rank: int, save_checkpoint: bool,
+    async_checkpointer: "_AsyncCheckpointer | None" = None, normalization_snapshot: dict | None = None,
 ) -> None:
     """dist_ctx is the accelerator from adapter.wrap_for_training (FSDP2 path)
     or None (DDP path). epoch_complete distinguishes a step-windowed
     (mid-epoch) checkpoint from an end-of-epoch one -- required for the
-    resume logic in train_loop_per_worker to pick the correct epoch."""
+    resume logic in train_loop_per_worker to pick the correct epoch.
+    async_checkpointer is only ever non-None for the plain-DDP path (see
+    _AsyncCheckpointer) -- the FSDP2 branch below always uses accelerate's
+    own save_state/load_state, a separate mechanism this doesn't touch.
+    normalization_snapshot (training/model/normalization.py's
+    build_normalization_snapshot) is persisted into every checkpoint format
+    below so resume/inference read back the same normalization used at
+    train time."""
     if not save_checkpoint:
         ray.train.report(metrics)
         return
@@ -105,7 +223,10 @@ def _report_with_checkpoint(
         # path derived from run_cfg rather than a per-rank temp dir.
         ckpt_dir = os.path.join(run_cfg.storage_root, run_cfg.run_name, "_fsdp2_checkpoint_tmp")
         os.makedirs(ckpt_dir, exist_ok=True)
-        adapter.save_checkpoint(dist_ctx, ckpt_dir, epoch, step, epoch_complete)
+        adapter.save_checkpoint(
+            dist_ctx, ckpt_dir, epoch, step, epoch_complete,
+            extra_meta={"normalization": normalization_snapshot},
+        )
         if rank == 0:
             ray.train.report(metrics, checkpoint=ray.train.Checkpoint.from_directory(ckpt_dir))
         else:
@@ -116,13 +237,45 @@ def _report_with_checkpoint(
             torch.distributed.barrier()
         return
 
-    # Default (DDP) path: pickle the unwrapped model/optimizer state_dict,
-    # rank 0 only.
+    if async_checkpointer is not None:
+        # Deliberately exactly ONE ray.train.report() call here, matching
+        # every other call site in this file -- calling it twice (once for
+        # a just-finished previous checkpoint, once more for THIS cycle's
+        # live metrics) would make rank 0's report() call COUNT differ from
+        # every other rank's for this same event, an unverified risk on top
+        # of an already-experimental feature. The real, user-visible cost:
+        # whenever a previous save just finished, Ray's OWN tracked metrics
+        # (result.metrics, history.jsonl) report that PREVIOUS cycle's
+        # values, not this one -- TensorBoard/W&B already have the current
+        # cycle's real numbers from _log_all above, so nothing is actually
+        # lost, but Ray's own history looks one checkpoint-cycle stale.
+        if rank == 0:
+            ckpt_dir = os.path.join(
+                run_cfg.storage_root, run_cfg.run_name, f"_async_checkpoint_tmp_{step}",
+            )
+            state = {
+                "model": unwrapped_policy.state_dict(),
+                "optim": optimizer.state_dict(),
+                "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
+                "normalization": normalization_snapshot,
+            }
+            finished = async_checkpointer.save(state, ckpt_dir, metrics, epoch, step, epoch_complete)
+            if finished is not None:
+                _attach_finished_async_checkpoint(finished)
+            else:
+                ray.train.report(metrics)
+        else:
+            ray.train.report(metrics)
+        return
+
+    # Default (synchronous DDP) path: pickle the unwrapped model/optimizer
+    # state_dict, rank 0 only. This is what --async-checkpoint replaces.
     if rank == 0:
         state = {
             "model": unwrapped_policy.state_dict(),
             "optim": optimizer.state_dict(),
             "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
+            "normalization": normalization_snapshot,
         }
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "state.pkl"), "wb") as f:
@@ -202,7 +355,8 @@ def _finish_val_pass(
     loss_sum: float, n: int, metrics_sum: dict[str, float], adapter: PolicyAdapter,
     unwrapped_policy, optimizer, dist_ctx, run_cfg: RunConfig, train_cfg: TrainConfig,
     epoch: int, step: int, epoch_complete: bool, rank: int, tb_writer, wandb_run,
-    best_val_loss_seen: float,
+    best_val_loss_seen: float, async_checkpointer: "_AsyncCheckpointer | None" = None,
+    normalization_snapshot: dict | None = None,
 ) -> float:
     """Shared tail of a val pass -- gather this rank's _run_eval_pass output
     across ranks, log under val/*, and attach a checkpoint scored by THIS
@@ -237,6 +391,7 @@ def _finish_val_pass(
         _report_with_checkpoint(
             val_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
             run_cfg, epoch, step, epoch_complete=epoch_complete, rank=rank, save_checkpoint=save_checkpoint,
+            async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
         )
     if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
         _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -257,6 +412,61 @@ def train_loop_per_worker(config: dict) -> None:
     )
 
     dataset_stats = config["dataset_stats"]
+
+    # Resume normalization cross-check -- must run BEFORE adapter.build()
+    # since dataset_stats/model_cfg.resolved_normalization_mode feed into
+    # it. Peeks at a resumed checkpoint's saved normalization snapshot and
+    # prefers its exact stats/mode on ordinary numeric drift (dataset-mode
+    # sampling isn't seeded); hard-fails only on a structural mismatch
+    # (different dims/mode keys). The checkpoint directory gets staged
+    # twice as a result (again below for the real model/optimizer restore,
+    # which needs dist_ctx, not yet constructed here) -- a one-time resume
+    # cost, not a hot-path concern.
+    resume_checkpoint = ray.train.get_checkpoint()
+    if resume_checkpoint is not None:
+        with resume_checkpoint.as_directory() as d:
+            if adapter.save_checkpoint:  # FSDP2 -- meta.json sidecar
+                meta_path = os.path.join(d, "meta.json")
+                saved_normalization = None
+                if os.path.exists(meta_path):
+                    with open(meta_path) as f:
+                        saved_normalization = json.load(f).get("normalization")
+            else:  # plain DDP (sync or async -- identical on-disk format) -- state.pkl
+                state_path = os.path.join(d, "state.pkl")
+                saved_normalization = None
+                if os.path.exists(state_path):
+                    with open(state_path, "rb") as f:
+                        saved_normalization = pickle.load(f).get("normalization")
+        if saved_normalization:
+            for column, expected_dim in (
+                ("observation.state", data_cfg.robot.state_dim), ("action", data_cfg.robot.action_dim),
+            ):
+                saved_stat = (saved_normalization.get("stats") or {}).get(column)
+                fresh_stat = dataset_stats.get(column)
+                if not saved_stat or not fresh_stat:
+                    continue
+                saved_len = len(next(iter(saved_stat.values())))
+                if set(saved_stat) != set(fresh_stat) or saved_len != expected_dim:
+                    raise RuntimeError(
+                        f"resuming {run_cfg.run_name!r}: checkpoint's saved normalization for {column!r} "
+                        f"(keys={sorted(saved_stat)}, dim={saved_len}) is structurally incompatible with "
+                        f"this run's freshly-resolved normalization (keys={sorted(fresh_stat)}, expected "
+                        f"dim={expected_dim}) -- looks like a genuinely different dataset/config is being "
+                        "resumed against."
+                    )
+                dataset_stats[column] = saved_stat
+            saved_mode = saved_normalization.get("mode")
+            if saved_mode is not None:
+                model_cfg.resolved_normalization_mode = saved_mode
+            log.info(
+                "resuming %s with checkpoint's own saved normalization (mode=%s)",
+                run_cfg.run_name, saved_mode,
+            )
+
+    normalization_snapshot = build_normalization_snapshot(
+        getattr(model_cfg, "resolved_normalization_mode", None), dataset_stats,
+    )
+
     policy, preprocessor = adapter.build(data_cfg, model_cfg, train_cfg, dataset_stats, device=str(device))
     policy = policy.to(device)
     if adapter.post_build_hook:
@@ -268,7 +478,10 @@ def train_loop_per_worker(config: dict) -> None:
     # accelerator.prepare(), which rebinds the optimizer's param references
     # to the sharded parameters -- so the optimizer must exist first.
     optim_params = policy.get_optim_params() if hasattr(policy, "get_optim_params") else policy.parameters()
-    optimizer = torch.optim.AdamW(optim_params, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+    optimizer = torch.optim.AdamW(
+        optim_params, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay,
+        betas=train_cfg.adam_betas, eps=train_cfg.adam_eps,
+    )
 
     dist_ctx = None
     if adapter.wrap_for_training:
@@ -282,6 +495,14 @@ def train_loop_per_worker(config: dict) -> None:
         # > 1, so `policy` may have no `.module` -- unwrap defensively.
         unwrapped_policy = policy.module if hasattr(policy, "module") else policy
 
+    # --async-checkpoint: only meaningful for the plain-DDP path -- FSDP2
+    # (adapter.save_checkpoint set) always uses accelerate's own
+    # save_state/load_state instead, a separate mechanism this doesn't
+    # touch, so _report_with_checkpoint's FSDP2 branch ignores this anyway.
+    async_checkpointer = (
+        _AsyncCheckpointer() if train_cfg.async_checkpoint and not adapter.save_checkpoint else None
+    )
+
     policy.train()  # load-bearing for MolmoAct2's train_mode="freeze" (see model/molmoact2.py)
 
     start_epoch, step = 0, 0
@@ -291,6 +512,11 @@ def train_loop_per_worker(config: dict) -> None:
             with checkpoint.as_directory() as d:
                 state = adapter.load_checkpoint(dist_ctx, d)
         else:
+            # Same state.pkl format regardless of --async-checkpoint --
+            # _AsyncCheckpointer writes via a background thread instead of
+            # inline, but the on-disk format (and this load path) is
+            # identical either way, so resuming a run that switches
+            # --async-checkpoint on/off between checkpoints just works.
             with checkpoint.as_directory() as d:
                 with open(os.path.join(d, "state.pkl"), "rb") as f:
                     state = pickle.load(f)
@@ -435,6 +661,13 @@ def train_loop_per_worker(config: dict) -> None:
     best_val_loss_seen = float("inf")
     windows_without_improvement = 0
     should_stop = False
+    # Tracks the last step the periodic VAL block actually ran at, so the
+    # epoch-end safety-net val pass (below) can skip itself when it would
+    # be a redundant, back-to-back re-run of the SAME step's val set (e.g.
+    # --max-train-steps landing exactly on a --val-every-steps boundary) --
+    # a real cross-rank ray.train.report() stall was observed from two val
+    # passes firing back-to-back at the same step, not just wasted compute.
+    last_val_step: int | None = None
 
     # --- perf instrumentation (training/perf_logging.py), opt-in via
     # --log-perf-metrics -- see that module's docstring for why it's not
@@ -664,6 +897,7 @@ def train_loop_per_worker(config: dict) -> None:
                     _report_with_checkpoint(
                         window_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
                         run_cfg, epoch, step, epoch_complete=False, rank=rank, save_checkpoint=save_checkpoint,
+                        async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
                     )
                 if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
                     _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -677,6 +911,7 @@ def train_loop_per_worker(config: dict) -> None:
             # longer wins retention. Early stopping (above) stays
             # training-loss-based, unchanged.
             if val_shard is not None and step % effective_val_every_steps == 0:
+                last_val_step = step
                 policy.eval()
                 val_loss_sum, val_n, val_metrics_sum, last_val_inputs = _run_eval_pass(
                     val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
@@ -734,6 +969,7 @@ def train_loop_per_worker(config: dict) -> None:
                     val_loss_sum, val_n, val_metrics_sum, adapter, unwrapped_policy, optimizer, dist_ctx,
                     run_cfg, train_cfg, epoch, step, epoch_complete=False, rank=rank,
                     tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+                    async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
                 )
 
             # Episode-preview GIFs -- independent cadence from the val
@@ -792,7 +1028,7 @@ def train_loop_per_worker(config: dict) -> None:
             if improved:
                 best_loss_seen = metrics["loss"]
 
-        if val_shard is not None:
+        if val_shard is not None and step != last_val_step:
             # Same gating as the windowed block: whenever a val split is
             # active, val owns checkpoint retention exclusively -- an
             # epoch-end checkpoint scored by training loss would otherwise
@@ -803,9 +1039,13 @@ def train_loop_per_worker(config: dict) -> None:
             # attachment) matters for a SHORT run -- fewer steps than the
             # val cadence never fires the periodic VAL block at all, and
             # skipping epoch-end too would leave the run with NO checkpoint
-            # whatsoever. This may duplicate a val pass that happened to
-            # also fire at this exact step via the periodic block -- a
-            # small, bounded extra cost, not a correctness issue.
+            # whatsoever. Skipped entirely (see the else branch) when the
+            # periodic VAL block already ran at this EXACT step (e.g.
+            # --max-train-steps landing on a --val-every-steps boundary) --
+            # NOT just "a small, bounded extra cost" as originally assumed
+            # here: a real run hit a genuine cross-rank ray.train.report()
+            # stall (SynchronizationActor waiting 120+s on one rank) from
+            # two val passes firing back-to-back at the same step.
             policy.eval()
             epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, _ = _run_eval_pass(
                 val_shard, adapter, policy, preprocessor, data_cfg, dataset_stats, dist_ctx, collate,
@@ -816,13 +1056,27 @@ def train_loop_per_worker(config: dict) -> None:
                 epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, adapter, unwrapped_policy, optimizer,
                 dist_ctx, run_cfg, train_cfg, epoch, step, epoch_complete=True, rank=rank,
                 tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
+                async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
             )
         else:
-            save_checkpoint = improved if train_cfg.save_only_on_improvement else True
+            # Either val is disabled entirely, OR periodic val already ran
+            # at this exact step -- report the training-loss epoch summary
+            # for bookkeeping symmetry (every rank must still call
+            # ray.train.report() once here), but NEVER attach a checkpoint
+            # from it when val is active: val already owns (or, via the
+            # async one-cycle lag, will shortly own) retention for this
+            # step, so a redundant training-loss-scored checkpoint here
+            # would just pollute the same scoring pool val is supposed to
+            # own exclusively.
+            save_checkpoint = (
+                False if val_shard is not None
+                else (improved if train_cfg.save_only_on_improvement else True)
+            )
             with perf_logging.Timer() as t_ckpt:
                 _report_with_checkpoint(
                     metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
                     run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=save_checkpoint,
+                    async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
                 )
             if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
                 _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
@@ -863,7 +1117,34 @@ def train_loop_per_worker(config: dict) -> None:
         _report_with_checkpoint(
             test_report_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
             run_cfg, epoch, step, epoch_complete=True, rank=rank, save_checkpoint=False,
+            normalization_snapshot=normalization_snapshot,
         )
+
+    if async_checkpointer is not None:
+        # Flush the LAST in-flight async save -- without this, a save
+        # kicked off by the final checkpoint-worthy call never gets
+        # reported to Ray at all (nothing left to trigger it), silently
+        # losing what should be the run's final checkpoint.
+        #
+        # Every rank MUST call ray.train.report() exactly once here,
+        # symmetrically -- a real deadlock was observed from an earlier,
+        # rank-0-only version of this block: only rank 0 ever touches
+        # async_checkpointer, so when it had a pending save to flush, it
+        # called report(checkpoint=...) here while every other rank called
+        # nothing at all, permanently desyncing Ray Train's cross-rank
+        # report() rendezvous (SynchronizationActor waited forever, not
+        # just the ~60-120s seen for the earlier, transient double-val-pass
+        # stall -- this one never resolves, since no later event makes the
+        # other ranks catch up). drain() on any non-zero rank always
+        # returns None (that rank's own async_checkpointer never had
+        # anything submitted to it), so the "else" branch below covers
+        # them for free -- this isn't rank-gated, it's just naturally a
+        # no-op there.
+        finished = async_checkpointer.drain() if rank == 0 else None
+        if finished is not None:
+            _attach_finished_async_checkpoint(finished)
+        else:
+            ray.train.report({"report_kind": "final_drain"})
 
     if prof is not None and prof_started:
         # max_train_steps/should_stop broke out of the loop before reaching
