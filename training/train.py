@@ -133,6 +133,9 @@ def main() -> None:
                          help="gradient accumulation steps")
     parser.add_argument("--weight-decay", type=float, default=1e-4,
                          help="AdamW weight decay")
+    parser.add_argument("--adam-beta1", type=float, default=0.9, help="AdamW beta1 -- PyTorch's own default")
+    parser.add_argument("--adam-beta2", type=float, default=0.999, help="AdamW beta2 -- PyTorch's own default")
+    parser.add_argument("--adam-eps", type=float, default=1e-8, help="AdamW eps -- PyTorch's own default")
     parser.add_argument("--max-train-steps", type=int, default=None,
                          help="cap total steps for a smoke run; omit for a full run over the data")
     parser.add_argument("--window-every-steps", type=int, default=200,
@@ -398,6 +401,17 @@ def main() -> None:
                               "modeling_molmoact2.py) -- bfloat16 is MolmoAct2Config's own real default "
                               "already, so this pipeline was already getting that benefit; exposed here "
                               "as a real override (e.g. float32 to debug a numerics issue)")
+    parser.add_argument("--molmoact2-revision", default=None,
+                         help="pins weight loading to a specific Hub revision/commit/tag -- default: "
+                              "the Hub's latest")
+    parser.add_argument("--molmoact2-norm-tag", default=None,
+                         help="selects a real, checkpoint-published normalization/config tag (e.g. "
+                              "'franka_droid') from the checkpoint's own norm_stats.json -- explicit "
+                              "only, no auto-derivation from --dataset-source (the mapping isn't 1:1). "
+                              "Warning: MolmoAct2Policy's own _apply_norm_tag_metadata silently "
+                              "overwrites chunk_size/n_action_steps to the tag's values at construction "
+                              "time -- validate_normalization hard-fails if these don't already match "
+                              "what you configured")
 
     # --- pi05 ---
     parser.add_argument("--pi05-pretrained-path", default="",
@@ -512,6 +526,10 @@ def main() -> None:
     _apply_if_explicit(run_cfg.train, "lr_backbone", args, "lr_backbone", parser)
     _apply_if_explicit(run_cfg.train, "grad_accum", args, "grad_accum", parser)
     _apply_if_explicit(run_cfg.train, "weight_decay", args, "weight_decay", parser)
+    # Tuple field, no single 1:1 CLI flag -- set from either half if either was passed explicitly.
+    if args.adam_beta1 != parser.get_default("adam_beta1") or args.adam_beta2 != parser.get_default("adam_beta2"):
+        run_cfg.train.adam_betas = (args.adam_beta1, args.adam_beta2)
+    _apply_if_explicit(run_cfg.train, "adam_eps", args, "adam_eps", parser)
     _apply_if_explicit(run_cfg.train, "max_train_steps", args, "max_train_steps", parser)
     _apply_if_explicit(run_cfg.train, "window_every_steps", args, "window_every_steps", parser)
     if run_cfg.train.window_every_steps <= 0:
@@ -617,6 +635,8 @@ def main() -> None:
     if run_cfg.policy_type == "molmoact2":
         m = run_cfg.model
         _apply_if_explicit(m, "checkpoint_path", args, "molmoact2_checkpoint_path", parser)
+        _apply_if_explicit(m, "revision", args, "molmoact2_revision", parser)
+        _apply_if_explicit(m, "norm_tag", args, "molmoact2_norm_tag", parser)
         _apply_if_explicit(m, "setup_type", args, "molmoact2_setup_type", parser)
         _apply_if_explicit(m, "control_mode", args, "molmoact2_control_mode", parser)
         _apply_if_explicit(m, "action_mode", args, "molmoact2_action_mode", parser)

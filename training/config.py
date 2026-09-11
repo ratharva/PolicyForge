@@ -55,6 +55,18 @@ class ACTConfigOverrides(PolicyOverrides):
 class MolmoAct2ConfigOverrides(PolicyOverrides):
     """Values passed to lerobot's MolmoAct2Config; see training/model/molmoact2.py."""
     checkpoint_path: str = "allenai/MolmoAct2"
+    # Pins weight loading to a specific Hub revision/commit/tag -- wires into
+    # MolmoAct2Config's own real (previously unwired) checkpoint_revision field.
+    revision: str | None = None
+    # Selects a real, checkpoint-published normalization/config tag (e.g.
+    # "franka_droid") from the checkpoint's own norm_stats.json -- wires into
+    # MolmoAct2Config's own real (previously unwired) norm_tag field. Explicit
+    # only, no auto-derivation from --dataset-source (the mapping isn't 1:1 --
+    # e.g. "franka_droid" matches --dataset-source droid, not droid_100). When
+    # set, MolmoAct2Policy's own _apply_norm_tag_metadata silently overwrites
+    # chunk_size/n_action_steps to the tag's values at construction time --
+    # see training/model/normalization.py's validation guard for this.
+    norm_tag: str | None = None
     chunk_size: int = 30          # MolmoAct2Config's own default -- NOT ACT's 100
     n_action_steps: int = 30
     action_mode: str = "continuous"  # real default is "both"; narrowed to skip the
@@ -182,6 +194,14 @@ class TrainConfig:
     lr: float = 1e-5
     lr_backbone: float = 1e-5
     weight_decay: float = 1e-4
+    # AdamW betas/eps -- PyTorch's own defaults, used by every policy today.
+    # A real optimizer recipe (e.g. AllenAI's own MolmoAct2 finetuning code)
+    # can need different values (betas=(0.9, 0.95), eps=1e-6) -- generic
+    # fields here rather than a MolmoAct2-only concept, since any policy's
+    # optimizer construction (train_loop.py) already goes through one shared
+    # torch.optim.AdamW(...) call.
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    adam_eps: float = 1e-8
     max_train_steps: int | None = None
     # Step-windowed reporting of TRAINING loss: finer-grained than
     # per-epoch, so early stopping gets more than one data point even with

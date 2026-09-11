@@ -93,6 +93,7 @@ def _molmoact2_adapter(distributed_strategy: str, offload_tokenization: bool) ->
         # requires_grad=True parameter participates in every forward pass.
         prepare_model_kwargs=None if is_fsdp2 else {"find_unused_parameters": True},
         preprocessing_offloaded=offload_tokenization,
+        get_pretrained_normalization=molmoact2.get_pretrained_normalization,
     )
 
 

@@ -219,6 +219,9 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 | `--molmoact2-fsdp-cpu-offload` | off | trades speed for fitting on fewer/smaller GPUs -- `fsdp2` only |
 | `--molmoact2-offload-tokenization` | off | run MolmoAct2's tokenizer+image-processor as a Ray Data stage instead of inline in the training loop |
 | `--molmoact2-offload-concurrency` | auto (from live CPU count) | Ray Data actor-pool size for the above |
+| `--molmoact2-revision` | none (Hub latest) | pins weight loading to a specific Hub revision/commit/tag |
+| `--molmoact2-norm-tag` | none | selects a real checkpoint-published tag (e.g. `franka_droid`) from `norm_stats.json` -- see "MolmoAct2 normalization resolution" below |
+| `--adam-beta1` / `-beta2` / `-eps` | `0.9` / `0.999` / `1e-8` | AdamW hyperparameters (PyTorch's own defaults) -- generic, used by every policy's optimizer |
 
 ```bash
 # LoRA on one GPU (the starting point -- get this working before fft)
@@ -256,6 +259,74 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
     --molmoact2-control-mode "delta joint position" \
     --molmoact2-vit-lr 1e-6 --molmoact2-connector-lr 5e-5 --molmoact2-action-expert-lr 1e-4
 ```
+
+### MolmoAct2 normalization resolution
+
+Same class of bug as π0.5's (see below): `training/model/molmoact2.py` hardcodes
+`{"STATE": "MEAN_STD", "ACTION": "MEAN_STD"}`, but the real installed
+`MolmoAct2Config()`'s own default is `QUANTILES`/`QUANTILES` (confirmed via
+`dataclasses.fields`), and AllenAI's own real finetuning code
+(`github.com/allenai/molmoact2`) defaults `--norm_mode q01_q99` -- both
+independently agree. Unlike π0.5's checkpoint, `allenai/MolmoAct2`'s own
+`norm_stats.json` publishes real numeric quantile stats (`q01`/`q99`/etc.,
+per dataset "tag" -- e.g. `franka_droid` for DROID/Franka), so
+`--normalization-stats-source checkpoint` is genuinely usable here, not
+just the scheme:
+
+```bash
+# Read-only: print what the checkpoint's franka_droid tag declares vs. this run's config
+python -m training.train --tasks droid_100_test --dataset-source droid_100 --policy-type molmoact2 \
+    --molmoact2-setup-type "single franka robotic arm in droid" \
+    --molmoact2-control-mode "absolute joint pose" \
+    --molmoact2-norm-tag franka_droid --inspect-normalization
+```
+
+**Real, confirmed dimension mismatch**: `franka_droid`'s stats are 8-dim
+(matches `--dataset-source droid`, the full `cadene/droid_1.0.1`, not yet
+prepared here) -- **not** `--dataset-source droid_100` (7-dim, this
+project's own small test dataset). `--normalization-stats-source checkpoint`
+against droid100 correctly hard-fails on this dimension mismatch (verified
+directly) rather than silently misapplying wrong-dim stats. The droid100
+recipe instead uses `mode_source: checkpoint` (the real QUANTILES scheme) +
+`stats_source: dataset` (computed from droid100's own 7-dim data) -- see
+`training/configs/molmoact2_droid100_base.yaml`/`molmoact2_droid100_lora.yaml`.
+
+**`--molmoact2-norm-tag` side effect, worth knowing**: setting it makes
+`MolmoAct2Policy`'s own `_apply_norm_tag_metadata` silently overwrite
+`chunk_size`/`n_action_steps` to the tag's own values at construction time
+(e.g. `franka_droid` -> 15/15, not this pipeline's own default of 30) --
+`validate_normalization` hard-fails if what you configured doesn't already
+match, rather than letting the run silently diverge from what you set.
+
+AllenAI's own real full-finetune recipe was also matched where it differs
+from this pipeline's own defaults: `train_mode: fft` + `distributed_strategy:
+fsdp2` (not this pipeline's own LoRA default), real per-group learning rates
+(`vit_lr=5e-6, connector_lr=5e-6, action_expert_lr=5e-5`, llm group via the
+flat `--lr 1e-5`), and real AdamW hyperparameters (`betas=(0.9, 0.95),
+eps=1e-6, weight_decay=0` -- PyTorch's own defaults are `(0.9, 0.999)`/`1e-8`,
+unchanged for every other policy). `training/configs/molmoact2_droid100_base.yaml`
+bundles all of this; `molmoact2_droid100_lora.yaml` is the same fix under
+this pipeline's own LoRA default, for anyone without FSDP2-capable
+multi-GPU hardware.
+
+Confirmed **not** an issue for MolmoAct2 (unlike π0.5): `float32_attention`
+(AllenAI's own deliberate fp32-attention-math precision choice) and
+`attn_implementation="sdpa"` are both already correct by default -- this
+pipeline never overrides either, and the real checkpoint's own `config.json`
+already sets them the same way AllenAI's own training code does.
+`torch.compile` is deliberately not attempted for MolmoAct2 -- no existing
+lerobot-side switch exists (unlike π0.5's), and AllenAI's own recommended
+generic-finetuning recipe (`--dynamic_seq_len=true`) disables compile too,
+using it only for their packed pretraining/reproduction recipes.
+
+**Not yet done**: an actual training run. Every finding above is verified
+against the real installed package + real checkpoint files + AllenAI's real
+training code, and the normalization hook itself is verified end-to-end via
+`--inspect-normalization` -- but MolmoAct2 has never actually been run in
+this pipeline (needs real GPU memory beyond what was available in
+development; ~20GB+ for LoRA, more for the recommended FSDP2 full-finetune
+path). Run the smoke test above first, then the normalization-fix
+comparison, before trusting either config file for a real training run.
 
 ## π0.5
 

@@ -178,7 +178,7 @@ def validate_normalization(
         raise ValueError(
             f"--normalization-mode-source checkpoint requires policy_type={policy_type!r} to declare "
             "a pretrained checkpoint's normalization scheme, but its adapter has no "
-            "get_pretrained_normalization hook (only pi05 does today) -- use "
+            "get_pretrained_normalization hook (pi05 and molmoact2 do today) -- use "
             "--normalization-mode-source explicit instead."
         )
 
@@ -186,8 +186,8 @@ def validate_normalization(
         if resolved.pretrained is None:
             raise ValueError(
                 f"--normalization-stats-source checkpoint requires policy_type={policy_type!r} to "
-                "declare a get_pretrained_normalization hook, but none exists (only pi05 does today) "
-                "-- use --normalization-stats-source dataset or explicit_file instead."
+                "declare a get_pretrained_normalization hook, but none exists (pi05 and molmoact2 do "
+                "today) -- use --normalization-stats-source dataset or explicit_file instead."
             )
         if not resolved.pretrained.stats:
             raise ValueError(
@@ -211,6 +211,29 @@ def validate_normalization(
                     f"resolved {column!r} normalization stats have dim {actual_dim}, but this run's "
                     f"RobotSchema declares {column!r} dim {expected_dim} -- these must match. Check "
                     "--action-space/dataset schema against the stats source."
+                )
+
+    # MolmoAct2-specific, independent of mode_source/stats_source: setting
+    # --molmoact2-norm-tag is wired unconditionally into MolmoAct2Config, so
+    # MolmoAct2Policy's own _apply_norm_tag_metadata silently overwrites
+    # chunk_size/n_action_steps to the tag's own values at construction
+    # time regardless of the normalization resolution path taken -- fail
+    # loudly here instead of letting the run silently diverge from what
+    # was configured.
+    if policy_type == "molmoact2" and getattr(model_cfg, "norm_tag", None):
+        from training.model.molmoact2 import get_norm_tag_metadata
+
+        tag_meta = get_norm_tag_metadata(model_cfg.checkpoint_path, model_cfg.revision, model_cfg.norm_tag)
+        for field, attr in (("action_horizon", "chunk_size"), ("n_action_steps", "n_action_steps")):
+            tag_value = tag_meta.get(field)
+            configured_value = getattr(model_cfg, attr)
+            if tag_value is not None and tag_value != configured_value:
+                raise ValueError(
+                    f"--molmoact2-norm-tag {model_cfg.norm_tag!r} declares {field}={tag_value!r}, but "
+                    f"this run configures {attr}={configured_value!r} -- MolmoAct2Policy's own "
+                    f"_apply_norm_tag_metadata will silently overwrite {attr} to {tag_value!r} at "
+                    f"construction time. Set --molmoact2-{attr.replace('_', '-')} {tag_value} to match, "
+                    "or the run's real behavior will diverge from what you configured."
                 )
 
     if norm_cfg.mode_source == "checkpoint" and resolved.pretrained is not None:
